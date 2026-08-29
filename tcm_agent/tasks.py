@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from tcm_kg.normalize import canonical_syndrome
+from tcm_kg.normalize import DECOCTION_MARKERS, canonical_syndrome
 from tcm_kg.schema import Domain, EdgeType, NodeType
 from tcm_kg.store import KGStore
 
@@ -138,9 +138,10 @@ class SDTTask(Task):
         if condition == "M0":
             return load_prompt("sdt_m0_base")
         parts = [load_prompt("sdt_structured")]
-        if condition in {"M2", "M3", "M4"}:
+        # M2C is the no-knowledge compute control: it must not see the KG note
+        if condition in {"M2", "M3", "M4", "M3C"}:
             parts.append(load_prompt("sdt_kg_note"))
-        if condition in {"M3", "M4"}:
+        if condition in {"M3", "M4", "M3C"}:
             parts.append(load_prompt("sdt_agent"))
         return "\n".join(parts)
 
@@ -210,25 +211,33 @@ class SDTTask(Task):
                 for h in syndromes
             ],
             "syndrome_option_lookup": self._lookup_options(item.get("syndrome_options")),
-            "pathogenesis_option_lookup": self._lookup_options(
-                item.get("pathogenesis_options"), as_syndrome=False
-            ),
             "note": (
                 "图谱不含症状与病机实体；证候的 definition 是诊疗方案原文定义句。"
                 "option_lookup 中 found=false 只表示该名称不在本图谱收录范围内，"
                 "不是排除该选项的理由。"
+                "任务二（病机）的选项刻意不做图谱检索：病机不是图谱实体，"
+                "病机判断必须由临床信息与证候证据自行推理得出。"
             ),
         }
 
-    def _lookup_options(
-        self, options: Any, *, as_syndrome: bool = True
-    ) -> List[Dict[str, Any]]:
-        """Resolve each named option against the graph.
+    def _lookup_options(self, options: Any) -> List[Dict[str, Any]]:
+        """Resolve each named **syndrome** option against the graph.
 
         Reported for every option, found or not, so the model sees a uniform
         table rather than a list biased toward whatever the graph happens to
         cover -- absence of an option from this graph is not evidence against
         it, and a partial table would imply otherwise.
+
+        Deliberately syndrome-only. An earlier version also ran the *task-2
+        pathogenesis* options through this method with a flag that was supposed
+        to disable syndrome matching but did not: the first lookup always hit
+        Syndrome nodes regardless. That is option-conditioned retrieval
+        leakage. Pathogenesis names and syndrome names share surface
+        vocabulary, so "which options does the graph recognise" is a signal
+        correlated with the answer, obtained without any reasoning. It also
+        destroyed the study's cleanest claim -- that a task-2 gain must come
+        from constrained reasoning, because the graph holds no pathogenesis
+        entity. Task 2 is now never queried against the graph at all.
         """
         if not isinstance(options, Mapping):
             return []
@@ -237,7 +246,7 @@ class SDTTask(Task):
             name = str(text).strip()
             record: Dict[str, Any] = {"option": letter, "name": name, "found": False}
             matches = self.kg.find_by_name(name, [NodeType.SYNDROME.value])
-            if not matches and as_syndrome:
+            if not matches:
                 matches = self.kg.find_by_name(canonical_syndrome(name), [NodeType.SYNDROME.value])
             if not matches:
                 # the option pool is drawn from case annotations, so many names
@@ -275,17 +284,27 @@ class SDTTask(Task):
     # ---------------------------------------------------------- verification
     def verify_arguments(
         self, result: Mapping[str, Any], item: Mapping[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Verify the *text* behind the chosen syndrome letters, not the letters."""
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Verify the *text* behind every chosen syndrome letter.
+
+        Returns one argument set per selected option. 27 of the 50 test cases
+        have more than one correct syndrome, and models select more than one
+        accordingly; verifying only the first -- as an earlier version did --
+        left most of a multi-select answer unchecked and made the M4 arm's
+        verification signal a function of answer order.
+        """
         options = item.get("syndrome_options") or {}
         letters = self.clamp_letters(result.get("syndrome_answer"), options)
-        names = [str(options[letter]).strip() for letter in letters if letter in options]
-        if not names:
-            return None
-        return {
-            "syndrome": canonical_syndrome(names[0]),
-            "clinical_features": coerce_list(result.get("clinical_information"))[:20],
-        }
+        features = coerce_list(result.get("clinical_information"))[:20]
+        return [
+            {
+                "syndrome": canonical_syndrome(str(options[letter]).strip()),
+                "clinical_features": features,
+                "_option": letter,
+            }
+            for letter in letters
+            if letter in options and str(options[letter]).strip()
+        ] or None
 
     def normalise_result(
         self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
@@ -338,9 +357,9 @@ class PATask(Task):
         if condition == "M0":
             return load_prompt("pa_m0_base")
         parts = [load_prompt("pa_structured")]
-        if condition in {"M2", "M3", "M4"}:
+        if condition in {"M2", "M3", "M4", "M3C"}:
             parts.append(load_prompt("pa_kg_note"))
-        if condition in {"M3", "M4"}:
+        if condition in {"M3", "M4", "M3C"}:
             parts.append(load_prompt("pa_agent"))
         return "\n".join(parts)
 
@@ -479,13 +498,123 @@ class PATask(Task):
             parts.extend(coerce_str(o) for o in options)
         return re.sub(r"\s+", " ", " ".join(parts))[:400]
 
+    #: Rule family -> the deterministic checkers that can adjudicate it.
+    #: Only families the graph can actually ground appear here; the rest are
+    #: left to the coverage audit, which is the honest answer for a rule with
+    #: no data behind it.
+    RULE_CHECKERS: Mapping[str, Sequence[str]] = {
+        "N-003": ("check_decoction_requirement",),
+        "A-005": ("check_decoction_requirement",),
+        "A-008": ("check_duplicate_medication",),
+        "A-007": ("check_restricted_item",),
+        "A-009": ("check_combination",),
+        "A-003": ("check_dose",),
+        "A-004": ("check_dose",),
+        "N-007": ("check_restricted_item",),
+        "N-009": ("check_restricted_item",),
+    }
+
     def verify_arguments(
         self, result: Mapping[str, Any], item: Mapping[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        # PA answers are option letters, which the syndrome verifier cannot
-        # check.  Verification for PA is done by re-running the deterministic
-        # checkers named by the rule category (see runtime._verify_pa).
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Deterministic checks to re-run against the answer the model gave.
+
+        PA answers are option letters, so there is nothing for the syndrome
+        verifier to check. What *can* be re-checked is the drug knowledge the
+        answer rests on: the entities named in the question and in the options
+        the model selected, put back through the rule engine for the family
+        this item belongs to.
+
+        This is what the M4 arm is supposed to mean. Without it -- as in an
+        earlier version, whose comment pointed at a ``_verify_pa`` that was
+        never written -- M4 was only a coverage audit plus one more revision
+        turn, and any M3→M4 gain would have measured extra thinking rather
+        than verification.
+        """
+        rule = str(item.get("rule_id") or "").upper()
+        checkers = self.RULE_CHECKERS.get(rule)
+        if not checkers:
+            return None
+        entities = self._entities_in_play(result, item)
+        if not entities:
+            return None
+
+        calls: List[Dict[str, Any]] = []
+        for checker in checkers:
+            if checker == "check_dose":
+                calls.append({"_tool": checker, "items": [{"name": e} for e in entities]})
+            elif checker == "check_restricted_item":
+                calls.append(
+                    {
+                        "_tool": checker,
+                        "items": entities,
+                        "patient_context": self._patient_context(item),
+                    }
+                )
+            elif checker == "check_combination" and len(entities) >= 2:
+                calls.append({"_tool": checker, "items": entities})
+            elif checker == "check_decoction_requirement":
+                call: Dict[str, Any] = {"_tool": checker, "items": entities}
+                # Pass what the model actually claimed, so the checker returns a
+                # verdict on the answer rather than a bare list of attested
+                # markers. Without it the check runs but adjudicates nothing.
+                claimed = self._claimed_preparation(result, item)
+                if claimed:
+                    call["claimed_requirement"] = claimed
+                calls.append(call)
+            elif checker == "check_duplicate_medication":
+                calls.append({"_tool": checker, "items": entities})
+        return calls or None
+
+    @staticmethod
+    def _claimed_preparation(
+        result: Mapping[str, Any], item: Mapping[str, Any]
+    ) -> Optional[str]:
+        """The preparation method the selected option asserts, if any."""
+        options = item.get("options") or {}
+        letters = PATask.clamp_letters(result.get("answer"), options)
+        for letter in letters:
+            text = str(options.get(letter) or "")
+            for marker in DECOCTION_MARKERS:
+                if marker in text:
+                    return marker
         return None
+
+    def _entities_in_play(
+        self, result: Mapping[str, Any], item: Mapping[str, Any]
+    ) -> List[str]:
+        """Drug-like names the answer actually depends on.
+
+        Drawn from the options the model selected plus the question stem, and
+        resolved against the graph so free text does not reach the checkers.
+        Capped, because a checker fed twenty speculative names produces noise
+        rather than verification.
+        """
+        options = item.get("options") or {}
+        letters = self.clamp_letters(result.get("answer"), options)
+        texts = [str(options[l]) for l in letters if l in options]
+        texts.append(str(item.get("question") or ""))
+
+        found: List[str] = []
+        for node_type in (NodeType.HERB.value, NodeType.FORMULA.value, NodeType.PATENT_MEDICINE.value):
+            for node in self.kg.of_type(node_type):
+                name = node.base_name or node.name
+                if len(name) < 2:
+                    continue
+                if any(name in text for text in texts) and name not in found:
+                    found.append(name)
+                if len(found) >= 6:
+                    return found
+        return found
+
+    @staticmethod
+    def _patient_context(item: Mapping[str, Any]) -> str:
+        """Cohort mentioned in the stem, for the restriction checker."""
+        question = str(item.get("question") or "")
+        for cohort in ("孕妇", "妊娠", "哺乳", "儿童", "小儿", "婴幼儿", "新生儿", "老年"):
+            if cohort in question:
+                return cohort
+        return ""
 
     def normalise_result(
         self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
@@ -509,7 +638,116 @@ def normalise_options(value: Any) -> List[str]:
     return sorted(letters)
 
 
-TASKS = {"sdt": SDTTask, "pa": PATask}
+class ClinicalPathwayTask(Task):
+    """TCM-CP: execute a staged clinical pathway.
+
+    Runs in the pathway domain, which withholds nothing -- executing a pathway
+    means deciding on treatment, so the treatment sub-graph has to be
+    reachable. That is safe here and *not* safe for SDT: nothing in TCM-CP is
+    answerable by inverting a syndrome->formula mapping, whereas in SDT that
+    inversion would hand over the answer.
+    """
+
+    name = "cp"
+    domain = Domain.PATHWAY
+
+    def system_prompt(self, condition: str) -> str:
+        parts = [load_prompt("cp_structured")]
+        if condition in {"M3", "M4", "M3C"}:
+            parts.append(load_prompt("cp_agent"))
+        return "\n".join(parts)
+
+    def user_message(self, item: Mapping[str, Any]) -> str:
+        lines = [f"【患者情况】\n{coerce_str(item.get('vignette'))}", ""]
+        if item.get("disease"):
+            lines.append(f"【病种】{coerce_str(item.get('disease'))}")
+        lines.append(f"【问题】{coerce_str(item.get('question'))}")
+        lines.append("【选项】")
+        options = item.get("options") or {}
+        for key in sorted(options):
+            lines.append(f"{key}. {coerce_str(options[key])}")
+        return "\n".join(lines)
+
+    def answer_fields(self) -> Sequence[str]:
+        return ("decision_type", "reasoning", "answer")
+
+    def static_context(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        """Fixed retrieval: the disease's stages, without naming the answer."""
+        disease = coerce_str(item.get("disease"))
+        limit = self.context_budget.max_entities_per_block
+        matches = self.kg.find_by_name(disease, [NodeType.DISEASE.value])
+        if not matches:
+            return {"disease": disease, "stages": [], "note": "图谱中未找到该病种的临床路径。"}
+        stages = [
+            t for _e, t in self.kg.neighbours(matches[0].id, {EdgeType.HAS_PATHWAY_STAGE.value})
+        ]
+        stages.sort(key=lambda s: (str(s.get("variant") or ""), s.get("order") or 0))
+        rendered = []
+        for stage in stages[:limit]:
+            rendered.append(
+                {
+                    "stage": stage.name,
+                    "order": stage.get("order"),
+                    "variant": stage.get("variant"),
+                    "day_actions": [str(a) for a in (stage.get("day_actions") or [])][:10],
+                    "nursing_items": [str(a) for a in (stage.get("nursing_items") or [])][:6],
+                    "monitoring_items": [str(a) for a in (stage.get("monitoring_items") or [])][:6],
+                    "entry_criteria": [str(a) for a in (stage.get("entry_criteria") or [])][:4],
+                    "exit_criteria": [str(a) for a in (stage.get("exit_criteria") or [])][:4],
+                    "next_stages": [
+                        t.name
+                        for _e, t in self.kg.neighbours(stage.id, {EdgeType.NEXT_STAGE.value})
+                    ],
+                }
+            )
+        context: Dict[str, Any] = {"disease": disease, "stages": rendered}
+        syndrome = coerce_str(item.get("syndrome"))
+        if syndrome:
+            found = self.kg.find_by_name(syndrome, [NodeType.SYNDROME.value])
+            if found:
+                context["treatment"] = {
+                    "syndrome": found[0].name,
+                    "principles": [
+                        t.name
+                        for _e, t in self.kg.neighbours(
+                            found[0].id, {EdgeType.TREATED_BY_PRINCIPLE.value}
+                        )
+                    ][:4],
+                    "formulas": [
+                        t.name
+                        for _e, t in self.kg.neighbours(found[0].id, {EdgeType.USES_FORMULA.value})
+                    ][:4],
+                }
+        return context
+
+    def verify_arguments(
+        self, result: Mapping[str, Any], item: Mapping[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Re-run the deterministic transition evaluator on transition items."""
+        if item.get("subtask") != "CP6_transition_decision":
+            return None
+        stage_id = coerce_str(item.get("stage_id"))
+        findings = [str(f) for f in (item.get("followup_findings") or [])]
+        if not stage_id or not findings:
+            return None
+        return [
+            {
+                "_tool": "evaluate_pathway_transition",
+                "stage_id": stage_id,
+                "disease": coerce_str(item.get("disease")),
+                "findings": findings,
+            }
+        ]
+
+    def normalise_result(
+        self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
+        out = dict(result)
+        out["answer"] = self.clamp_letters(result.get("answer"), (item or {}).get("options") or {})
+        return out
+
+
+TASKS = {"sdt": SDTTask, "pa": PATask, "cp": ClinicalPathwayTask}
 
 
 def build_task(name: str, kg: KGStore, retriever, budget: Optional[ContextBudget] = None) -> Task:

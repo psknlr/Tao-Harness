@@ -1,0 +1,17 @@
+
+【工具使用规则】
+你可以调用工具查询中医临床路径知识图谱。推荐流程：
+
+  1. retrieve_pathway_stage —— 按疾病取出该病种的全部路径阶段，
+     查看每个阶段的 day_actions、nursing_items、monitoring_items、
+     entry_criteria、exit_criteria 与前后阶段关系；
+  2. 将患者当前表现与各阶段的监测项目、诊疗行为比对，确定当前阶段；
+  3. retrieve_treatment_plan —— 按证候取出治法、方剂、中成药与外治法；
+  4. evaluate_pathway_transition —— 转阶段决策时，把当前阶段与随访发现
+     交给确定性判定器，它会逐条比对出径标准与下一阶段入径标准；
+     该工具只做词面比对，其结论是证据不是判决，仍需你结合病情确认；
+  5. retrieve_safety_constraints / check_restricted_item —— 核对禁忌；
+  6. 综合后作答。
+
+本任务开放完整图谱访问权限（诊断、证候、治法、方药、外治、安全、路径），
+因为执行临床路径本身就包含治疗决策。

@@ -150,6 +150,20 @@ what is meant to be a knowledge comparison. Every model sees the same 13 tools
 with byte-identical descriptions, and a test asserts no tool description
 mentions a query language.
 
+### 2b. Statistics chosen from the data
+
+SDT's primary metric is the benchmark's own weighted composite — continuous on
+[0, 1]. Testing it with McNemar, as an earlier version did, discards the
+magnitude of every paired difference and tests a hypothesis the metric does not
+express. The harness now picks the test from the observed values: exact
+McNemar for genuinely binary outcomes (PA accuracy), paired bootstrap with a
+95% CI for continuous ones, with Wilcoxon signed-rank reported beside it.
+
+Multiplicity is controlled **within prespecified hypothesis families** — SDT is
+the effectiveness family, PA the safety family — and the report names the
+family and its size in the table caption, so the correction and the prose
+cannot drift apart.
+
 ### 3. Coverage is explicit — silence is not absence
 
 Every tool returns a coverage verdict:
@@ -201,6 +215,21 @@ endorse a classical contraindication. `check_combination` therefore returns
 `not_covered`, labels co-occurrence as weak compatibility evidence only, and
 says the incompatibility table is absent. There is a test for exactly this.
 
+### 3b. Verification is deterministic, and checks the whole answer
+
+M4 re-runs rule-engine checks over the answer the model just gave, then gives
+the model one revision turn. Two properties matter:
+
+- **Every selected option is checked.** 27 of the 50 SDT test cases have more
+  than one correct syndrome; verifying only the first would leave most of a
+  multi-select answer unchecked and make the signal depend on answer order.
+- **PA verification is real.** Each rule family maps to the deterministic
+  checkers that can adjudicate it — `N-003` to the decoction checker with the
+  *claimed* preparation passed through, `A-008` to duplicate detection, and so
+  on. For the majority of PA items no checker applies, and there M4 falls back
+  to the coverage audit: "the graph cannot speak to this — did you claim it
+  could?" That is the honest verification for a rule with no data behind it.
+
 ### 4b. The SDT leakage check
 
 The KG conditions hand the model a lookup over the ten named options, which is
@@ -219,6 +248,16 @@ have been measuring answer leakage rather than reasoning and the option-lookup
 tool would have had to be withdrawn. A regression test enforces the gap stays
 under 10 points.
 
+**Task-2 options are never looked up at all.** Pathogenesis is not a graph
+entity, which is what makes a task-2 gain interesting — it can only come from
+the graph constraining the reasoning space. An earlier version nevertheless ran
+the pathogenesis options through a syndrome lookup (a flag meant to prevent it
+did not), so "which options does the graph recognise" became a signal
+correlated with the answer. That path is gone, and because an M3 agent could
+still type an option into the search tool of its own accord, the prompt
+forbids it and `pathogenesis_probe_rate` measures how often it happens anyway.
+Reporting the rate is better science than assuming it is zero.
+
 ### 5. Deterministic checks stay deterministic
 
 `LLM = decides what to look up + integrates + explains`,
@@ -229,14 +268,28 @@ source of measured difference.
 
 ### 6. The framework hash
 
-Everything a model could be advantaged by is hashed together: prompts, tool
-descriptions and schemas, retrieval weights, top-k, graph hops, context budget,
-tool budget, decode parameters, turn limits. `score` **refuses** to pool traces
-whose hashes differ, rather than silently averaging incomparable runs.
+Everything a model could be advantaged by is hashed together — and so is what
+the run was *measuring*:
 
 ```
-framework_hash = sha256(prompts ‖ tools ‖ retrieval ‖ budgets ‖ decode ‖ limits)
+framework_hash = sha256(prompts ‖ tools ‖ retrieval ‖ budgets ‖ decode ‖ limits
+                        ‖ task ‖ domain ‖ kg_content ‖ dataset_content)
 ```
+
+The last four matter. Without `task` and `domain` an SDT run and a PA run
+hashed **identically**, certifying as comparable two runs that read different
+sub-graphs and answered different questions. Without the content hashes, an
+edited graph or a swapped dataset file left the hash unchanged. The graph hash
+is semantic — computed over node and edge contents, not file bytes — so the
+JSON and GraphML exports of one graph agree while any edit to a relation
+changes it. The retrieval index caches on it too; keying on node *count*, as an
+earlier version did, meant a thousand edited relations silently reused a stale
+index.
+
+`score` **refuses** to pool traces whose hashes differ. Every run also writes a
+`manifest.json` with the graph hash, dataset hash, git commit, Python version,
+model snapshots and timestamp — written before generation starts, so an
+interrupted run still records what it was doing.
 
 ---
 
@@ -261,23 +314,39 @@ across 300 cases × 5 models × 5 conditions.
 
 ## Experimental arms
 
-| arm | structured prompt | KG evidence | model-chosen tools | verification |
-|---|---|---|---|---|
-| **M0** Base LLM | – | – | – | – |
-| **M1** Structured | ✓ | – | – | – |
-| **M2** KG-RAG | ✓ | static, deterministic | – | – |
-| **M3** KG-Agent | ✓ | agentic | ✓ | – |
-| **M4** KG-Agent + Verify | ✓ | agentic | ✓ | ✓ |
+| arm | structured prompt | KG evidence | model-chosen tools | verification | model calls |
+|---|---|---|---|---|---|
+| **M0** Base LLM | – | – | – | – | 1 |
+| **M1** Structured | ✓ | – | – | – | 1 |
+| **M2** KG-RAG | ✓ | static, deterministic | – | – | 1 |
+| **M2C** Iterative control | ✓ | **none** | – | – | = M3 |
+| **M3** KG-Agent | ✓ | agentic | ✓ | – | multi |
+| **M3C** Sham-revision control | ✓ | agentic | ✓ | **no evidence** | = M4 |
+| **M4** KG-Agent + Verify | ✓ | agentic | ✓ | ✓ | multi |
+
+**The two controls exist because M3 and M4 spend more test-time compute than
+the arms they are compared against.** Without them, `M2→M3` confounds "the
+agent used the graph" with "the model got more turns to think", and `M3→M4`
+confounds "verification helped" with "being asked to look again helped". M2C
+gets M3's turn budget with no graph access at all; M3C gets M4's extra
+revision turn with no verification evidence in it. The report includes a
+compute-parity table so the matching claim is evidenced, not asserted.
 
 M2's retrieval is built from a **rule-based** query (demographics and
-administrative fragments stripped identically for every model), so
-`Δ(M3−M2)` isolates agentic tool choice rather than confounding it with a
-better query. The contrasts decompose as:
+administrative fragments stripped identically for every model), so the
+retrieval contrast is not confounded with a better query. The interpretable
+contrasts are:
 
 ```
-Δ_structure    = M1 − M0      Δ_retrieval    = M2 − M1
-Δ_agent        = M3 − M2      Δ_verification = M4 − M3
+Δ_structure     = M1  − M0     prompt scaffold only
+Δ_retrieval     = M2  − M1     static KG evidence
+Δ_agency        = M3  − M2C    agentic KG tool use, compute held constant
+Δ_verification  = M4  − M3C    verification content, compute held constant
 ```
+
+`M0→M3` is reported too, but labelled the **whole-scaffold effect** — it
+contains prompt structure, retrieval and agency together and is not a KG-only
+result.
 
 ---
 
@@ -384,16 +453,39 @@ debug and analyse; use the runner to measure.
 
 ---
 
+## Three benchmarks, three different claims
+
+| benchmark | what a gain there licenses |
+|---|---|
+| **TCMEval-SDT** | effectiveness: the graph improved clinical reasoning |
+| **TCMEval-PA** | effectiveness: the graph reduced rule and knowledge errors — but only in the ~half of items whose rule family it can ground |
+| **TCM-CP** | **capability only**: the agent can execute a staged pathway faithfully |
+
+TCM-CP is built from the graph's own pathway layer (`scripts/build_tcm_cp.py`),
+because no published TCM pathway benchmark exists. Its gold answers therefore
+come from the same graph the KG arms consult, which makes it **circular by
+construction** for those arms. It is a genuine and separately interesting
+instrument — can an agent locate a patient in a pathway, name the actions due,
+plan treatment, and respect exit criteria? — but a KG advantage on it is
+expected and is *not* evidence for the effectiveness claims. The generated
+report labels it, the config says so at the top, and its contrasts are never
+pooled with SDT or PA.
+
+The pathway work needed a fourth access domain rather than a widening of the
+clinical one: executing a pathway means deciding on treatment, so
+`clinical_pathway` withholds nothing. Opening treatment entities to SDT instead
+would have let an SDT agent invert syndrome→formula and read off the answer.
+
 ## Repository layout
 
 ```
 tcm_kg/       ontology · store · normalisation · hybrid retrieval
-tcm_tools/    8 KG tools + 5 deterministic checkers, domain-gated
+tcm_tools/    16 tools (8 knowledge + 5 checkers + 3 pathway), domain-gated
 tcm_agent/    frozen runtime, M0–M4, tasks, prompts (versioned text), traces
 tcm_models/   provider adapters, generation cache, keyless replay
 tcm_eval/     datasets · scorers · judge · trace metrics · statistics · report
 runner/       CLI: run · score · judge · report · compare · inspect · coverage
-scripts/      KG coverage audit
+scripts/      KG coverage audit, TCM-CP benchmark builder
 configs/      models.yaml + one experiment file per benchmark
 kg/           tcm_knowledge_graph.json.gz (the committed artefact)
 vendor/       the benchmark's own evaluate.py, vendored unmodified

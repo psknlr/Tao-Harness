@@ -140,6 +140,38 @@ def coverage_honesty(trace: Trace) -> Optional[float]:
     return 1.0 if admits_gap else 0.0
 
 
+def pathogenesis_probe_rate(
+    trace: Trace, pathogenesis_options: Optional[Mapping[str, str]]
+) -> Optional[float]:
+    """Did the agent search the graph for its task-2 answer options?
+
+    The static condition no longer hands the model a pathogenesis lookup (that
+    was option-conditioned retrieval leakage). An agent in M3/M4 can still type
+    an option string into ``search_tcm_entities`` of its own accord, and the
+    prompt tells it not to. Prohibiting it outright would mean policing free
+    text; measuring it is better science. This returns the fraction of the
+    agent's search queries that contain a task-2 option verbatim, so a paper
+    can report the rate rather than assume it is zero -- and so a model that
+    games the format is visible rather than silently advantaged.
+
+    ``None`` when the trace issued no searches, so silent traces do not dilute
+    the average.
+    """
+    if not pathogenesis_options:
+        return None
+    queries = [
+        str(step.arguments.get("query") or "")
+        for step in trace.tool_steps
+        if step.tool == "search_tcm_entities"
+    ]
+    queries = [q for q in queries if q.strip()]
+    if not queries:
+        return None
+    names = [str(v).strip() for v in pathogenesis_options.values() if str(v).strip()]
+    hits = sum(1 for q in queries if any(name in q for name in names))
+    return hits / len(queries)
+
+
 def aggregate_trace_metrics(traces: Sequence[Trace]) -> Dict[str, Any]:
     """Means over a set of traces, skipping metrics that are ``None``."""
     rows = [trace_metrics(t) for t in traces]

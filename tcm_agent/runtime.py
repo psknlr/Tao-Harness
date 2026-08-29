@@ -42,16 +42,67 @@ from .prompts import load_prompt, prompt_fingerprint
 from .tasks import ContextBudget, Task
 from .trace import LLMStep, ToolStep, Trace
 
-CONDITIONS = ("M0", "M1", "M2", "M3", "M4")
+#: ``M2C`` and ``M3C`` are compute-matched controls, not ablations of the
+#: knowledge graph. Without them, M2→M3 confounds "the agent used the graph"
+#: with "the model got more turns to think", and M3→M4 confounds "verification
+#: helped" with "one more revision helped". Each control spends the same
+#: number of model calls as the arm it is matched to, and receives no graph
+#: evidence in those extra calls.
+CONDITIONS = ("M0", "M1", "M2", "M3", "M4", "M2C", "M3C")
+
+#: control -> the arm whose test-time compute it matches
+COMPUTE_MATCHED: Mapping[str, str] = {"M2C": "M3", "M3C": "M4"}
 
 #: Topics the knowledge graph does not encode.  Used by the PA verification
 #: pass to catch a model citing graph support it cannot have had.
+#: Ordered worst-first: one contradiction outweighs any number of passes.
+_VERDICT_PRIORITY = (
+    "contradicted",
+    "contradicted_by_graph",
+    "partially_supported",
+    "not_in_graph",
+    "not_covered",
+    "supported",
+)
+
 UNCOVERED_TOPICS: Mapping[str, Tuple[str, ...]] = {
     "dose": ("剂量", "用量", "超量", "克", "g", "用法用量"),
     "incompatibility": ("十八反", "十九畏", "配伍禁忌", "相反", "相畏"),
     "pregnancy": ("妊娠", "孕妇", "孕期"),
     "drug_interaction": ("相互作用", "中西药联用"),
 }
+
+
+def _summarise_verdicts(checks: Sequence[Mapping[str, Any]]) -> str:
+    """Worst verdict across every deterministic check.
+
+    Worst-first because verification is a safety gate: an answer with one
+    contradicted component and three supported ones needs review, and
+    averaging would hide exactly the case the pass exists to catch.
+    """
+    seen: set = set()
+    for check in checks:
+        data = check.get("data")
+        if isinstance(data, Mapping):
+            if data.get("overall"):
+                seen.add(str(data["overall"]))
+            for finding in data.get("findings") or []:
+                if not isinstance(finding, Mapping):
+                    continue
+                if finding.get("claim_verdict"):
+                    seen.add(str(finding["claim_verdict"]))
+                elif finding.get("attested_requirements") or finding.get("restrictions"):
+                    # the checker found grounded facts but was given no claim to
+                    # adjudicate; that is evidence, not a silent no-op
+                    seen.add("supported")
+            if data.get("alias_duplicates") or data.get("formula_overlap"):
+                seen.add("contradicted")
+        if check.get("coverage") == "not_covered":
+            seen.add("not_covered")
+    for verdict in _VERDICT_PRIORITY:
+        if verdict in seen:
+            return verdict
+    return "no_verdict"
 
 
 @dataclass
@@ -67,6 +118,15 @@ class FrameworkConfig:
     #: recorded as a format failure rather than retried indefinitely
     max_format_retries: int = 2
     registry: ToolRegistry = field(default=REGISTRY)
+    #: What the run is measuring. Two arms are only comparable if these match
+    #: too: an SDT run and a PA run share every budget and prompt file, so
+    #: without these the hash collided and certified as identical two runs that
+    #: read different sub-graphs and answered different questions.
+    task: str = ""
+    domain: str = ""
+    #: Content fingerprints of the inputs, filled in by the runner.
+    kg_hash: str = ""
+    dataset_hash: str = ""
 
     def framework_hash(self) -> str:
         payload = json.dumps(
@@ -79,6 +139,10 @@ class FrameworkConfig:
                 "decode": self.decode.fingerprint(),
                 "max_agent_turns": self.max_agent_turns,
                 "max_format_retries": self.max_format_retries,
+                "task": self.task,
+                "domain": self.domain,
+                "kg": self.kg_hash,
+                "dataset": self.dataset_hash,
             },
             sort_keys=True,
         )
@@ -87,6 +151,10 @@ class FrameworkConfig:
     def describe(self) -> Dict[str, Any]:
         return {
             "framework_hash": self.framework_hash(),
+            "task": self.task,
+            "domain": self.domain,
+            "kg_hash": self.kg_hash[:16],
+            "dataset_hash": self.dataset_hash[:16],
             "prompt_fingerprint": prompt_fingerprint(),
             "tool_fingerprint": self.registry.fingerprint(),
             "retrieval": self.retrieval.fingerprint(),
@@ -137,6 +205,8 @@ class AgentRuntime:
         try:
             if condition in {"M0", "M1", "M2"}:
                 self._run_single_shot(item, condition, trace, sample)
+            elif condition == "M2C":
+                self._run_iterative_control(item, trace, sample)
             else:
                 self._run_agent(item, condition, trace, sample)
         except Exception as exc:  # one bad case must not lose the other 299
@@ -158,6 +228,76 @@ class AgentRuntime:
         messages = [Message("system", system), Message("user", user)]
         outcome = self._ask(messages, trace, phase="answer", sample=sample)
         self._finalise(outcome, trace, item)
+
+    # ------------------------------------------------- M2C: compute control
+    def _run_iterative_control(
+        self, item: Mapping[str, Any], trace: Trace, sample: int
+    ) -> None:
+        """M2C: as many model turns as M3 gets, but no knowledge graph.
+
+        The point is to hold test-time compute constant while removing the only
+        thing M3 adds -- graph access. If M2C matches M3, the agentic gain was
+        thinking time rather than knowledge, and the honest contrast to report
+        is M2C→M3 rather than M2→M3.
+
+        The model is told it may think for several turns; each turn it is
+        prompted onward with no new information, so no evidence enters. Turns
+        are capped at the tool budget M3 would have had, so the two arms cost
+        the same number of calls.
+        """
+        system = (
+            self.task.system_prompt("M1")
+            + "\n"
+            + load_prompt("control_iterative").replace(
+                "{max_calls}", str(self.config.tool_budget.max_calls)
+            )
+        )
+        messages: List[Message] = [
+            Message("system", system),
+            Message("user", self.task.user_message(item)),
+        ]
+        budget = self.config.tool_budget.max_calls
+        result: Optional[Dict[str, Any]] = None
+        format_failures = 0
+
+        for turn in range(self.config.max_agent_turns):
+            outcome = self._ask(messages, trace, phase="reason", sample=sample)
+            if outcome.value is None:
+                format_failures += 1
+                if format_failures > self.config.max_format_retries:
+                    trace.error = "model did not emit parseable JSON"
+                    break
+                messages.append(Message("assistant", outcome.raw[:2000]))
+                messages.append(
+                    Message("user", '请只输出一个 JSON 对象，形如 {"action": "think", ...} 或 {"action": "answer", ...}。')
+                )
+                continue
+
+            action = str(outcome.value.get("action") or "").lower()
+            trace.llm_steps[-1].action = action or "unparsed"
+            if action == "answer" or "result" in outcome.value:
+                payload = outcome.value.get("result")
+                result = payload if isinstance(payload, Mapping) else outcome.value
+                break
+            if action == "think" and budget > 0:
+                budget -= 1
+                messages.append(Message("assistant", json.dumps(outcome.value, ensure_ascii=False)))
+                messages.append(
+                    Message(
+                        "user",
+                        f"已记录。请继续推理或给出最终答案。[剩余思考轮次: {budget}]"
+                        + ("\n思考轮次已用尽，请立即给出最终答案。" if budget == 0 else ""),
+                    )
+                )
+                continue
+            result = dict(outcome.value)
+            break
+
+        if result is None and trace.error is None:
+            trace.error = "control arm exhausted its turn budget without answering"
+        if result is not None:
+            trace.final = self.task.normalise_result(result, item)
+            trace.final_raw = json.dumps(result, ensure_ascii=False)
 
     # ------------------------------------------------------------ M3 / M4
     def _run_agent(
@@ -230,8 +370,10 @@ class AgentRuntime:
         if result is None and trace.error is None:
             trace.error = "agent exhausted its turn budget without answering"
 
-        if result is not None and condition == "M4":
-            result = self._verify_and_revise(item, result, ctx, trace, sample)
+        if result is not None and condition in {"M4", "M3C"}:
+            result = self._verify_and_revise(
+                item, result, ctx, trace, sample, sham=(condition == "M3C")
+            )
 
         if result is not None:
             trace.final = self.task.normalise_result(result, item)
@@ -245,21 +387,39 @@ class AgentRuntime:
         ctx: ToolContext,
         trace: Trace,
         sample: int,
+        *,
+        sham: bool = False,
     ) -> Dict[str, Any]:
-        """M4: deterministic re-check of the answer, then one revision turn."""
-        report = self._verification_report(item, result, ctx, trace)
-        if report is None:
-            return dict(result)
-        messages = [
-            Message("system", load_prompt("verifier")),
-            Message(
-                "user",
-                "【你的结论】\n"
-                + json.dumps(result, ensure_ascii=False)
-                + "\n\n【校验结果】\n"
-                + json.dumps(report, ensure_ascii=False),
-            ),
-        ]
+        """M4: deterministic re-check then one revision turn.
+
+        ``sham=True`` is the M3C control: the same extra revision turn, with no
+        verification evidence in it. M4 minus M3C is the effect of the
+        verification *content*; M4 minus M3 also contains the effect of simply
+        being asked to look again.
+        """
+        if sham:
+            report = None
+        else:
+            report = self._verification_report(item, result, ctx, trace)
+            if report is None:
+                return dict(result)
+
+        if sham:
+            messages = [
+                Message("system", load_prompt("control_sham_revision")),
+                Message("user", "【你的结论】\n" + json.dumps(result, ensure_ascii=False)),
+            ]
+        else:
+            messages = [
+                Message("system", load_prompt("verifier")),
+                Message(
+                    "user",
+                    "【你的结论】\n"
+                    + json.dumps(result, ensure_ascii=False)
+                    + "\n\n【校验结果】\n"
+                    + json.dumps(report, ensure_ascii=False),
+                ),
+            ]
         outcome = self._ask(messages, trace, phase="verify_revise", sample=sample)
         if outcome.value is None:
             revised = dict(result)
@@ -273,7 +433,8 @@ class AgentRuntime:
             payload = payload["result"]
         revised = dict(payload)
         revised.setdefault("revision", "unchanged")
-        revised["verification_report"] = report
+        if report is not None:
+            revised["verification_report"] = report
         # a revision turn must not silently drop required answer fields
         for key in self.task.answer_fields():
             if key not in revised and key in result:
@@ -287,16 +448,56 @@ class AgentRuntime:
         ctx: ToolContext,
         trace: Trace,
     ) -> Optional[Dict[str, Any]]:
-        args = self.task.verify_arguments(result, item)
-        if args is not None:
-            # SDT: graph consistency of the claimed syndrome
-            verify_ctx = ToolContext(
-                self.kg, self.retriever, self.task.domain, ToolBudget(max_calls=2, max_calls_per_tool=2)
-            )
-            tool_result = self.config.registry.call("verify_tcm_decision", verify_ctx, args)
+        """Re-run deterministic checks over the answer the model just gave.
+
+        The task decides *what* to verify; this runs it. A task may return a
+        list of argument sets -- one per selected syndrome for SDT, one per
+        applicable rule checker for PA -- and every one is executed, because a
+        verification pass that checks only the first element of a multi-select
+        answer verifies almost nothing.
+
+        The coverage audit remains as the fallback for items no deterministic
+        checker can adjudicate (over half the PA set), where the honest
+        verification is "the graph cannot speak to this; did you claim it
+        could?".
+        """
+        plans = self.task.verify_arguments(result, item)
+        if plans is None:
+            return self._coverage_audit(result, trace)
+        if isinstance(plans, Mapping):
+            plans = [plans]
+
+        # a budget of its own, so verification cannot be starved by an agent
+        # that spent everything during reasoning
+        verify_ctx = ToolContext(
+            self.kg,
+            self.retriever,
+            self.task.domain,
+            ToolBudget(max_calls=max(4, 2 * len(plans)), max_calls_per_tool=max(4, len(plans))),
+        )
+        checks: List[Dict[str, Any]] = []
+        for plan in plans:
+            arguments = {k: v for k, v in plan.items() if not k.startswith("_")}
+            tool_name = str(plan.get("_tool") or "verify_tcm_decision")
+            tool_result = self.config.registry.call(tool_name, verify_ctx, arguments)
             self._record_tool(tool_result, verify_ctx, trace)
-            return tool_result.to_dict()
-        return self._coverage_audit(result, trace)
+            entry = tool_result.to_dict()
+            if plan.get("_option"):
+                entry["option"] = plan["_option"]
+            checks.append(entry)
+
+        report: Dict[str, Any] = {
+            "check": "deterministic_verification",
+            "n_checks": len(checks),
+            "checks": checks,
+            "verdict": _summarise_verdicts(checks),
+        }
+        # the coverage audit is complementary, not alternative: a deterministic
+        # check can pass while the prose still over-claims graph support
+        audit = self._coverage_audit(result, trace)
+        if audit:
+            report["coverage_audit"] = audit
+        return report
 
     def _coverage_audit(
         self, result: Mapping[str, Any], trace: Trace

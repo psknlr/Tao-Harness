@@ -11,6 +11,8 @@ data/pa/*.xlsx
 data/pa/*.json
 data/tcmsd/*.json
 data/tcmsd/*.txt
+# TCM-CP is generated: rebuild with scripts/build_tcm_cp.py
+data/cp/*.json
 !data/**/README.md
 .DS_Store
 *.egg-info/

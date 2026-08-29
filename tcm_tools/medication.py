@@ -14,7 +14,7 @@ from tcm_kg.schema import Domain, EdgeType, NodeType
 from ._common import documents_block, edge_evidence, node_brief, resolve_entity
 from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
 
-_SAFETY_DOMAINS = (Domain.SAFETY, Domain.FULL)
+_SAFETY_DOMAINS = (Domain.SAFETY, Domain.PATHWAY, Domain.FULL)
 
 _DRUG_TYPES = (
     NodeType.FORMULA.value,

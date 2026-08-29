@@ -118,11 +118,12 @@ class ConditionTests(unittest.TestCase):
         # a revision turn must not drop fields the first answer supplied
         self.assertEqual(trace.final["pathogenesis_answer"], ["A"])
 
-    def test_verifier_resolves_the_letter_to_its_option_text(self):
-        # verify_tcm_decision cannot check a letter; it must be handed the name
+    def test_verifier_resolves_every_letter_to_its_option_text(self):
+        # verify_tcm_decision cannot check a letter; it must be handed the name,
+        # and a multi-select answer must produce one check per selected option
         task = build_task("sdt", graph(), retriever())
-        args = task.verify_arguments({"syndrome_answer": ["A"]}, CASE)
-        self.assertEqual(args["syndrome"], "心虚胆怯证")
+        plans = task.verify_arguments({"syndrome_answer": ["A", "B"]}, CASE)
+        self.assertEqual([p["syndrome"] for p in plans], ["心虚胆怯证", "痰火扰心证"])
 
     def test_out_of_range_letters_are_dropped(self):
         task = build_task("sdt", graph(), retriever())
@@ -158,7 +159,9 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertNotEqual(variant.framework_hash(), base)
 
     def test_every_declared_condition_runs(self):
-        self.assertEqual(set(CONDITIONS), {"M0", "M1", "M2", "M3", "M4"})
+        self.assertEqual(
+            set(CONDITIONS), {"M0", "M1", "M2", "M3", "M4", "M2C", "M3C"}
+        )
 
 
 if __name__ == "__main__":

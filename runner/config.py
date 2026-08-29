@@ -104,6 +104,8 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         max_agent_turns=int(payload.get("max_agent_turns", 16)),
         max_format_retries=int(payload.get("max_format_retries", 2)),
         registry=REGISTRY,
+        task=str(payload.get("task") or dataset.get("kind") or "sdt"),
+        domain=str(payload.get("domain") or Domain.CLINICAL.value),
     )
 
     return ExperimentConfig(

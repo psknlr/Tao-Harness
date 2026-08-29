@@ -20,7 +20,7 @@ from tcm_kg.schema import Domain, EdgeType, NodeType
 from ._common import documents_block, edge_evidence, node_brief, resolve_entity
 from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
 
-_SAFETY_DOMAINS = (Domain.SAFETY, Domain.FULL)
+_SAFETY_DOMAINS = (Domain.SAFETY, Domain.PATHWAY, Domain.FULL)
 
 SAFETY_SCOPE_NOTE = (
     "图谱的安全知识来源于诊疗方案与临床路径中的调护、饮食与操作禁忌段落，"
