@@ -316,8 +316,14 @@ Runs are **resumable** — an interrupted run picks up from the recorded traces,
 matching on `framework_hash`, and every request is cached on the way through.
 
 ```bash
-python -m unittest discover -s tests -t .    # 79 tests, fully offline
+python -m unittest discover -s tests -t .    # 102 tests, fully offline
 ```
+
+The suite passes on a clean checkout with **no benchmark files present**: the
+end-to-end tests run against committed synthetic fixtures written in the
+released schemas, and the tests that need the real data skip themselves (17 of
+102). CI runs it on 3.10 and 3.12 and also re-validates the graph against the
+declared ontology.
 
 ---
 
@@ -395,6 +401,8 @@ docs/         kg_coverage.md (generated)
 ```
 
 Datasets are not committed — see `data/*/README.md` for where to put them.
+`tests/fixtures/` holds small synthetic stand-ins in the same schemas so the
+suite and the CLI are exercised without them.
 
 ## Sources
 

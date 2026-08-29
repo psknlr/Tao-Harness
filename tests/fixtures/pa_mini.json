@@ -1,0 +1,6 @@
+[
+  {"ID": "m1", "Question": "下列中药中，调配时需标注“先煎”的是", "Candidate Answers": "A. 石膏\nB. 薄荷\nC. 阿胶\nD. 三七粉\nE. 钩藤", "Answer": "A", "Explanation": "矿物类药材质地坚硬，需先煎。", "Category": "处方规范性", "Rule_ID": "N-003", "Rule_summary": "特殊煎煮方法"},
+  {"ID": "m2", "Question": "某处方同时开具瓜蒌与全瓜蒌，属于", "Candidate Answers": "A. 重复用药\nB. 配伍禁忌\nC. 超剂量\nD. 用法不当\nE. 无问题", "Answer": "A", "Explanation": "二者为同一药材的别名。", "Category": "处方适宜性", "Rule_ID": "A-008", "Rule_summary": "重复用药"},
+  {"ID": "m3", "Question": "关于附子的说法，正确的有", "Candidate Answers": "A. 药典标注有毒\nB. 需先煎\nC. 属于麻醉药品\nD. 无需特殊处理\nE. 为矿物类药材", "Answer": "AB", "Explanation": "附子有毒且需先煎。", "Category": "处方适宜性", "Rule_ID": "A-007", "Rule_summary": "使用禁忌"},
+  {"ID": "m4", "Question": "处方审核的基本概念不包括", "Candidate Answers": "A. 适宜性审核\nB. 规范性审核\nC. 药品定价\nD. 用药安全\nE. 合理用药", "Answer": "C", "Explanation": "定价不属于处方审核范畴。", "Category": "基础概念", "Rule_ID": "C-001", "Rule_summary": "处方审核基本概念"}
+]

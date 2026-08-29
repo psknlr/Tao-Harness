@@ -1,8 +1,13 @@
-"""End-to-end: the CLI's run -> score -> report -> compare -> replay cycle.
+"""End-to-end: the CLI's run -> score -> report -> submit -> replay cycle.
 
-Runs entirely offline against the echo provider, so CI needs no API key and no
-network. This is the test that would catch a break in the seam between the
-runtime, the trace format and the scorer.
+Runs entirely offline against the echo provider and against committed synthetic
+fixtures written in the released schemas, so this passes on a clean checkout
+with no API key, no network and no benchmark files. That matters: the datasets
+are gitignored, and a suite that only passed on a machine where someone had
+already downloaded them would be no use in CI or to a reviewer.
+
+This is the test that catches a break in the seam between the runtime, the
+trace format and the scorer.
 """
 
 import json
@@ -18,16 +23,17 @@ REPO = Path(__file__).resolve().parent.parent
 SDT_CONFIG = "tests/fixtures/experiment.test.yaml"
 PA_CONFIG = "tests/fixtures/experiment.pa.test.yaml"
 
-#: A fixed answer for 病例247 (gold: pathogenesis D, syndrome J), so the scored
-#: numbers below are checkable by hand against the released answer file.
+#: A fixed answer matching fixture 案例001 exactly (gold: pathogenesis A,
+#: syndrome A) and wrong for the other two, so every scored number below is
+#: checkable by hand against tests/fixtures/sdt_mini/Results/.
 SDT_ANSWER = json.dumps(
     {
         "action": "answer",
         "result": {
-            "clinical_information": ["咳逆不能平卧", "唾白色泡沫痰", "短气"],
-            "pathogenesis_answer": ["D"],
-            "syndrome_answer": ["J"],
-            "explanation": "临证体会：少阴伤寒，阴寒内盛。辨证：少阴伤寒，阴寒内盛",
+            "clinical_information": ["心悸不安", "善惊易恐", "多梦易醒"],
+            "pathogenesis_answer": ["A"],
+            "syndrome_answer": ["A"],
+            "explanation": "临证体会：心胆气虚，心神失养，故善惊易恐。辨证：心虚胆怯",
         },
     },
     ensure_ascii=False,
@@ -36,16 +42,16 @@ PA_ANSWER = json.dumps(
     {
         "action": "answer",
         "result": {
-            "rule_category": "基础概念",
+            "rule_category": "特殊煎煮",
             "option_analysis": "逐项分析",
-            "answer": ["E"],
-            "reasoning": "图谱未收录该法规条文，依据自身知识判断",
+            "answer": ["A"],
+            "reasoning": "图谱记载石膏先煎",
         },
     },
     ensure_ascii=False,
 )
-N_SDT_CASES = 4
-N_PA_CASES = 6
+N_SDT_CASES = 3
+N_PA_CASES = 4
 
 
 class EndToEndTests(unittest.TestCase):
@@ -74,15 +80,17 @@ class EndToEndTests(unittest.TestCase):
         path = self.out / "scores.sdt.jsonl"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), N_SDT_CASES * 5)
-        # 病例247's gold answers are pathogenesis D and syndrome J, which the
-        # scripted answer matches exactly; every other case it gets wrong
+        # 案例001's gold answers are pathogenesis A and syndrome A, which the
+        # scripted answer matches exactly; the other two cases it gets wrong
         by_case = {}
         for row in rows:
             by_case.setdefault(row["case_id"], []).append(row["metrics"])
-        hit = by_case["病例247"][0]
+        hit = by_case["案例001"][0]
         self.assertEqual(hit["task2_pathogenesis"], 1.0)
         self.assertEqual(hit["task3_syndrome"], 1.0)
-        self.assertIn("sdt_composite", hit)
+        self.assertGreater(hit["sdt_composite"], 0.7)
+        miss = by_case["案例002"][0]
+        self.assertEqual(miss["task3_syndrome"], 0.0)
 
     def test_04_report_renders(self):
         target = self.out / "report.md"
@@ -115,9 +123,9 @@ class EndToEndTests(unittest.TestCase):
         )
         lines = [l for l in target.read_text(encoding="utf-8").splitlines() if l]
         # a submission must cover every case in the split, not only those run
-        self.assertEqual(len(lines), 50)
+        self.assertEqual(len(lines), N_SDT_CASES)
         self.assertTrue(all(line.count("@") == 4 for line in lines))
-        self.assertTrue(lines[0].startswith("病例247@"))
+        self.assertTrue(lines[0].startswith("案例001@"))
 
     def test_07_pa_pipeline_runs_and_scores(self):
         self.assertEqual(main(["run", PA_CONFIG, "--echo-script", PA_ANSWER]), 0)
@@ -128,9 +136,9 @@ class EndToEndTests(unittest.TestCase):
         ]
         self.assertEqual(len(rows), N_PA_CASES * 2)
         by_case = {r["case_id"]: r["metrics"] for r in rows}
-        self.assertEqual(by_case["1"]["exact"], 1.0)   # gold E, answered E
-        self.assertEqual(by_case["2"]["exact"], 0.0)   # gold D, answered E
-        self.assertEqual(by_case["1"]["rule_id"], "C-001")
+        self.assertEqual(by_case["m1"]["exact"], 1.0)   # gold A, answered A
+        self.assertEqual(by_case["m4"]["exact"], 0.0)   # gold C, answered A
+        self.assertEqual(by_case["m1"]["rule_id"], "N-003")
 
     def test_08_mixed_framework_hashes_are_refused(self):
         path = self.out / "traces.sdt.echo.jsonl"
@@ -147,8 +155,10 @@ class EndToEndTests(unittest.TestCase):
 
     def test_09_inspect_and_coverage_run(self):
         self.assertEqual(
-            main(["inspect", "--dataset", "data/pa/TCMEval-PA.xlsx", "--dataset-kind", "pa"]), 0
+            main(["inspect", "--dataset", "tests/fixtures/pa_mini.json", "--dataset-kind", "pa"]), 0
         )
+        # the coverage audit degrades to the graph-only sections when the
+        # released datasets are absent, rather than failing
         self.assertEqual(main(["coverage", "--out", str(self.out / "coverage.md")]), 0)
 
 

@@ -98,7 +98,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None:
         config.dataset_limit = args.limit
 
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     print(dataset.mapping.report(), file=sys.stderr)
     if dataset.mapping.missing:
         print(
@@ -234,7 +234,7 @@ def _score_traces(
 
 def cmd_score(args: argparse.Namespace) -> int:
     config = load_experiment(args.config)
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     gold = {str(item["id"]): item for item in dataset.items}
     kg, _ = _load_graph(args.kg, config) if config.task == "sdt" else (None, None)
 
@@ -312,7 +312,7 @@ def cmd_judge(args: argparse.Namespace) -> int:
     if config.task != "sdt":
         print("the judge scores SDT free-text steps only", file=sys.stderr)
         return 1
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     gold = {str(item["id"]): item for item in dataset.items}
 
     specs = load_models(args.models_config)
@@ -417,7 +417,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if config.task != "sdt":
         print("submission files are defined for SDT only", file=sys.stderr)
         return 1
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     order = [item["id"] for item in dataset.items]
 
     trace_file = config.output_dir / f"traces.{config.task}.{args.model}.jsonl"
