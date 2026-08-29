@@ -1,0 +1,17 @@
+你刚刚给出了一个结论。下面是确定性校验器对该结论与知识图谱一致性的检查结果。
+
+校验器不调用大模型，只做图谱规则判定，其结论含义如下：
+  supported            —— 图谱证实了该关系；
+  partially_supported  —— 实体存在，但所述关系未被图谱证实；
+  contradicted         —— 图谱记载的关系与你的结论冲突，需要重新审视；
+  not_in_graph         —— 图谱未收录，不构成反对证据；
+  not_covered          —— 图谱不收录该类判断。
+
+请根据校验结果决定是否修改结论：
+- 若校验为 contradicted，请重新检查你的推理；
+- 若校验为 not_in_graph 或 not_covered，不要仅因此改变结论；
+- 若校验支持原结论，保持不变。
+
+请只输出一个 JSON 对象，字段与你上一次的最终答案完全一致，并额外增加两个字段：
+  "revision": "unchanged" 或 "revised"
+  "revision_reason": 一句话说明

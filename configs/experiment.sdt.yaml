@@ -1,0 +1,48 @@
+# TCMEval-SDT: syndrome differentiation.
+#
+# Access domain: clinical_reasoning only. Formula / Herb / PatentMedicine /
+# ExternalTherapy are unreachable, so the agent cannot invert the
+# syndrome->treatment mapping to recover the answer from the prescription.
+
+name: tcm-sdt
+dataset:
+  kind: sdt
+  path: data/sdt/Test_TCM_Data_v1.json
+  limit: null
+
+task: sdt
+domain: clinical_reasoning
+
+models: [deepseek, gemini, glm, gpt, minimax]
+conditions: [M0, M1, M2, M3, M4]
+samples: 1              # >1 enables self-consistency voting
+
+# ---- frozen framework contract: identical for every model ----
+decode:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 2048
+  seed: 20260829
+
+retrieval:
+  alpha_semantic: 0.60
+  beta_graph: 0.25
+  gamma_source: 0.15
+  top_k: 8
+  graph_hops: 2
+  graph_decay: 0.5
+
+tool_budget:
+  max_calls: 12
+  max_calls_per_tool: 4
+  max_result_chars: 4000
+
+context_budget:
+  max_chars: 6000
+  max_entities_per_block: 8
+
+max_agent_turns: 16
+max_format_retries: 2
+
+output_dir: runs/sdt
+concurrency: 4

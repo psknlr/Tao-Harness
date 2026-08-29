@@ -1,0 +1,51 @@
+# TCMEval-PA: prescription audit.
+#
+# Access domain: prescription_safety. The medication, safety and pharmacopoeia
+# sub-graphs are the object of study here and are fully exposed; PathwayStage
+# and Department are withheld as inpatient-workflow noise.
+#
+# Note the honest coverage position: of the 19 rule families, this graph can
+# ground roughly half. `check_dose` and `check_combination` return
+# NOT_COVERED by construction. See docs/kg_coverage.md.
+
+name: tcm-pa
+dataset:
+  kind: pa
+  path: data/pa/TCMEval-PA.xlsx
+  limit: null
+
+task: pa
+domain: prescription_safety
+
+models: [deepseek, gemini, glm, gpt, minimax]
+conditions: [M0, M1, M2, M3, M4]
+samples: 1
+
+decode:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 2048
+  seed: 20260829
+
+retrieval:
+  alpha_semantic: 0.60
+  beta_graph: 0.25
+  gamma_source: 0.15
+  top_k: 8
+  graph_hops: 2
+  graph_decay: 0.5
+
+tool_budget:
+  max_calls: 12
+  max_calls_per_tool: 4
+  max_result_chars: 4000
+
+context_budget:
+  max_chars: 6000
+  max_entities_per_block: 8
+
+max_agent_turns: 16
+max_format_retries: 2
+
+output_dir: runs/pa
+concurrency: 4

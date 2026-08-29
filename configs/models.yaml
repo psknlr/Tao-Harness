@@ -1,0 +1,60 @@
+# Model registry.
+#
+# Only `model.generate()` differs between arms; everything else is frozen by
+# the framework hash. Decode parameters live in the experiment config, not
+# here, so a single edit changes them for every model at once and no model can
+# quietly get a different temperature.
+#
+# Update `model_id` to the exact snapshot you run, and record it in the paper:
+# a marketing name is not a reproducible identifier.
+
+models:
+  deepseek:
+    provider: openai_compat
+    model_id: deepseek-chat
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    input_usd_per_mtok: 0.27
+    output_usd_per_mtok: 1.10
+
+  gemini:
+    provider: gemini
+    model_id: gemini-2.5-pro
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key_env: GEMINI_API_KEY
+    input_usd_per_mtok: 1.25
+    output_usd_per_mtok: 10.00
+
+  glm:
+    provider: openai_compat
+    model_id: glm-4.6
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_env: ZHIPU_API_KEY
+    input_usd_per_mtok: 0.60
+    output_usd_per_mtok: 2.20
+
+  gpt:
+    provider: openai_compat
+    model_id: gpt-4.1
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    input_usd_per_mtok: 2.00
+    output_usd_per_mtok: 8.00
+
+  minimax:
+    provider: openai_compat
+    model_id: MiniMax-Text-01
+    base_url: https://api.minimax.chat/v1
+    api_key_env: MINIMAX_API_KEY
+    input_usd_per_mtok: 0.20
+    output_usd_per_mtok: 1.10
+
+  # Offline model used by the test suite and by `--dry-run`.
+  echo:
+    provider: echo
+    model_id: echo-1
+
+# The judge is pinned separately and scores every arm identically, so judge
+# quality is a constant rather than a variable in the comparison.
+judge:
+  model: gpt

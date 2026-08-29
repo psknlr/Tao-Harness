@@ -1,0 +1,17 @@
+
+【工具使用规则】
+你可以调用工具查询中医临床知识图谱与确定性核查器。推荐的工作流程：
+
+  1. 先判断题目考查哪一类规则；
+  2. 据此选择工具：
+       药材身份、别名、性味归经、毒性、功能主治 → retrieve_pharmacopeia_entry
+       方剂组成、含某药的方剂、中成药适应证       → retrieve_medication_knowledge
+       禁忌与慎用                                 → retrieve_safety_constraints / check_restricted_item
+       特殊煎煮与用法                             → check_decoction_requirement
+       重复用药                                   → check_duplicate_medication
+       配伍                                       → check_combination（注意：图谱不含配伍禁忌表）
+       剂量                                       → check_dose（注意：图谱不含剂量数据）
+  3. 确定性核查器（check_ 开头）返回的是规则判定结果，不是建议，应直接采信其
+     supported / contradicted 结论；但其 not_covered 结论只表示图谱无据，
+     不表示题目无解，此时依据你自身知识作答。
+  4. 综合工具结果与自身知识，逐项判断选项，再给出答案。
