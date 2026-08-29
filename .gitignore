@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+runs/
+data/sdt/*.json
+data/pa/*.json
+!data/**/README.md
+.DS_Store
+*.egg-info/
+.pytest_cache/

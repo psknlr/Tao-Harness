@@ -1,0 +1,26 @@
+[
+  {
+    "id": "pa_demo_001",
+    "question": "下列中药中，处方调配时需要标注“先煎”的是：",
+    "options": {"A": "石膏", "B": "薄荷", "C": "阿胶", "D": "三七粉"},
+    "answer": "A",
+    "question_type": "单选题",
+    "rule_id": "N-003"
+  },
+  {
+    "id": "pa_demo_002",
+    "question": "某处方同时开具了瓜蒌与全瓜蒌，属于下列哪种情形？",
+    "options": {"A": "重复用药", "B": "配伍禁忌", "C": "超剂量", "D": "用法不当"},
+    "answer": "A",
+    "question_type": "单选题",
+    "rule_id": "A-008"
+  },
+  {
+    "id": "pa_demo_003",
+    "question": "关于附子的说法，正确的有：",
+    "options": {"A": "药典标注有毒", "B": "需先煎", "C": "属于麻醉药品", "D": "无需特殊处理"},
+    "answer": "AB",
+    "question_type": "多选题",
+    "rule_id": "N-007"
+  }
+]

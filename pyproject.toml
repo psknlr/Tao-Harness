@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcm-kg-agent"
+version = "1.0.0"
+description = "A frozen KG-agent harness for evaluating LLMs on TCMEval-SDT and TCMEval-PA"
+requires-python = ">=3.10"
+# PyYAML is the only runtime dependency. Everything else -- HTTP, retrieval,
+# statistics -- is standard library, so a run reproduces from a clean Python
+# years from now without resolving a wheel that may no longer exist.
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+tcm-bench = "runner.benchmark_runner:main"
+
+[tool.setuptools]
+packages = ["tcm_kg", "tcm_tools", "tcm_agent", "tcm_models", "tcm_eval", "runner", "scripts"]
+
+[tool.setuptools.package-data]
+tcm_agent = ["prompts/*.txt"]
