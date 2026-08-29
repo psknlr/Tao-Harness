@@ -1,7 +1,8 @@
 name: tcm-test-pa
 dataset:
   kind: pa
-  path: tests/fixtures/pa_sample.json
+  path: data/pa/TCMEval-PA.xlsx
+  limit: 6
 task: pa
 domain: prescription_safety
 models: [echo]
@@ -10,7 +11,7 @@ samples: 1
 decode: {temperature: 0.0, max_tokens: 512, seed: 7}
 retrieval: {top_k: 4, graph_hops: 1}
 tool_budget: {max_calls: 4, max_calls_per_tool: 2, max_result_chars: 1500}
-context_budget: {max_chars: 2500, max_entities_per_block: 4}
+context_budget: {max_chars: 3000, max_entities_per_block: 4}
 max_agent_turns: 6
 output_dir: runs/test
 concurrency: 1

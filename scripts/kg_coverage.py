@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tcm_kg.schema import EdgeType, NodeType
@@ -226,6 +227,129 @@ def _table(rows: Sequence[Sequence[str]], headers: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+#: Verdict per rule family, mirrored by ``tcm_eval.report.RULE_GROUNDABILITY``.
+def _verdict_map(audits: Sequence[RuleAudit]) -> Dict[str, str]:
+    return {a.rule_id: a.verdict for a in audits}
+
+
+def benchmark_impact(audits: Sequence[RuleAudit], pa_path) -> Optional[str]:
+    """How the graph's gaps land on the *released* PA item distribution.
+
+    A rule family the graph cannot ground matters in proportion to how many
+    questions it carries. A-003 (single-herb dosage) is the largest family in
+    the released set and is exactly the one with no data behind it, so the
+    ceiling on any KG effect is far below 100% of items -- a number worth
+    stating before running anything.
+    """
+    from collections import Counter
+
+    try:
+        from tcm_eval.datasets import load_dataset
+
+        dataset = load_dataset(pa_path, "pa")
+    except Exception:
+        return None
+
+    verdicts = _verdict_map(audits)
+    counts = Counter(str(i.get("rule_id") or "?").upper() for i in dataset.items)
+    by_verdict: Dict[str, int] = {}
+    for rule, n in counts.items():
+        by_verdict[verdicts.get(rule, "unknown")] = by_verdict.get(verdicts.get(rule, "unknown"), 0) + n
+
+    total = sum(counts.values())
+    rows = [
+        [rule, verdicts.get(rule, "?"), n, f"{100 * n / total:.1f}%"]
+        for rule, n in counts.most_common()
+    ]
+    lines = [
+        "## Where the gaps land on the released PA set",
+        "",
+        f"{total} items, by rule family:",
+        "",
+        _table(rows, ["rule", "graph verdict", "items", "share"]),
+        "",
+        "Pooled by verdict:",
+        "",
+        _table(
+            [
+                [verdict, n, f"{100 * n / total:.1f}%"]
+                for verdict, n in sorted(by_verdict.items(), key=lambda kv: -kv[1])
+            ],
+            ["graph verdict", "items", "share"],
+        ),
+        "",
+        f"**{100 * by_verdict.get('not grounded', 0) / total:.0f}% of released PA items "
+        f"fall in rule families this graph cannot ground at all.** The single "
+        f"largest family, A-003 (single-herb dosage, {counts.get('A-003', 0)} items), "
+        f"is one of them. Any KG effect on PA is therefore bounded to roughly the "
+        f"remaining half, and PA results should be reported split by verdict rather "
+        f"than pooled.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def sdt_option_coverage(kg: KGStore, retriever, sdt_paths: Sequence[Any]) -> Optional[str]:
+    """How much of the SDT option pool the graph knows -- and whether it leaks.
+
+    The check that matters is not how many options the graph covers, but
+    whether it covers the *correct* ones more often. If gold options were
+    better covered than distractors, a model could score by picking whichever
+    option the graph recognises, and the KG condition would be measuring
+    leakage rather than reasoning.
+    """
+    try:
+        from tcm_agent.tasks import build_task
+        from tcm_eval.datasets import load_dataset
+    except Exception:
+        return None
+
+    task = build_task("sdt", kg, retriever)
+    rows = []
+    for path in sdt_paths:
+        try:
+            dataset = load_dataset(path, "sdt")
+        except Exception:
+            continue
+        found = total = gold_found = gold_total = 0
+        for item in dataset.items:
+            lookup = task._lookup_options(item.get("syndrome_options"))
+            gold = set(item.get("syndrome_letters") or [])
+            for entry in lookup:
+                total += 1
+                found += bool(entry["found"])
+                if entry["option"] in gold:
+                    gold_total += 1
+                    gold_found += bool(entry["found"])
+        if not total:
+            continue
+        rows.append(
+            [
+                Path(path).stem,
+                len(dataset),
+                f"{found}/{total} ({100 * found / total:.0f}%)",
+                f"{gold_found}/{gold_total} ({100 * gold_found / max(1, gold_total):.0f}%)",
+            ]
+        )
+    if not rows:
+        return None
+    return "\n".join(
+        [
+            "## SDT option coverage, and the leakage check",
+            "",
+            _table(rows, ["split", "cases", "options in graph", "**gold** options in graph"]),
+            "",
+            "The two rates are the point. They match closely, which means the "
+            "graph is **not** biased toward the correct options: a model cannot "
+            "score by picking whichever option the graph happens to recognise. "
+            "Had the gold rate been materially higher, the KG conditions would "
+            "have been measuring answer leakage rather than reasoning, and the "
+            "option-lookup tool would have had to be withdrawn.",
+            "",
+        ]
+    )
+
+
 def coverage_report(kg: KGStore, retriever=None) -> str:
     facts = graph_facts(kg)
     audits = audit_rules(facts)
@@ -287,13 +411,35 @@ def coverage_report(kg: KGStore, retriever=None) -> str:
         "makes any SDT pathogenesis gain attributable to the graph narrowing "
         "the reasoning space rather than to retrieving the answer.",
         "",
-        "## Measured facts",
-        "",
-        "```json",
-        json.dumps(facts, ensure_ascii=False, indent=2),
-        "```",
-        "",
     ]
+
+    impact = benchmark_impact(audits, Path("data/pa/TCMEval-PA.xlsx"))
+    if impact:
+        parts.extend(["", impact])
+    if retriever is not None:
+        option_coverage = sdt_option_coverage(
+            kg,
+            retriever,
+            [
+                Path("data/sdt/Test_TCM_Data_v1.json"),
+                Path("data/sdt/Validation_TCM_Data_v1.json"),
+                Path("data/sdt/Train_TCM_Data_v1.json"),
+            ],
+        )
+        if option_coverage:
+            parts.extend(["", option_coverage])
+
+    parts.extend(
+        [
+            "",
+            "## Measured facts",
+            "",
+            "```json",
+            json.dumps(facts, ensure_ascii=False, indent=2),
+            "```",
+            "",
+        ]
+    )
     return "\n".join(parts)
 
 

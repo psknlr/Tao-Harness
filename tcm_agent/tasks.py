@@ -92,8 +92,26 @@ class Task(abc.ABC):
         self, result: Mapping[str, Any], item: Mapping[str, Any]
     ) -> Optional[Dict[str, Any]]: ...
 
-    def normalise_result(self, result: Mapping[str, Any]) -> Dict[str, Any]:
+    def normalise_result(
+        self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
         return dict(result)
+
+    @staticmethod
+    def clamp_letters(value: Any, options: Mapping[str, Any]) -> List[str]:
+        """Keep only letters that name a real option for this item.
+
+        A model that answers ``K`` on a ten-option question has not made a
+        scoreable choice; silently passing it through would let a formatting
+        slip read as a wrong answer, and letting it into a submission file
+        would be scored as a wrong pick by the official evaluator, which
+        dilutes credit for the picks that were right.
+        """
+        letters = normalise_options(value)
+        if not options:
+            return letters
+        valid = {str(k).upper() for k in options}
+        return [letter for letter in letters if letter in valid]
 
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +120,16 @@ class Task(abc.ABC):
 
 
 class SDTTask(Task):
-    """TCMEval-SDT: syndrome differentiation from a clinical record."""
+    """TCMEval-SDT: a four-task benchmark, scored 0.2/0.3/0.4/0.1.
+
+    Tasks 2 and 3 are ten-option multiple choice with possibly several correct
+    answers, which changes what the knowledge graph is for: the options arrive
+    as *named* pathogeneses and syndromes, so the agent can look each candidate
+    up directly instead of having to guess a name from the case text. That is a
+    far better fit for this graph than free-form naming, and it is why
+    ``static_context`` resolves the option list against the graph rather than
+    only running the case text through retrieval.
+    """
 
     name = "sdt"
     domain = Domain.CLINICAL
@@ -118,11 +145,24 @@ class SDTTask(Task):
         return "\n".join(parts)
 
     def user_message(self, item: Mapping[str, Any]) -> str:
-        return f"【病例】\n{coerce_str(item.get('clinical_data'))}"
+        lines = [f"【病例】\n{coerce_str(item.get('clinical_data'))}", ""]
+        lines.append("【任务二 病机选项】")
+        lines.extend(self._render_options(item.get("pathogenesis_options")))
+        lines.append("")
+        lines.append("【任务三 证候选项】")
+        lines.extend(self._render_options(item.get("syndrome_options")))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_options(options: Any) -> List[str]:
+        if not isinstance(options, Mapping) or not options:
+            return ["（本题未提供选项）"]
+        return [f"{letter}. {text}" for letter, text in sorted(options.items())]
 
     def answer_fields(self) -> Sequence[str]:
-        return ("clinical_information", "pathogenesis", "syndrome", "explanation")
+        return ("clinical_information", "pathogenesis_answer", "syndrome_answer", "explanation")
 
+    # ------------------------------------------------------------- retrieval
     def static_context(self, item: Mapping[str, Any]) -> Dict[str, Any]:
         query = clinical_query(item.get("clinical_data"))
         limit = self.context_budget.max_entities_per_block
@@ -162,52 +202,123 @@ class SDTTask(Task):
                 }
             )
 
-        documents: List[Dict[str, Any]] = []
-        seen_docs: set = set()
-        for hit in list(diseases) + list(syndromes):
-            for doc_id in hit.source_docs[:2]:
-                if doc_id in seen_docs:
-                    continue
-                seen_docs.add(doc_id)
-                doc = self.kg.document(doc_id)
-                if doc is not None:
-                    documents.append(
-                        {
-                            "doc_id": doc_id,
-                            "title": doc.attrs.get("title"),
-                            "doc_type": doc.attrs.get("doc_type"),
-                            "department": doc.attrs.get("department"),
-                            "version": doc.attrs.get("version_label"),
-                        }
-                    )
         return {
             "retrieval_query": query,
             "disease_anchors": subgraph,
-            "syndrome_candidates": [
-                {
-                    "name": h.name,
-                    "score": round(h.score, 3),
-                    "definition": h.matched_text[:220],
-                }
+            "syndrome_candidates_from_case": [
+                {"name": h.name, "score": round(h.score, 3), "definition": h.matched_text[:220]}
                 for h in syndromes
             ],
-            "documents": documents[:6],
+            "syndrome_option_lookup": self._lookup_options(item.get("syndrome_options")),
+            "pathogenesis_option_lookup": self._lookup_options(
+                item.get("pathogenesis_options"), as_syndrome=False
+            ),
             "note": (
-                "图谱不含症状与病机实体；证候的 definition 字段是诊疗方案原文定义句。"
+                "图谱不含症状与病机实体；证候的 definition 是诊疗方案原文定义句。"
+                "option_lookup 中 found=false 只表示该名称不在本图谱收录范围内，"
+                "不是排除该选项的理由。"
             ),
         }
 
+    def _lookup_options(
+        self, options: Any, *, as_syndrome: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Resolve each named option against the graph.
+
+        Reported for every option, found or not, so the model sees a uniform
+        table rather than a list biased toward whatever the graph happens to
+        cover -- absence of an option from this graph is not evidence against
+        it, and a partial table would imply otherwise.
+        """
+        if not isinstance(options, Mapping):
+            return []
+        out: List[Dict[str, Any]] = []
+        for letter, text in sorted(options.items()):
+            name = str(text).strip()
+            record: Dict[str, Any] = {"option": letter, "name": name, "found": False}
+            matches = self.kg.find_by_name(name, [NodeType.SYNDROME.value])
+            if not matches and as_syndrome:
+                matches = self.kg.find_by_name(canonical_syndrome(name), [NodeType.SYNDROME.value])
+            if not matches:
+                # the option pool is drawn from case annotations, so many names
+                # are phrase-like ("阴亏之体"); fall back to a similarity-gated
+                # lexical hit rather than an unconditional top-1
+                for hit in self.retriever.search(
+                    name, domain=self.domain, node_types=[NodeType.SYNDROME.value], top_k=3
+                ):
+                    node = self.kg.node(hit.node_id)
+                    if node is not None and _surface_overlap(name, node.name) >= 0.5:
+                        matches = [node]
+                        break
+            if matches:
+                node = matches[0]
+                record.update(
+                    {
+                        "found": True,
+                        "graph_name": node.name,
+                        "definition": node.sentence()[:220],
+                        "diseases": [
+                            self.kg.nodes[e.source].name
+                            for e in self.kg.in_edges(
+                                node.id,
+                                {
+                                    EdgeType.HAS_SYNDROME.value,
+                                    EdgeType.SUBTYPE_HAS_SYNDROME.value,
+                                },
+                            )
+                        ][:4],
+                    }
+                )
+            out.append(record)
+        return out
+
+    # ---------------------------------------------------------- verification
     def verify_arguments(
         self, result: Mapping[str, Any], item: Mapping[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        syndrome = canonical_syndrome(coerce_str(result.get("syndrome")))
-        if not syndrome:
+        """Verify the *text* behind the chosen syndrome letters, not the letters."""
+        options = item.get("syndrome_options") or {}
+        letters = self.clamp_letters(result.get("syndrome_answer"), options)
+        names = [str(options[letter]).strip() for letter in letters if letter in options]
+        if not names:
             return None
-        features = coerce_list(result.get("clinical_information"))
         return {
-            "syndrome": syndrome,
-            "clinical_features": features[:20],
+            "syndrome": canonical_syndrome(names[0]),
+            "clinical_features": coerce_list(result.get("clinical_information"))[:20],
         }
+
+    def normalise_result(
+        self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
+        out = dict(result)
+        pathogenesis_options = (item or {}).get("pathogenesis_options") or {}
+        syndrome_options = (item or {}).get("syndrome_options") or {}
+        out["pathogenesis_answer"] = self.clamp_letters(
+            result.get("pathogenesis_answer"), pathogenesis_options
+        )
+        out["syndrome_answer"] = self.clamp_letters(
+            result.get("syndrome_answer"), syndrome_options
+        )
+        out["clinical_information"] = [
+            part for part in coerce_list(result.get("clinical_information")) if part
+        ]
+        out["explanation"] = coerce_str(result.get("explanation"))
+        return out
+
+
+def _surface_overlap(left: str, right: str) -> float:
+    """Character-bigram Jaccard between two names."""
+    from tcm_kg.normalize import char_ngrams, normalize_text
+
+    a, b = normalize_text(left), normalize_text(right)
+    if not a or not b:
+        return 0.0
+    if a == b or a in b or b in a:
+        return 1.0
+    x, y = set(char_ngrams(a, (2,))), set(char_ngrams(b, (2,)))
+    if not x or not y:
+        return 0.0
+    return len(x & y) / len(x | y)
 
 
 # --------------------------------------------------------------------------- #
@@ -234,19 +345,19 @@ class PATask(Task):
         return "\n".join(parts)
 
     def user_message(self, item: Mapping[str, Any]) -> str:
-        lines = [f"【题目】\n{coerce_str(item.get('question'))}"]
+        lines = [f"【题目】\n{coerce_str(item.get('question'))}", "【选项】"]
         options = item.get("options")
-        if options:
-            lines.append("【选项】")
-            if isinstance(options, Mapping):
-                for key in sorted(options):
-                    lines.append(f"{key}. {coerce_str(options[key])}")
-            else:
-                for option in options:
-                    lines.append(coerce_str(option))
-        kind = item.get("question_type") or item.get("type")
-        if kind:
-            lines.append(f"【题型】{coerce_str(kind)}")
+        if isinstance(options, Mapping):
+            for key in sorted(options):
+                lines.append(f"{key}. {coerce_str(options[key])}")
+        elif options:
+            lines.extend(coerce_str(option) for option in options)
+        n_gold = len(item.get("answer_letters") or [])
+        # The released set is 297 single- plus 31 multiple-choice and marks the
+        # distinction only through the answer key, which is gold. Telling the
+        # model how many options are correct would leak that key, so the prompt
+        # says only that either is possible.
+        lines.append("【题型】单选或多选，请自行判断")
         return "\n".join(lines)
 
     def answer_fields(self) -> Sequence[str]:
@@ -376,9 +487,11 @@ class PATask(Task):
         # checkers named by the rule category (see runtime._verify_pa).
         return None
 
-    def normalise_result(self, result: Mapping[str, Any]) -> Dict[str, Any]:
+    def normalise_result(
+        self, result: Mapping[str, Any], item: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
         out = dict(result)
-        out["answer"] = normalise_options(result.get("answer"))
+        out["answer"] = self.clamp_letters(result.get("answer"), (item or {}).get("options") or {})
         return out
 
 

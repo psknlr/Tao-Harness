@@ -4,8 +4,13 @@ __pycache__/
 venv/
 .env
 runs/
+# Benchmark datasets are not redistributed here; see data/*/README.md
 data/sdt/*.json
+data/sdt/Results/
+data/pa/*.xlsx
 data/pa/*.json
+data/tcmsd/*.json
+data/tcmsd/*.txt
 !data/**/README.md
 .DS_Store
 *.egg-info/

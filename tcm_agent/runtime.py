@@ -157,7 +157,7 @@ class AgentRuntime:
             user = f"{user}\n\n{rendered}"
         messages = [Message("system", system), Message("user", user)]
         outcome = self._ask(messages, trace, phase="answer", sample=sample)
-        self._finalise(outcome, trace)
+        self._finalise(outcome, trace, item)
 
     # ------------------------------------------------------------ M3 / M4
     def _run_agent(
@@ -234,7 +234,7 @@ class AgentRuntime:
             result = self._verify_and_revise(item, result, ctx, trace, sample)
 
         if result is not None:
-            trace.final = self.task.normalise_result(result)
+            trace.final = self.task.normalise_result(result, item)
             trace.final_raw = json.dumps(result, ensure_ascii=False)
 
     # ----------------------------------------------------------- verification
@@ -395,7 +395,9 @@ class AgentRuntime:
     def _budget_note(ctx: ToolContext) -> str:
         return f"\n[剩余工具预算: {ctx.remaining()} 次]"
 
-    def _finalise(self, outcome: ParseOutcome, trace: Trace) -> None:
+    def _finalise(
+        self, outcome: ParseOutcome, trace: Trace, item: Mapping[str, Any]
+    ) -> None:
         trace.parse_strategy = outcome.strategy
         trace.final_raw = outcome.raw
         if outcome.value is None:
@@ -405,4 +407,4 @@ class AgentRuntime:
         payload = outcome.value
         if "result" in payload and isinstance(payload["result"], Mapping):
             payload = payload["result"]
-        trace.final = self.task.normalise_result(payload)
+        trace.final = self.task.normalise_result(payload, item)

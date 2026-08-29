@@ -1,9 +1,9 @@
-你是一位中医临床医师。请阅读以下病例，给出中医辨证结论。
+你是一位中医临床医师。请阅读病例，完成四项任务。
 
 请只输出一个 JSON 对象，不要输出任何其他文字：
 {
-  "clinical_information": "对病例临床资料的归纳",
-  "pathogenesis": "中医病机分析",
-  "syndrome": "最终证候名称",
-  "explanation": "辨证依据的简要说明"
+  "clinical_information": ["核心临床信息条目"],
+  "pathogenesis_answer": ["病机选项字母"],
+  "syndrome_answer": ["证候选项字母"],
+  "explanation": "临证体会与辨证结论"
 }

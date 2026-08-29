@@ -86,6 +86,55 @@ A rule marked *not grounded* is not a defect to be papered over. The correspondi
 - **PA is the explicit-knowledge probe** only for the grounded and partial families. Reporting PA accuracy split by verdict is the cleanest test of RQ4: if the KG gain concentrates in the grounded families, the mechanism is knowledge injection rather than a general prompting effect.
 - **No entity was added to the ontology to suit either benchmark.** There is no Symptom node and no Pathogenesis node. Pathogenesis is treated as a latent reasoning variable produced by the model, which makes any SDT pathogenesis gain attributable to the graph narrowing the reasoning space rather than to retrieving the answer.
 
+
+## Where the gaps land on the released PA set
+
+328 items, by rule family:
+
+| rule | graph verdict | items | share |
+|---|---|---|---|
+| A-003 | not grounded | 87 | 26.5% |
+| A-007 | partial | 64 | 19.5% |
+| N-003 | grounded | 36 | 11.0% |
+| A-001 | not grounded | 35 | 10.7% |
+| A-005 | partial | 20 | 6.1% |
+| N-007 | partial | 14 | 4.3% |
+| N-001 | not grounded | 11 | 3.4% |
+| N-002 | not grounded | 10 | 3.0% |
+| A-006 | grounded | 9 | 2.7% |
+| A-004 | partial | 9 | 2.7% |
+| C-001 | not grounded | 6 | 1.8% |
+| N-006 | not grounded | 6 | 1.8% |
+| N-005 | not grounded | 5 | 1.5% |
+| A-002 | grounded | 4 | 1.2% |
+| A-008 | partial | 4 | 1.2% |
+| A-009 | not grounded | 4 | 1.2% |
+| N-009 | partial | 2 | 0.6% |
+| N-008 | not grounded | 1 | 0.3% |
+| N-004 | not grounded | 1 | 0.3% |
+
+Pooled by verdict:
+
+| graph verdict | items | share |
+|---|---|---|
+| not grounded | 166 | 50.6% |
+| partial | 113 | 34.5% |
+| grounded | 49 | 14.9% |
+
+**51% of released PA items fall in rule families this graph cannot ground at all.** The single largest family, A-003 (single-herb dosage, 87 items), is one of them. Any KG effect on PA is therefore bounded to roughly the remaining half, and PA results should be reported split by verdict rather than pooled.
+
+
+## SDT option coverage, and the leakage check
+
+| split | cases | options in graph | **gold** options in graph |
+|---|---|---|---|
+| Test_TCM_Data_v1 | 50 | 161/500 (32%) | 25/81 (31%) |
+| Validation_TCM_Data_v1 | 50 | 183/500 (37%) | 25/77 (32%) |
+| Train_TCM_Data_v1 | 200 | 689/2000 (34%) | 115/335 (34%) |
+
+The two rates are the point. They match closely, which means the graph is **not** biased toward the correct options: a model cannot score by picking whichever option the graph happens to recognise. Had the gold rate been materially higher, the KG conditions would have been measuring answer leakage rather than reasoning, and the option-lookup tool would have had to be withdrawn.
+
+
 ## Measured facts
 
 ```json

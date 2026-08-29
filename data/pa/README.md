@@ -1,20 +1,33 @@
 # TCMEval-PA
 
-Place the benchmark file here, e.g. `TCMEval-PA.json` (328 items: 297
-single-choice, 31 multiple-choice).
+Place `TCMEval-PA.xlsx` here (the released workbook; `.json` also works).
 
 Source: *TCMEval-PA: a question-answering benchmark dataset for the
 prescription audit of Traditional Chinese Medicine*, Scientific Data (2025),
 <https://doi.org/10.1038/s41597-025-06387-6>.
 
-Scoring uses `rule_id` (A-001…A-009, N-001…N-009, C-001) for the per-rule
-breakdown that RQ4 turns on. If your copy names that field differently, add the
-key to `PA_ALIASES` in `tcm_eval/datasets.py`; without it the per-rule analysis
-degrades to an overall accuracy and the explicit-vs-implicit contrast is lost.
+328 items — 297 single-choice, 31 multiple-choice — with columns `ID`,
+`Question`, `Candidate Answers`, `Answer`, `Explanation`, `Category`,
+`Rule_ID`, `Rule_summary`. The workbook is read with a stdlib-only parser
+(`tcm_eval/xlsx.py`), so no pandas or openpyxl is required.
 
-Check the binding first:
+`Rule_ID` drives the per-rule analysis that RQ4 turns on. The released
+distribution, against what this knowledge graph can ground:
+
+| rule | items | graph verdict |
+|---|---|---|
+| A-003 single-herb dosage | 87 | not grounded |
+| A-007 contraindications | 64 | partial |
+| N-003 special decoction | 36 | **grounded** |
+| A-001 appropriateness concepts | 35 | not grounded |
+| A-005 administration | 20 | partial |
+| … | | |
+
+Pooled: **166 items (51%) not grounded, 113 partial, 49 grounded.** Report PA
+accuracy split by verdict; pooling hides the effect. Regenerate the full table
+with `python -m runner.benchmark_runner coverage`.
 
 ```bash
 python -m runner.benchmark_runner inspect \
-  --dataset data/pa/TCMEval-PA.json --dataset-kind pa
+  --dataset data/pa/TCMEval-PA.xlsx --dataset-kind pa
 ```

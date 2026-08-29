@@ -18,14 +18,16 @@ REPO = Path(__file__).resolve().parent.parent
 SDT_CONFIG = "tests/fixtures/experiment.test.yaml"
 PA_CONFIG = "tests/fixtures/experiment.pa.test.yaml"
 
+#: A fixed answer for 病例247 (gold: pathogenesis D, syndrome J), so the scored
+#: numbers below are checkable by hand against the released answer file.
 SDT_ANSWER = json.dumps(
     {
         "action": "answer",
         "result": {
-            "clinical_information": "心悸；善惊易恐；多梦易醒；食少纳呆",
-            "pathogenesis": "心胆气虚，心神失养",
-            "syndrome": "心虚胆怯证",
-            "explanation": "善惊易恐为心胆气虚之特征表现",
+            "clinical_information": ["咳逆不能平卧", "唾白色泡沫痰", "短气"],
+            "pathogenesis_answer": ["D"],
+            "syndrome_answer": ["J"],
+            "explanation": "临证体会：少阴伤寒，阴寒内盛。辨证：少阴伤寒，阴寒内盛",
         },
     },
     ensure_ascii=False,
@@ -34,14 +36,16 @@ PA_ANSWER = json.dumps(
     {
         "action": "answer",
         "result": {
-            "rule_category": "特殊煎煮",
-            "option_analysis": "石膏为矿物类，需先煎",
-            "answer": ["A"],
-            "reasoning": "图谱记载石膏先煎",
+            "rule_category": "基础概念",
+            "option_analysis": "逐项分析",
+            "answer": ["E"],
+            "reasoning": "图谱未收录该法规条文，依据自身知识判断",
         },
     },
     ensure_ascii=False,
 )
+N_SDT_CASES = 4
+N_PA_CASES = 6
 
 
 class EndToEndTests(unittest.TestCase):
@@ -55,7 +59,7 @@ class EndToEndTests(unittest.TestCase):
         code = main(["run", SDT_CONFIG, "--echo-script", SDT_ANSWER])
         self.assertEqual(code, 0)
         traces = read_traces(self.out / "traces.sdt.echo.jsonl")
-        self.assertEqual(len(traces), 2 * 5)  # 2 cases x 5 conditions
+        self.assertEqual(len(traces), N_SDT_CASES * 5)
         self.assertEqual(len({t.framework_hash for t in traces}), 1)
         self.assertTrue(all(t.final is not None for t in traces))
 
@@ -69,13 +73,16 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(main(["score", SDT_CONFIG]), 0)
         path = self.out / "scores.sdt.jsonl"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(rows), 10)
-        # case 1's gold syndrome is 心虚胆怯证, case 2's is 痰瘀郁肺证
+        self.assertEqual(len(rows), N_SDT_CASES * 5)
+        # 病例247's gold answers are pathogenesis D and syndrome J, which the
+        # scripted answer matches exactly; every other case it gets wrong
         by_case = {}
         for row in rows:
-            by_case.setdefault(row["case_id"], []).append(row["metrics"]["syndrome_exact"])
-        self.assertEqual(set(by_case["sdt_demo_001"]), {1.0})
-        self.assertEqual(set(by_case["sdt_demo_002"]), {0.0})
+            by_case.setdefault(row["case_id"], []).append(row["metrics"])
+        hit = by_case["病例247"][0]
+        self.assertEqual(hit["task2_pathogenesis"], 1.0)
+        self.assertEqual(hit["task3_syndrome"], 1.0)
+        self.assertIn("sdt_composite", hit)
 
     def test_04_report_renders(self):
         target = self.out / "report.md"
@@ -91,12 +98,26 @@ class EndToEndTests(unittest.TestCase):
             main(["run", SDT_CONFIG, "--overwrite", "--replay"]), 0
         )
         traces = read_traces(self.out / "traces.sdt.echo.jsonl")
-        self.assertEqual(len(traces), 10)
+        self.assertEqual(len(traces), N_SDT_CASES * 5)
         self.assertTrue(all(t.final is not None for t in traces), "replay lost answers")
 
     def test_06_compare_is_paired(self):
         scores = self.out / "scores.sdt.jsonl"
-        self.assertEqual(main(["compare", str(scores), str(scores), "--metric", "syndrome_exact"]), 0)
+        self.assertEqual(
+            main(["compare", str(scores), str(scores), "--metric", "sdt_composite"]), 0
+        )
+
+    def test_06b_submission_file_is_official_format(self):
+        target = self.out / "sub.txt"
+        self.assertEqual(
+            main(["submit", SDT_CONFIG, "--model", "echo", "--condition", "M3",
+                  "--out", str(target)]), 0
+        )
+        lines = [l for l in target.read_text(encoding="utf-8").splitlines() if l]
+        # a submission must cover every case in the split, not only those run
+        self.assertEqual(len(lines), 50)
+        self.assertTrue(all(line.count("@") == 4 for line in lines))
+        self.assertTrue(lines[0].startswith("病例247@"))
 
     def test_07_pa_pipeline_runs_and_scores(self):
         self.assertEqual(main(["run", PA_CONFIG, "--echo-script", PA_ANSWER]), 0)
@@ -105,10 +126,11 @@ class EndToEndTests(unittest.TestCase):
             json.loads(line)
             for line in (self.out / "scores.pa.jsonl").read_text(encoding="utf-8").splitlines()
         ]
-        self.assertEqual(len(rows), 3 * 2)
-        by_case = {r["case_id"]: r["metrics"]["exact"] for r in rows}
-        self.assertEqual(by_case["pa_demo_001"], 1.0)  # answer A, gold A
-        self.assertEqual(by_case["pa_demo_003"], 0.0)  # answer A, gold AB
+        self.assertEqual(len(rows), N_PA_CASES * 2)
+        by_case = {r["case_id"]: r["metrics"] for r in rows}
+        self.assertEqual(by_case["1"]["exact"], 1.0)   # gold E, answered E
+        self.assertEqual(by_case["2"]["exact"], 0.0)   # gold D, answered E
+        self.assertEqual(by_case["1"]["rule_id"], "C-001")
 
     def test_08_mixed_framework_hashes_are_refused(self):
         path = self.out / "traces.sdt.echo.jsonl"
@@ -124,8 +146,9 @@ class EndToEndTests(unittest.TestCase):
             path.write_text(original, encoding="utf-8")
 
     def test_09_inspect_and_coverage_run(self):
-        self.assertEqual(main(["inspect", "--dataset", "tests/fixtures/pa_sample.json",
-                               "--dataset-kind", "pa"]), 0)
+        self.assertEqual(
+            main(["inspect", "--dataset", "data/pa/TCMEval-PA.xlsx", "--dataset-kind", "pa"]), 0
+        )
         self.assertEqual(main(["coverage", "--out", str(self.out / "coverage.md")]), 0)
 
 

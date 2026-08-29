@@ -4,10 +4,15 @@ A frozen agent harness for measuring what a Traditional Chinese Medicine
 clinical knowledge graph adds to frontier LLMs, across two complementary
 benchmarks:
 
-- **TCMEval-SDT** — syndrome differentiation from a clinical record
-  (knowledge-enhanced *clinical reasoning*)
-- **TCMEval-PA** — multiple-choice prescription audit
-  (knowledge-grounded *rule and tool reasoning*)
+- **TCMEval-SDT** — a *four-task* syndrome-differentiation benchmark
+  (knowledge-enhanced *clinical reasoning*), scored by the benchmark's own
+  weighted rules
+- **TCMEval-PA** — 328 multiple-choice prescription-audit items across 19 rule
+  families (knowledge-grounded *rule and tool reasoning*)
+
+A third corpus, **TCM-SD** (43k EHR records over 148 syndrome labels, plus a
+1,027-entry syndrome knowledge base), loads through the same interface for
+scale-up work.
 
 The same framework serves both. Only `model.generate()` differs between arms,
 and a `framework_hash` proves it.
@@ -44,6 +49,43 @@ and a `framework_hash` proves it.
 ```
 
 ---
+
+## The benchmarks, as released
+
+**TCMEval-SDT is four tasks, not one**, and its `scripts/evaluate.py` fixes the
+scoring:
+
+| task | field | form | weight |
+|---|---|---|---|
+| 1 | `Clinical Information` | `;`-separated findings | 0.2 |
+| 2 | `Answers of TCM Pathogenesis` | letters, 10 options, often multi | 0.3 |
+| 3 | `Answers of TCM Syndrome` | letters, 10 options, often multi | 0.4 |
+| 4 | `Explanatory Summary` + `Syndrome Differentiation` | free text, ROUGE-L | 0.1 |
+
+Three consequences the harness is built around:
+
+- **Pathogenesis and syndrome are multiple choice.** The options arrive as
+  *named* pathogeneses and syndromes, so the agent can look each candidate up
+  in the graph rather than guess a name from the case text. That fits this
+  graph far better than free-form naming.
+- **The held-out splits ship blank answer columns.** Gold labels for
+  validation and test live only in `Results/*.txt`, in the `@`-separated
+  submission format. The loader merges them by record ID, so pointing at the
+  test split yields a scorable dataset instead of silently scoring against
+  empty strings.
+- **Scoring follows the benchmark, quirks included.** `tcm_eval/official_sdt.py`
+  reproduces the official rules and is checked against the vendored original on
+  perfect, random and empty submissions (`tests/test_official_sdt.py`). Two
+  quirks matter and are preserved: a wrong option **dilutes rather than
+  forfeits** credit (`correct / (|gold| + n_wrong)`, so selecting all ten
+  scores `|gold|/10`, not zero), and because the evaluator never strips line
+  terminators an **empty explanation scores ~0.009 rather than 0**. `submit`
+  writes the official format so a run can be scored by the benchmark's own
+  evaluator rather than only by this harness's arithmetic.
+
+**TCMEval-PA** is 328 items — 297 single-choice, 31 multiple-choice — each
+tagged with one of 19 `Rule_ID` families. The distribution decides how much the
+graph could possibly help; see below.
 
 ## What the knowledge graph actually is
 
@@ -127,8 +169,21 @@ negatives in drug safety are the dangerous kind.
 ### 4. Honest gaps, measured not asserted
 
 `python -m runner.benchmark_runner coverage` audits the 19 PA rule families
-against what the graph holds. The verdict: **3 grounded, 6 partial, 10 not
-grounded.** Concretely, this graph contains
+against what the graph holds, then projects that onto the released item
+distribution. The verdict: **3 grounded, 6 partial, 10 not grounded** — and
+weighted by how many questions each family actually carries:
+
+| graph verdict | PA items | share |
+|---|---|---|
+| not grounded | 166 | 50.6% |
+| partial | 113 | 34.5% |
+| grounded | 49 | 14.9% |
+
+**Half the released PA set is in families this graph cannot ground at all**, and
+the single largest family — A-003, single-herb dosage, 87 items (26.5%) — is
+one of them. Any KG effect on PA is bounded to roughly the other half, which is
+why the report splits PA accuracy by verdict instead of pooling it. Concretely,
+this graph contains
 
 - **no dosage field** — `用法用量` appears 0 times, so `check_dose` returns
   `NOT_COVERED` by construction;
@@ -145,6 +200,24 @@ that reported co-occurrence as evidence of compatibility would confidently
 endorse a classical contraindication. `check_combination` therefore returns
 `not_covered`, labels co-occurrence as weak compatibility evidence only, and
 says the incompatibility table is absent. There is a test for exactly this.
+
+### 4b. The SDT leakage check
+
+The KG conditions hand the model a lookup over the ten named options, which is
+only legitimate if the graph recognises distractors and gold answers at the
+same rate. Measured across all three splits:
+
+| split | options in graph | **gold** options in graph |
+|---|---|---|
+| Test | 161/500 (32%) | 25/81 (31%) |
+| Validation | 183/500 (37%) | 25/77 (32%) |
+| Train | 689/2000 (34%) | 115/335 (34%) |
+
+The rates match, so a model cannot score by picking whichever option the graph
+happens to know. Had gold coverage been materially higher, the KG arms would
+have been measuring answer leakage rather than reasoning and the option-lookup
+tool would have had to be withdrawn. A regression test enforces the gap stays
+under 10 points.
 
 ### 5. Deterministic checks stay deterministic
 
@@ -227,9 +300,13 @@ python -m runner.benchmark_runner inspect \
 export DEEPSEEK_API_KEY=... GEMINI_API_KEY=... OPENAI_API_KEY=...
 python -m runner.benchmark_runner run   configs/experiment.sdt.yaml
 python -m runner.benchmark_runner score configs/experiment.sdt.yaml
-python -m runner.benchmark_runner judge configs/experiment.sdt.yaml   # SDT free-text steps
+python -m runner.benchmark_runner judge configs/experiment.sdt.yaml   # task-4 quality
 python -m runner.benchmark_runner report configs/experiment.sdt.yaml \
                                           configs/experiment.pa.yaml --out runs/report.md
+
+# 5. Emit an official submission file and score it with the benchmark's own script
+python -m runner.benchmark_runner submit configs/experiment.sdt.yaml \
+                                          --model gpt --condition M3
 
 # Offline: replay a recorded run with no API key
 python -m runner.benchmark_runner run configs/experiment.sdt.yaml --replay
@@ -256,18 +333,22 @@ McNemar per contrast, Holm–Bonferroni across the family.
 separating out verification.
 
 **RQ4** Does the gain differ between knowledge the graph encodes explicitly and
-reasoning it only constrains? This is the contrast the two benchmarks were
-chosen for:
+reasoning it only constrains? SDT's four tasks give an unusually clean ladder,
+because they are scored separately under one composite:
 
 | target | relationship to the graph |
 |---|---|
-| PA rules (grounded families) | **explicit** — safety and pharmacopoeia facts are entities and edges |
-| SDT syndrome | **partial** — syndromes are entities, symptoms are not |
-| SDT pathogenesis | **implicit** — not a graph entity at all |
+| PA, grounded families (49 items) | **explicit** — the fact is an entity or an edge |
+| PA, ungroundable families (166 items) | **none** — a control: any gain here is not knowledge injection |
+| SDT task 3, syndrome | **partial** — syndromes are entities, symptoms are not; 32% of options in graph |
+| SDT task 2, pathogenesis | **implicit** — not a graph entity at all |
+| SDT task 1, clinical extraction | **none** — a second control, drawn from the case text alone |
 
-If accuracy on pathogenesis improves even though the graph never encodes a
-pathogenesis, the mechanism is constraint of the reasoning space rather than
-retrieval — a stronger and more interesting result than a lookup win.
+The ungroundable PA families and SDT task 1 are the controls that make the rest
+interpretable. If the KG arms improve there too, the effect is prompting rather
+than knowledge. If accuracy on task 2 improves even though the graph never
+encodes a pathogenesis, the mechanism is constraint of the reasoning space — a
+stronger result than a lookup win.
 
 **Compensation.** `compensation_table` reports Spearman ρ(base score, Δ) across
 models. A negative ρ means the framework compensates weaker base models, which
@@ -309,11 +390,15 @@ runner/       CLI: run · score · judge · report · compare · inspect · cove
 scripts/      KG coverage audit
 configs/      models.yaml + one experiment file per benchmark
 kg/           tcm_knowledge_graph.json.gz (the committed artefact)
+vendor/       the benchmark's own evaluate.py, vendored unmodified
 docs/         kg_coverage.md (generated)
 ```
+
+Datasets are not committed — see `data/*/README.md` for where to put them.
 
 ## Sources
 
 - [TCMEval-SDT — Scientific Data (2025)](https://www.nature.com/articles/s41597-025-04772-9)
 - [TCMEval-PA — Scientific Data (2025)](https://www.nature.com/articles/s41597-025-06387-6)
+- TCM-SD — syndrome-differentiation corpus and syndrome knowledge base
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) · [dsh-eval](https://github.com/hccccc01333/dsh-eval)

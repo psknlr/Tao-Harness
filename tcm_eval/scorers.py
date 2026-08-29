@@ -7,18 +7,19 @@ of named metrics so new metrics can be added without invalidating old runs.
 
 Two decisions are worth defending explicitly.
 
-**Syndrome partial credit.**  Chinese syndrome names compose additively:
-``痰阻血瘀，湿郁化热证`` is two conjuncts.  An answer recovering one of two is
-genuinely closer than one recovering neither, and collapsing both to "wrong"
-throws away the signal that most distinguishes a KG-grounded run from a
-free-running one.  The headline metric stays strict exact match; atom-F1 is
-reported beside it.
+**SDT follows the benchmark, not our preferences.**  TCMEval-SDT is a
+four-task benchmark whose official ``evaluate.py`` weights clinical-information
+recall 0.2, pathogenesis options 0.3, syndrome options 0.4 and a ROUGE-L
+explanation 0.1.  Those rules -- including their quirks -- are implemented in
+:mod:`tcm_eval.official_sdt` and verified against the vendored original.  Any
+metric this module adds on top is diagnostic and named so it cannot be mistaken
+for an official score.
 
-**Multi-select credit.**  The primary PA metric is strict set equality, as the
-benchmark intends.  Pharmacist-exam partial credit (any wrong option scores
-zero, otherwise credit is proportional to options recovered) is reported
-alongside because with only 31 multiple-choice items strict accuracy is very
-noisy, and the two together say whether a model is under-selecting or guessing.
+**Multi-select credit differs between the two benchmarks, deliberately.**  SDT's
+own rule dilutes on a wrong pick (``correct / (|gold| + n_wrong)``); PA has no
+official scorer shipped with it, so it uses strict set equality as the primary
+metric with exam-style partial credit reported alongside.  Mixing the two would
+misreport one benchmark or the other.
 """
 
 from __future__ import annotations
@@ -27,9 +28,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from tcm_agent.parsing import coerce_str
+from tcm_agent.parsing import coerce_list, coerce_str
 from tcm_agent.tasks import normalise_options
 from tcm_kg.normalize import canonical_syndrome, char_ngrams, normalize_text, syndrome_atoms
+
+from .official_sdt import score_case as official_score_case
 
 
 def _bigrams(text: str) -> Set[str]:
@@ -66,14 +69,15 @@ def set_f1(prediction: Iterable[str], reference: Iterable[str]) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# SDT
+# SDT -- scored by the benchmark's own rules
 # --------------------------------------------------------------------------- #
 
-#: Modifier characters that a model may add or drop without changing meaning.
+#: Modifier characters a model may add or drop without changing meaning.
 _SYNDROME_TRIM_RE = re.compile(r"(证候|证型|证$|型$)")
 
 
 def normalise_syndrome(name: str) -> str:
+    """Canonical surface form of a syndrome name (used by the KG-alias check)."""
     text = canonical_syndrome(coerce_str(name))
     text = normalize_text(text)
     text = _SYNDROME_TRIM_RE.sub("", text)
@@ -86,74 +90,69 @@ def score_sdt(
     *,
     kg=None,
 ) -> Dict[str, Any]:
-    """Score one SDT case."""
+    """Score one SDT case with the official four-task rules.
+
+    The headline numbers come from :mod:`tcm_eval.official_sdt`, which agrees
+    with the benchmark's own ``evaluate.py`` (see
+    ``tests/test_official_sdt.py``). Everything added on top is diagnostic and
+    named so it can never be confused with an official metric:
+
+    ``n_pathogenesis_selected`` / ``n_syndrome_selected``
+        How many options the model picked. The official rule dilutes rather
+        than forfeits on a wrong pick, so selecting everything scores
+        ``|gold|/10`` instead of zero. Reporting selection counts is what
+        distinguishes a model that reasoned from one that hedged.
+    ``syndrome_exact_set`` / ``pathogenesis_exact_set``
+        Strict set equality, for readers who want an accuracy-shaped number
+        beside the official proportional score.
+    """
+    scores: Dict[str, Any] = dict(official_score_case(prediction, gold))
+    gold_pathogenesis = set(gold.get("pathogenesis_letters") or [])
+    gold_syndrome = set(gold.get("syndrome_letters") or [])
+
     if not prediction:
-        empty: Dict[str, Any] = {
-            "answered": 0.0,
-            "syndrome_exact": 0.0,
-            "syndrome_atom_f1": 0.0,
-            "syndrome_alias_match": 0.0,
+        scores.update(
+            {
+                "n_pathogenesis_selected": 0.0,
+                "n_syndrome_selected": 0.0,
+                "pathogenesis_exact_set": 0.0,
+                "syndrome_exact_set": 0.0,
+            }
+        )
+        return scores
+
+    predicted_pathogenesis = set(normalise_options(prediction.get("pathogenesis_answer")))
+    predicted_syndrome = set(normalise_options(prediction.get("syndrome_answer")))
+    scores.update(
+        {
+            "n_pathogenesis_selected": float(len(predicted_pathogenesis)),
+            "n_syndrome_selected": float(len(predicted_syndrome)),
+            "pathogenesis_exact_set": float(
+                bool(predicted_pathogenesis) and predicted_pathogenesis == gold_pathogenesis
+            ),
+            "syndrome_exact_set": float(
+                bool(predicted_syndrome) and predicted_syndrome == gold_syndrome
+            ),
+            "n_clinical_information": float(
+                len(coerce_list(prediction.get("clinical_information")))
+            ),
+            "predicted_syndrome_letters": sorted(predicted_syndrome),
+            "gold_syndrome_letters": sorted(gold_syndrome),
         }
-        for step in ("clinical_information", "pathogenesis", "explanation"):
-            if coerce_str(gold.get(step)):
-                empty[f"{step}_f1"] = 0.0
-        return empty
-
-    pred_syndrome = coerce_str(prediction.get("syndrome"))
-    gold_syndrome = coerce_str(gold.get("syndrome"))
-    exact = float(
-        bool(pred_syndrome)
-        and normalise_syndrome(pred_syndrome) == normalise_syndrome(gold_syndrome)
     )
-
-    pred_atoms = {normalise_syndrome(a) for a in syndrome_atoms(pred_syndrome)}
-    gold_atoms = {normalise_syndrome(a) for a in syndrome_atoms(gold_syndrome)}
-    pred_atoms.discard("")
-    gold_atoms.discard("")
-    atom_f1 = set_f1(pred_atoms, gold_atoms)
-
-    alias = exact
-    if not alias and kg is not None and pred_syndrome and gold_syndrome:
-        alias = float(_alias_equivalent(kg, pred_syndrome, gold_syndrome))
-
-    scores: Dict[str, Any] = {
-        "answered": 1.0,
-        "syndrome_exact": exact,
-        "syndrome_atom_f1": atom_f1,
-        "syndrome_alias_match": max(exact, alias),
-        "predicted_syndrome": pred_syndrome,
-        "gold_syndrome": gold_syndrome,
-    }
-    # A free-text step is scored only when the gold record actually annotates
-    # it.  Scoring an absent reference as a perfect match would silently
-    # inflate every model's average on whichever steps the split omits.
-    for step in ("clinical_information", "pathogenesis", "explanation"):
-        reference = coerce_str(gold.get(step))
-        if reference:
-            scores[f"{step}_f1"] = char_f1(coerce_str(prediction.get(step)), reference)
     return scores
 
 
-def _alias_equivalent(kg, left: str, right: str) -> bool:
-    """Two syndrome names that the graph itself treats as one entity."""
-    left_nodes = kg.find_by_name(canonical_syndrome(left), ["Syndrome"])
-    right_nodes = kg.find_by_name(canonical_syndrome(right), ["Syndrome"])
-    if not left_nodes or not right_nodes:
-        return False
-    left_ids = {kg.canonical_id(n.id) for n in left_nodes}
-    right_ids = {kg.canonical_id(n.id) for n in right_nodes}
-    return bool(left_ids & right_ids)
-
-
-SDT_PRIMARY = "syndrome_exact"
+SDT_PRIMARY = "sdt_composite"
 SDT_METRICS = (
     "answered",
-    "syndrome_exact",
-    "syndrome_alias_match",
-    "syndrome_atom_f1",
-    "clinical_information_f1",
-    "pathogenesis_f1",
-    "explanation_f1",
+    "sdt_composite",
+    "task1_clinical_information",
+    "task2_pathogenesis",
+    "task3_syndrome",
+    "task4_explanation",
+    "syndrome_exact_set",
+    "n_syndrome_selected",
 )
 
 

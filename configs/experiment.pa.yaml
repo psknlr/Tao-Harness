@@ -11,7 +11,7 @@
 name: tcm-pa
 dataset:
   kind: pa
-  path: data/pa/TCMEval-PA.json
+  path: data/pa/TCMEval-PA.xlsx
   limit: null
 
 task: pa

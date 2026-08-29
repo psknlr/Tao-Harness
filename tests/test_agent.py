@@ -15,15 +15,24 @@ from ._fixtures import graph, retriever
 CASE = {
     "id": "t1",
     "clinical_data": "男，52岁。心悸，善惊易恐，坐卧不安，多梦易醒，食少纳呆。舌淡红，脉细。",
+    "pathogenesis_options": {
+        "A": "心胆气虚", "B": "痰热扰心", "C": "心血不足", "D": "水饮凌心", "E": "心阳不振",
+        "F": "肝郁气滞", "G": "瘀阻心脉", "H": "阴虚火旺", "I": "脾胃虚弱", "J": "肾精不足",
+    },
+    "syndrome_options": {
+        "A": "心虚胆怯证", "B": "痰火扰心证", "C": "心脾两虚证", "D": "水饮凌心证",
+        "E": "心阳不振证", "F": "肝郁化火证", "G": "心血瘀阻证", "H": "阴虚火旺证",
+        "I": "脾胃虚弱证", "J": "肾精亏虚证",
+    },
 }
 ANSWER = json.dumps(
     {
         "action": "answer",
         "result": {
-            "clinical_information": "心悸；善惊易恐；多梦易醒",
-            "pathogenesis": "心胆气虚，心神失养",
-            "syndrome": "心虚胆怯证",
-            "explanation": "善惊易恐为心胆气虚之特征",
+            "clinical_information": ["心悸", "善惊易恐", "多梦易醒", "食少纳呆"],
+            "pathogenesis_answer": ["A"],
+            "syndrome_answer": ["A"],
+            "explanation": "临证体会：善惊易恐为心胆气虚之特征。辨证：心虚胆怯",
         },
     },
     ensure_ascii=False,
@@ -69,7 +78,7 @@ class ConditionTests(unittest.TestCase):
             trace = run(condition, [ANSWER])
             self.assertEqual(trace.n_llm_calls, 1, condition)
             self.assertEqual(trace.n_tool_calls, 0, condition)
-            self.assertEqual(trace.final["syndrome"], "心虚胆怯证")
+            self.assertEqual(trace.final["syndrome_answer"], ["A"])
 
     def test_only_m2_injects_static_context(self):
         self.assertEqual(run("M1", [ANSWER]).static_context_chars, 0)
@@ -96,18 +105,29 @@ class ConditionTests(unittest.TestCase):
         ]
         trace = run("M3", script)
         self.assertEqual(trace.n_invalid_tool_calls, 1)
-        self.assertEqual(trace.final["syndrome"], "心虚胆怯证")
+        self.assertEqual(trace.final["syndrome_answer"], ["A"])
 
     def test_verification_arm_adds_a_deterministic_check(self):
         revision = json.dumps(
-            {"syndrome": "心虚胆怯证", "revision": "unchanged", "revision_reason": "图谱一致"},
+            {"syndrome_answer": ["A"], "revision": "unchanged", "revision_reason": "图谱一致"},
             ensure_ascii=False,
         )
         trace = run("M4", [ANSWER, revision])
         self.assertIn("verify_tcm_decision", trace.tools_used())
         self.assertEqual(trace.final["revision"], "unchanged")
         # a revision turn must not drop fields the first answer supplied
-        self.assertEqual(trace.final["pathogenesis"], "心胆气虚，心神失养")
+        self.assertEqual(trace.final["pathogenesis_answer"], ["A"])
+
+    def test_verifier_resolves_the_letter_to_its_option_text(self):
+        # verify_tcm_decision cannot check a letter; it must be handed the name
+        task = build_task("sdt", graph(), retriever())
+        args = task.verify_arguments({"syndrome_answer": ["A"]}, CASE)
+        self.assertEqual(args["syndrome"], "心虚胆怯证")
+
+    def test_out_of_range_letters_are_dropped(self):
+        task = build_task("sdt", graph(), retriever())
+        result = task.normalise_result({"syndrome_answer": ["A", "K", "z"]}, CASE)
+        self.assertEqual(result["syndrome_answer"], ["A"])
 
     def test_unparseable_output_is_retried_then_recorded(self):
         trace = run("M3", ["不是 JSON"])

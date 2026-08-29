@@ -10,7 +10,7 @@ Subcommands
 ``judge``     run the LLM judge over recorded SDT traces
 ``report``    build the Markdown report from scored traces
 ``compare``   paired A/B between two runs, win/lose/tie with signed deltas
-``replay``    re-run entirely from the request cache, with no API key
+``submit``    write an official TCMEval-SDT ``@``-separated submission file
 
 The split between ``run`` and ``score`` is the point: a scorer fix never
 re-bills a single token, and a run recorded once replays in CI forever.
@@ -49,6 +49,7 @@ from tcm_eval import (
 )
 from tcm_eval.judge import SDTJudge, aggregate_judge
 from tcm_eval.metrics import tool_selection_accuracy
+from tcm_eval.official_sdt import write_submission
 from tcm_eval.stats import mcnemar, paired_bootstrap
 from tcm_kg import load_kg
 from tcm_kg.index import KGRetriever
@@ -206,10 +207,14 @@ def _score_traces(
         reference = gold.get(trace.case_id)
         if reference is None:
             continue
+        if not reference.get("_has_gold"):
+            continue  # generated but unscoreable (a split with blank answers)
         if config.task == "sdt":
             metrics = score_sdt(trace.final, reference, kg=kg)
         else:
             metrics = score_pa(trace.final, reference)
+            metrics["rule_id"] = reference.get("rule_id")
+            metrics["category"] = reference.get("category")
             accuracy = tool_selection_accuracy(trace, reference.get("rule_id"))
             if accuracy is not None:
                 metrics["tool_selection_accuracy"] = accuracy
@@ -402,6 +407,42 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_submit(args: argparse.Namespace) -> int:
+    """Write an official SDT submission file from recorded traces.
+
+    Emitting the benchmark's own format means a run can be scored by the
+    benchmark's own evaluator, rather than only by this harness's arithmetic.
+    """
+    config = load_experiment(args.config)
+    if config.task != "sdt":
+        print("submission files are defined for SDT only", file=sys.stderr)
+        return 1
+    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    order = [item["id"] for item in dataset.items]
+
+    trace_file = config.output_dir / f"traces.{config.task}.{args.model}.jsonl"
+    traces = [
+        t
+        for t in read_traces(trace_file)
+        if t.condition == args.condition and t.sample == args.sample
+    ]
+    if not traces:
+        print(f"no traces for {args.model}/{args.condition} in {trace_file}", file=sys.stderr)
+        return 1
+    by_case = {t.case_id: t.final for t in traces}
+    rows = [(case_id, by_case.get(case_id)) for case_id in order]
+
+    target = Path(args.out or config.output_dir / f"submission.{args.model}.{args.condition}.txt")
+    write_submission(target, rows)
+    missing = sum(1 for _c, prediction in rows if not prediction)
+    print(
+        f"wrote {len(rows)} lines to {target}"
+        + (f" ({missing} cases had no answer and are blank)" if missing else ""),
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     kg, retriever = _load_graph(args.kg)
     print("== knowledge graph ==")
@@ -493,9 +534,17 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--metric", default="syndrome_exact")
     compare.set_defaults(func=cmd_compare)
 
+    submit = sub.add_parser("submit", help="write an official SDT submission file")
+    submit.add_argument("config")
+    submit.add_argument("--model", required=True)
+    submit.add_argument("--condition", default="M3")
+    submit.add_argument("--sample", type=int, default=0)
+    submit.add_argument("--out", default=None)
+    submit.set_defaults(func=cmd_submit)
+
     inspect = sub.add_parser("inspect", help="print the graph, domain and tool contract")
     inspect.add_argument("--dataset", default=None)
-    inspect.add_argument("--dataset-kind", default="sdt", choices=["sdt", "pa"])
+    inspect.add_argument("--dataset-kind", default="sdt", choices=["sdt", "pa", "tcmsd"])
     inspect.set_defaults(func=cmd_inspect)
 
     coverage = sub.add_parser(

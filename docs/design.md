@@ -8,36 +8,50 @@ piece is shaped the way it is.
 
 ## 1. SDT reasoning chain
 
-The graph has no `Symptom` and no `Pathogenesis` entity, so the chain cannot
-run `Symptom → Pathogenesis → Syndrome`. It runs:
+TCMEval-SDT is four tasks under one weighted composite (0.2/0.3/0.4/0.1), with
+tasks 2 and 3 as ten-option multiple choice. The graph has no `Symptom` and no
+`Pathogenesis` entity, so the chain cannot run
+`Symptom → Pathogenesis → Syndrome`. It runs:
 
 ```
 Case text
    │
-   ▼  ① deterministic cleaning (demographics stripped, identically for all models)
-Clinical features  ── transient runtime variables, never written to the graph
+   ▼  ① clinical-information extraction        → task 1 (0.2)
+Findings, in the case's own wording  ── transient, never written to the graph
    │
-   ▼  ② semantic anchor retrieval over per-entity virtual documents
-Disease / DiseaseSubtype / PathwayStage anchors
+   ▼  ② deterministic cleaning + semantic anchor retrieval
+Disease / DiseaseSubtype anchors
    │
-   ▼  ③ typed graph expansion (1–2 hops) + re-ranking
-Syndrome candidates + definition sentences + DocumentSource
+   ▼  ③ option lookup: resolve each of the 10 named options against the graph
+Per-option evidence (definition sentence, attested diseases, or "not found")
    │
-   ▼  ④ LLM pathogenesis reasoning        ← the graph never supplies this
-Pathogenesis (latent variable)
+   ▼  ④ LLM pathogenesis reasoning             → task 2 (0.3)
+Pathogenesis options
    │
-   ▼  ⑤ LLM syndrome selection
-Candidate syndrome
+   ▼  ⑤ LLM syndrome selection                 → task 3 (0.4)
+Syndrome options
    │
-   ▼  ⑥ deterministic graph-consistency check (verify_tcm_decision)
-Final structured answer
+   ▼  ⑥ deterministic graph-consistency check on the chosen option's *text*
+   ▼  ⑦ explanatory summary                    → task 4 (0.1, ROUGE-L)
+Structured answer → official @-separated submission
 ```
 
-Step ⑥ never calls a model. It checks that the syndrome exists in the graph,
-that it belongs to the anchored disease, optionally that the stated treatment
-principle matches, and reports which case features appear verbatim in the
-syndrome's definition sentence. `not_in_graph` is explicitly *not* evidence
-against the answer — the graph covers national protocols, not all of TCM.
+Step ③ is what the multiple-choice format buys. The options arrive as named
+pathogeneses and syndromes, so each candidate can be looked up directly rather
+than guessed from the case text — a far better fit for this graph than
+free-form naming. Every option is reported, found or not: a table biased toward
+what the graph covers would imply that absence is evidence against an option,
+which it is not.
+
+Step ⑥ never calls a model, and it resolves the chosen *letter* to its option
+*text* first — `verify_tcm_decision` cannot check a letter.
+
+### Answer hygiene
+
+Letters outside the item's own option set are dropped before scoring. A model
+answering `K` on a ten-option question has not made a scoreable choice, and
+under the official rule a stray letter counts as a wrong pick that dilutes
+credit for the picks that were right.
 
 ### Ranking
 
@@ -53,8 +67,6 @@ no model download, and better on compounded clinical vocabulary (`舌质暗红`,
 `苔黄腻`) than a general-purpose segmenter never trained on TCM text. A dense
 encoder can be registered through `EmbeddingProvider` and is then frozen
 alongside everything else.
-
----
 
 ## 2. PA reasoning chain
 
@@ -133,20 +145,30 @@ is not.
 
 ## 5. Measurement decisions
 
-**Syndrome partial credit.** Chinese syndrome names compose additively
-(`痰阻血瘀，湿郁化热证` is two conjuncts). The headline metric stays strict
-exact match; atom-F1 is reported beside it because an answer recovering one of
-two conjuncts is genuinely closer than one recovering neither.
+**SDT uses the benchmark's own rules, not ours.** `tcm_eval/official_sdt.py`
+reproduces `evaluate.py` and is verified against the vendored original on
+perfect, random and empty submissions. Two quirks are preserved because they
+change the reported number:
 
-**Multi-select credit.** Strict set equality is primary, as the benchmark
-intends. Exam-style partial credit (any wrong option forfeits; otherwise
-proportional) is reported alongside because with only 31 multiple-choice items
-strict accuracy is very noisy, and the pair reveals under-selection versus
-guessing.
+- A wrong option **dilutes rather than forfeits**:
+  `correct / (|gold| + n_wrong)`. Selecting all ten options scores `|gold|/10`,
+  not zero, so hedging is weakly rewarded. `n_syndrome_selected` is reported
+  beside the score so hedging is visible rather than invisible.
+- The evaluator never strips line terminators, so task 4 always compares
+  `prediction + "\n"` against `reference + "\n"`. The shared newline gives an
+  **empty explanation ~0.009 instead of 0**. Tiny, but a harness claiming
+  agreement has to model it; pass `emulate_official_io=False` for clean
+  arithmetic.
 
-**Unscoreable steps are omitted, not zeroed.** A split that does not annotate
-`pathogenesis` yields no `pathogenesis_f1`, rather than a perfect score for
-matching emptiness or a zero for every model.
+**PA uses strict set equality**, since no official scorer ships with it, with
+exam-style partial credit reported alongside — with only 31 multiple-choice
+items strict accuracy is noisy, and the pair reveals under-selection versus
+guessing. The two benchmarks deliberately do *not* share a multi-select rule;
+forcing one would misreport the other.
+
+**PA is reported split by rule groundability.** Half the released items are in
+families the graph cannot ground; pooling them with the grounded families
+dilutes any real effect and invites the wrong conclusion.
 
 **Paired tests throughout.** The same cases pass through every arm, so exact
 McNemar (binary metrics) and paired bootstrap (continuous) condition on the
@@ -161,13 +183,16 @@ model most often trips the judge's parser.
 
 ## 6. Known limitations
 
-1. **Coverage.** 10 of 19 PA rule families are ungroundable here (see
-   `kg_coverage.md`). PA gains should be read per rule family; pooling grounded
-   and ungroundable families dilutes the effect and invites the wrong
-   conclusion.
+1. **Coverage.** 10 of 19 PA rule families are ungroundable here — **166 of
+   328 released items (51%)**, including the largest family, A-003 dosage (87
+   items). PA gains must be read per rule family. The ungroundable families
+   double as a control: a KG gain there is not knowledge injection.
 2. **Half the syndromes are name-only.** 336 of 648 lack a definition sentence,
    so retrieval anchors them weakly. `retrieve_syndrome_evidence` reports
-   `PARTIAL` for these.
+   `PARTIAL` for these. Relatedly, the graph recognises only ~32-37% of SDT's
+   answer options at all — though it recognises gold options and distractors at
+   the same rate, which is what keeps the option-lookup tool from leaking
+   answers.
 3. **Uniform text tool protocol.** Removes provider function-calling
    differences as a confound, at the cost of not measuring native
    tool-calling quality. Deliberate; state it in the methods.

@@ -197,6 +197,86 @@ def compensation_table(
     return table, stats
 
 
+#: Groundability verdict per PA rule family, from ``scripts/kg_coverage.py``.
+#: Kept here so the report can split PA accuracy by whether the graph could
+#: possibly have helped -- pooling grounded and ungroundable families dilutes
+#: any real effect and invites the wrong conclusion.
+RULE_GROUNDABILITY: Mapping[str, str] = {
+    "A-002": "grounded", "A-006": "grounded", "N-003": "grounded",
+    "A-004": "partial", "A-005": "partial", "A-007": "partial",
+    "A-008": "partial", "N-007": "partial", "N-009": "partial",
+    "A-001": "not grounded", "A-003": "not grounded", "A-009": "not grounded",
+    "N-001": "not grounded", "N-002": "not grounded", "N-004": "not grounded",
+    "N-005": "not grounded", "N-006": "not grounded", "N-008": "not grounded",
+    "C-001": "not grounded",
+}
+
+
+def pa_rule_table(items: Sequence[ScoredItem], metric: str = "exact") -> str:
+    """PA accuracy per rule family, per condition, with the graph's verdict."""
+    scoped = [i for i in items if i.dataset == "pa"]
+    if not scoped:
+        return ""
+    conditions = [c for c in CONDITION_LABELS if any(i.condition == c for i in scoped)]
+    buckets: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    counts: Dict[str, int] = defaultdict(int)
+    for item in scoped:
+        rule = str(item.metrics.get("rule_id") or "?").upper()
+        value = item.metrics.get(metric)
+        if isinstance(value, (int, float)):
+            buckets[(rule, item.condition)].append(float(value))
+        if item.condition == conditions[0]:
+            counts[rule] += 1
+
+    rows: List[List[Any]] = []
+    for rule in sorted({r for r, _ in buckets}):
+        row: List[Any] = [
+            rule,
+            RULE_GROUNDABILITY.get(rule, "?"),
+            counts.get(rule) or len(buckets.get((rule, conditions[0]), [])),
+        ]
+        for condition in conditions:
+            values = buckets.get((rule, condition), [])
+            row.append(sum(values) / len(values) if values else None)
+        rows.append(row)
+    return _md_table(["rule", "graph verdict", "n"] + conditions, rows)
+
+
+def pa_groundability_table(items: Sequence[ScoredItem], metric: str = "exact") -> str:
+    """PA accuracy pooled by whether the graph can ground the rule family."""
+    scoped = [i for i in items if i.dataset == "pa"]
+    if not scoped:
+        return ""
+    conditions = [c for c in CONDITION_LABELS if any(i.condition == c for i in scoped)]
+    buckets: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    sizes: Dict[str, set] = defaultdict(set)
+    for item in scoped:
+        rule = str(item.metrics.get("rule_id") or "?").upper()
+        verdict = RULE_GROUNDABILITY.get(rule, "unknown")
+        value = item.metrics.get(metric)
+        if isinstance(value, (int, float)):
+            buckets[(verdict, item.condition)].append(float(value))
+        sizes[verdict].add(item.case_id)
+
+    rows: List[List[Any]] = []
+    for verdict in ("grounded", "partial", "not grounded", "unknown"):
+        if verdict not in sizes:
+            continue
+        row: List[Any] = [verdict, len(sizes[verdict])]
+        for condition in conditions:
+            values = buckets.get((verdict, condition), [])
+            row.append(sum(values) / len(values) if values else None)
+        first = buckets.get((verdict, conditions[0]), [])
+        last = buckets.get((verdict, conditions[-1]), [])
+        row.append(
+            (sum(last) / len(last)) - (sum(first) / len(first)) if first and last else None
+        )
+        rows.append(row)
+    return _md_table(
+        ["graph verdict", "items"] + conditions + [f"Δ {conditions[0]}→{conditions[-1]}"], rows
+    )
+
+
 def explicit_vs_implicit_table(items: Sequence[ScoredItem]) -> str:
     """RQ4: gain on graph-explicit knowledge versus graph-constrained reasoning.
 
@@ -206,19 +286,30 @@ def explicit_vs_implicit_table(items: Sequence[ScoredItem]) -> str:
     so any gain there comes only from the graph narrowing the reasoning space.
     """
     specs = [
-        ("PA", "pa", "exact", "explicit — safety / pharmacopoeia rules are graph entities"),
-        ("SDT syndrome", "sdt", "syndrome_exact", "partial — syndromes are entities, symptoms are not"),
+        ("PA (all rules)", "pa", "exact", "explicit where the rule is grounded at all"),
         (
-            "SDT pathogenesis",
+            "SDT task 3 syndrome",
             "sdt",
-            "pathogenesis_f1",
+            "task3_syndrome",
+            "partial — syndromes are entities, symptoms are not (~32% of options in graph)",
+        ),
+        (
+            "SDT task 2 pathogenesis",
+            "sdt",
+            "task2_pathogenesis",
             "implicit — pathogenesis is not a graph entity at all",
         ),
         (
-            "SDT clinical info",
+            "SDT task 1 clinical info",
             "sdt",
-            "clinical_information_f1",
-            "implicit — extraction from the case, unaided by the graph",
+            "task1_clinical_information",
+            "unaided — extraction from the case text alone",
+        ),
+        (
+            "SDT task 4 explanation",
+            "sdt",
+            "task4_explanation",
+            "unaided — free-text ROUGE-L against the case's own commentary",
         ),
     ]
     index = index_items(items)
@@ -298,6 +389,20 @@ def build_report(
         parts.append("")
         parts.append(f"Spearman ρ(base, Δ) = `{comp_stats['spearman_rho_base_vs_delta']}` "
                      f"over {comp_stats['n_models']} models — {comp_stats['interpretation']}.")
+        parts.append("")
+
+    if any(i.dataset == "pa" for i in items):
+        parts.append("## PA by rule family")
+        parts.append("")
+        parts.append(
+            "Half the released PA items fall in rule families this graph cannot "
+            "ground (A-003 dosage alone is 87 of 328). Pooling them with the "
+            "grounded families dilutes any real effect, so both splits are shown."
+        )
+        parts.append("")
+        parts.append(pa_groundability_table(items))
+        parts.append("")
+        parts.append(pa_rule_table(items))
         parts.append("")
 
     if len(datasets) > 1:
