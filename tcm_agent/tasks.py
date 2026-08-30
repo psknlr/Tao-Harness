@@ -217,13 +217,19 @@ class SDTTask(Task):
                 continue
             # disease-conditioned presentations; the global first-mention
             # sentence often describes the syndrome in a different disease
+            # Contextual, so a subtype-routed syndrome reaches the static
+            # arms too. Without it M1/M2/M2C saw no syndromes at all for the
+            # 25 pathway diseases whose syndromes hang off a subtype, while
+            # M3's tools could reach them -- a knowledge asymmetry between
+            # arms that is not the intervention.
             children = [
                 {
-                    "name": syn["name"],
-                    "presentation": syn["presentation"][:200],
-                    "scope": syn["scope"],
+                    "name": row["syndrome"],
+                    "presentation": row["evidence"][:200],
+                    "scope": row["scope"],
+                    **({"subtype": row["subtype"]} if row["subtype"] else {}),
                 }
-                for syn in self.kg.syndromes_of(node.id)
+                for row in self.kg.syndrome_contexts(node.id)
             ][:limit]
             subgraph.append(
                 {

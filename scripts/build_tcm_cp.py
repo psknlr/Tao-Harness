@@ -422,7 +422,19 @@ def build(
 
     for disease_id, stages in sorted(by_disease.items()):
         disease = kg.node(disease_id)
-        syndromes = [t for _e, t in kg.neighbours(disease_id, {EdgeType.HAS_SYNDROME.value})]
+        # Disease-level *and* subtype-routed syndromes. Reading only
+        # HAS_SYNDROME meant 25 of the 299 pathway diseases -- 放射性直肠炎,
+        # 前葡萄膜炎, 慢性心衰 II 级, 下肢 DVT and the rest, whose syndromes
+        # hang off a DiseaseSubtype -- produced no CP4 treatment items at all,
+        # while the graph held the knowledge to build them.
+        syndromes = [
+            node
+            for node in (
+                kg.nodes.get(row["syndrome_id"])
+                for row in kg.syndrome_contexts(disease_id)
+            )
+            if node is not None
+        ]
         syndrome = syndromes[0] if syndromes else None
         usable = discriminable_stages(stages)
         dropped["stage_not_discriminable"] += len(stages) - len(usable)

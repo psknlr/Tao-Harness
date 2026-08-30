@@ -441,36 +441,74 @@ inside an audit whose entire purpose is to be checkable by someone else.
 
 Measured on the released benchmarks:
 
-| benchmark | cases | clean | gold answers found in the graph |
-|---|---|---|---|
-| SDT | 50 | **100.0%** | 0 |
-| PA | 328 | **99.4%** | 0 |
-| CP | 500 | 0.0% | 136 |
+| benchmark | cases | clean | possible | likely |
+|---|---|---|---|---|
+| SDT | 50 | **70.0%** | 12.0% | 18.0% |
+| PA | 328 | **89.0%** | 5.8% | 5.2% |
+| CP | 500 | 0.0% | 0.0% | 100% |
 
-**The detector was validated before those numbers were believed.** A null
-result from an unvalidated detector is worth nothing. TCM-CP is contaminated by
-construction — its gold comes from this graph — and the audit says so at 100%,
-which is what makes the SDT and PA readings mean anything. Planted positives
-are caught, and six realistic rewrite modes with them: punctuation swapped,
+An earlier version of this audit reported SDT at 100.0% and PA at 99.4%. Those
+numbers were wrong, and the difference is the whole reason this section exists.
+Three defects, each confirmed by construction before being fixed:
+
+1. **The corpus was not what an agent can read.** It indexed node
+   `first_mention` sentences and edge evidence and called that reachable text.
+   Measured against what the tools return and the retriever indexes, it missed
+   **99.8% of PathwayStage text, 100% of PharmacoPoeiaEntry, 100% of
+   ExternalTherapy** and 96% of SafetyContext. A case drawn from a monitoring
+   item or a pharmacopoeia function scored `clean` while
+   `retrieve_pathway_stage` would hand it straight to M3. The corpus is now
+   built from `KGStore.virtual_document` — by construction the text the
+   retriever indexes, so the audit cannot fall behind retrieval without the
+   index falling behind too — plus every string attribute as its own atom,
+   because a leak is usually one field and a 4,000-character concatenation
+   hides it. 16,052 passages became 33,223; per-type uncovered text is 0%.
+
+2. **Containment ran one way only.** It measured the share of a graph passage
+   inside the case and missed the reverse: a case that is a verbatim *excerpt*
+   of a longer graph passage. A 40-character excerpt of a 544-character passage
+   scored 0.315 and landed in `possible`; against a longer passage it reads
+   `clean`. Both directions are measured now and the stratum takes the larger.
+
+3. **Multi-select gold was concatenated before matching.** Two options each
+   lifted verbatim from the graph — from *different* passages, as they would
+   be — produced a joined string present in no single passage, so the case was
+   filed `clean` with both of its answers sitting in the graph. SDT tasks 2 and
+   3 are multi-select on 27 of 50 cases.
+
+**The detector is validated, and that is what makes a null result mean
+anything.** TCM-CP is contaminated by construction and the audit says so at
+100%. Planted positives are caught — a verbatim copy, an answer lifted from
+the graph, a case that is an excerpt of a passage, a multi-select item with one
+leaked option — along with six realistic rewrite modes: punctuation swapped,
 clauses reordered, embedded in a longer case, 30% of clauses dropped, half
-kept. Unrelated text scores zero.
+kept. Unrelated text stays far below threshold.
 
-The known limit, stated rather than papered over: a character-shuffled passage
-is missed. No lexical method survives that, and no rewritten medical record
-looks like it.
+The known limits, stated rather than papered over. A character-shuffled passage
+is missed; no lexical method survives that, and no rewritten record looks like
+it. More importantly, **`clean` means this audit found nothing, not that there
+is nothing.** A case paraphrased into different vocabulary would pass. The
+audit is hash-locked to the graph, dataset, resolved gold, case set and
+thresholds it was computed against, and `score` refuses a report that does not
+describe the run being scored — a stale audit is worse than none, because none
+is at least visible in the report.
 
 `score` attaches each case's stratum and the report recomputes `M1→M2` and
-`M2C→M3` on the clean subset beside the full one. **A gain that survives on the
-clean subset cannot be read as retrieving the answer from the graph.** Where no
-audit has been run the report says so, because silence there looks like a clean
-result.
+`M2C→M3` on the clean subset beside the full one. State the result as what it
+is: a gain persisting on the lexically clean subset is **less consistent with
+detectable direct lexical or provenance overlap**. It is not proof that no
+contamination exists, and the difference matters in a medical-AI paper. Where
+no audit has been run the report says so, because silence there looks like a
+clean result.
 
 Leave-source-out KG — withholding a case's own source document while that case
-runs — is deliberately not implemented. With zero `likely` cases in SDT and PA
-there is nothing for it to withhold, and it would add per-case graph mutation
-to a harness whose value now lies in being frozen. The threshold that would
-justify building it: any `likely` case in an effectiveness benchmark, or a
-clean-subset delta that differs materially from the full-set delta.
+runs — is now worth building. The threshold stated when it was deferred was
+"any `likely` case in an effectiveness benchmark"; the corrected audit finds
+**9 in SDT and 17 in PA**, so that threshold is met. It is deferred to a
+separate change rather than bundled here because it adds per-case graph
+mutation, and the honest interim position is the one the report already takes:
+run the KG contrasts on the clean subset and describe the result as a
+sensitivity analysis, not a proof.
 
 ## 11. Reading TCM-CP: the macro-average
 

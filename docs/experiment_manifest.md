@@ -19,30 +19,30 @@ apart from what the code produces. Do not edit by hand.
 
 ## TCM-CP
 
-- **5611 items**, 5611 unique case ids (0 duplicates)
+- **5721 items**, 5721 unique case ids (0 duplicates)
 - 299 diseases
 - primary endpoint: macro-average over 6 families (CP1, CP2, CP3, CP4, CP5, CP6)
 
 | subtask | n | endpoint |
 |---|---|---|
 | CP1_pathway_eligibility | 474 | primary |
-| CP2_stage_identification | 971 | primary |
-| CP3_stage_actions | 1015 | primary |
-| CP4G_cross_disease_treatment | 244 | **reported separately** |
-| CP4_external_therapy | 403 | primary |
-| CP4_formula | 428 | primary |
-| CP4_patent_medicine | 272 | primary |
-| CP4_treatment_principle | 483 | primary |
-| CP5_monitoring | 1015 | primary |
+| CP2_stage_identification | 953 | primary |
+| CP3_stage_actions | 997 | primary |
+| CP4G_cross_disease_treatment | 298 | **reported separately** |
+| CP4_external_therapy | 432 | primary |
+| CP4_formula | 452 | primary |
+| CP4_patent_medicine | 287 | primary |
+| CP4_treatment_principle | 525 | primary |
+| CP5_monitoring | 997 | primary |
 | CP6_transition_decision | 306 | primary |
 
-CP4 gold provenance: `cross_disease_general` 244, `disease_specific` 1586
+CP4 gold provenance: `cross_disease_general` 298, `disease_specific` 1696
 
 Dropped as unusable:
 
-- `first_stage_rebalanced`: 195
+- `first_stage_rebalanced`: 213
 - `stage_not_discriminable`: 46
-- `stage_without_exit_criteria`: 911
+- `stage_without_exit_criteria`: 893
 - `too_few_distractor_actions`: 2
 
 ## Experiment configs

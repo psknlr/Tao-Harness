@@ -326,20 +326,31 @@ four levels — verbatim gold, character 5-gram Jaccard, containment, cited
 source — deterministically and with no embedding model, because an audit whose
 purpose is to be checkable should not contain an uncontrolled variable.
 
-| benchmark | cases | clean | gold in graph |
-|---|---|---|---|
-| SDT | 50 | **100.0%** | 0 |
-| PA | 328 | **99.4%** | 0 |
-| CP | 500 | 0.0% | 136 |
+| benchmark | cases | clean | possible | likely |
+|---|---|---|---|---|
+| SDT | 50 | **70.0%** | 12.0% | 18.0% |
+| PA | 328 | **89.0%** | 5.8% | 5.2% |
+| CP | 500 | 0.0% | 0.0% | 100% |
 
-**The detector was validated before those numbers were trusted.** TCM-CP is
-contaminated by construction and the audit says so at 100% — that is what makes
-the SDT and PA readings mean something. Planted copies and six realistic
-rewrite modes are caught; unrelated text scores zero; a character-shuffled
-passage is missed and that limit is stated rather than hidden.
+An earlier version reported SDT 100.0% and PA 99.4%. Those were wrong: the
+corpus indexed about half the reachable text (missing 99.8% of PathwayStage,
+100% of PharmacoPoeiaEntry), containment ran one way so a case that was an
+*excerpt* of a graph passage scored 0.315, and multi-select gold was joined
+before matching so two separately-leaked options reported clean. All three are
+fixed and the corpus is now built from `virtual_document` — the same text the
+retriever indexes, so the audit cannot fall behind retrieval.
+
+**The detector is validated, which is what makes a null result mean anything.**
+TCM-CP is contaminated by construction and the audit says so at 100%. Planted
+copies, excerpts, leaked multi-select options and six realistic rewrite modes
+are all caught; unrelated text stays far below threshold.
 
 `score` attaches the stratum and the report recomputes the KG contrasts on the
-clean subset. **A gain that survives there is not retrieval of the answer.**
+clean subset. Say what it supports: a gain persisting there is **less
+consistent with detectable lexical or provenance overlap** — not a proof that
+no contamination exists. `clean` means this audit found nothing. The audit is
+hash-locked to the graph, dataset, gold and case set it was computed against,
+and `score` refuses a stale one.
 
 ### 8. Dataset identity
 
@@ -509,6 +520,38 @@ pair *and the number of per-case parity breaks*, so the matching claim is
 evidenced rather than asserted — means can agree while individual pairs do not.
 
 ---
+
+## Providers
+
+| key | adapter | notes |
+|---|---|---|
+| `deepseek`, `glm`, `gpt` | `openai_compat` | first-party OpenAI-shaped endpoints |
+| `gemini` | `gemini` | `generateContent`; sends the decode seed |
+| `minimax` | `minimax` | see below |
+| `poe` | `poe` | gateway; see below |
+| `echo` | `echo` | offline, used by the test suite |
+
+**MiniMax** gets its own adapter because it reports API errors with **HTTP
+200** and a non-zero `base_resp.status_code`. Through the generic client those
+became successful *empty* answers, so a rate limit or a bad key would have
+lowered MiniMax's answered rate for a reason that is not the model. It may also
+report only `total_tokens`; that is recorded as-is rather than split into a
+guessed prompt/completion ratio.
+
+**Poe** is a gateway, and that costs reproducibility: `model_id` is a Poe *bot*
+name, and a bot can be repointed at a different upstream snapshot without the
+name changing, so the manifest cannot pin a snapshot the way a first-party
+endpoint can. Every completion is marked `via_gateway`. Prefer a first-party
+adapter where one exists, and disclose which models came through Poe. Sampling
+controls are forwarded but not guaranteed — run `smoke` and trust its
+seed-determinism column.
+
+Before any real run:
+
+```bash
+python -m runner.benchmark_runner smoke              # every provider
+python -m runner.benchmark_runner smoke --models minimax poe
+```
 
 ## Quick start
 
