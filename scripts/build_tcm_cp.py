@@ -784,13 +784,13 @@ def _treatment_items(
         "vignette": _treatment_vignette(kg, disease, syndrome, blocked),
     }
     specs = [
-        ("principle", EdgeType.TREATED_BY_PRINCIPLE.value, "本证在本病路径中的治法是？", "CP4_treatment_principle"),
-        ("formula", EdgeType.USES_FORMULA.value, "本证在本病路径中推荐使用的方剂是？", "CP4_formula"),
-        ("patent", EdgeType.USES_PATENT_MEDICINE.value, "本证在本病路径中可选用的中成药是？", "CP4_patent_medicine"),
-        ("external", EdgeType.USES_EXTERNAL_THERAPY.value, "本证在本病路径中可采用的非药物外治疗法是？", "CP4_external_therapy"),
+        ("principle", EdgeType.TREATED_BY_PRINCIPLE.value, "治法", "CP4_treatment_principle"),
+        ("formula", EdgeType.USES_FORMULA.value, "方剂", "CP4_formula"),
+        ("patent", EdgeType.USES_PATENT_MEDICINE.value, "中成药", "CP4_patent_medicine"),
+        ("external", EdgeType.USES_EXTERNAL_THERAPY.value, "非药物外治疗法", "CP4_external_therapy"),
     ]
     out: List[Dict[str, Any]] = []
-    for suffix, edge_type, question, subtask in specs:
+    for suffix, edge_type, noun, subtask in specs:
         # Ask the graph for this syndrome's treatments *in this disease*. Read
         # globally, 补中益气汤 is "the formula for 脾胃虚弱证" whether the
         # pathway is 弱视, 吉兰巴雷综合征 or 糖尿病性胃轻瘫 -- and the first
@@ -798,13 +798,38 @@ def _treatment_items(
         plan = kg.treatments_of(syndrome.id, {edge_type}, disease_id=disease.id)
         grounded = [r["name"] for r in plan["disease_specific"]]
         general = [r["name"] for r in plan["cross_disease_general"]]
-        correct = grounded or general
-        if not correct:
+        if not grounded and not general:
             continue
-        # 异病同治 is real, so a treatment attested only outside this disease's
-        # guideline is not necessarily wrong -- but the item is weaker evidence
-        # and the report must be able to separate the two strata.
-        provenance = "disease_specific" if grounded else "cross_disease_general"
+
+        # Two different questions, so two different subtasks.
+        #
+        # The pathway question -- "what does *this* pathway recommend?" -- can
+        # only be keyed from this disease's own guideline. Falling back to a
+        # cross-disease edge when the disease had none made the gold an answer
+        # the evidence does not support: 14.5% of CP4 overall, 21% of the
+        # formal sample, and 48% of formal CP4-patent items.
+        #
+        # 异病同治 means those cross-disease edges are still real knowledge, so
+        # they are not discarded. They become CP4G, which asks what they can
+        # actually attest: that a treatment has syndrome-level support across
+        # diseases. Answering that well is knowledge transfer, not pathway
+        # execution, and the two must not be averaged together.
+        if grounded:
+            correct = grounded
+            provenance = "disease_specific"
+            question = f"本病临床路径中，本证推荐的{noun}是？"
+            item_subtask = subtask
+            item_id = f"cp4{suffix}::{disease.id}::{syndrome.id}"
+        else:
+            correct = general
+            provenance = "cross_disease_general"
+            question = (
+                f"本病指南未单独记载本证的{noun}。依据该证候在其他疾病中的通用记载"
+                f"（异病同治），下列哪项{noun}在证候层面具有支持？"
+            )
+            item_subtask = "CP4G_cross_disease_treatment"
+            item_id = f"cp4g{suffix}::{disease.id}::{syndrome.id}"
+
         blocked = {canon(c) for c in grounded + general}
         pool = [
             t.name
@@ -824,8 +849,9 @@ def _treatment_items(
                 # 825 rows, and because gold, resume and paired analysis all
                 # key on case_id, a model was scored against another disease's
                 # answer key -- with a different correct letter.
-                "id": f"cp4{suffix}::{disease.id}::{syndrome.id}",
-                "subtask": subtask,
+                "id": item_id,
+                "subtask": item_subtask,
+                "relation": suffix,
                 "question": question,
                 "options": options,
                 "answer": answer,

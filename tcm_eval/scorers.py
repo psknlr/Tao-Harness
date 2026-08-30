@@ -301,6 +301,7 @@ def score_cp(
 
 #: The six pathway-execution capabilities TCM-CP tests, in pathway order, with
 #: the subtask ids that make up each. CP4 is one capability probed four ways.
+#: These, and only these, make up the primary macro-average.
 CP_FAMILIES: Mapping[str, Tuple[str, ...]] = {
     "CP1": ("CP1_pathway_eligibility",),
     "CP2": ("CP2_stage_identification",),
@@ -315,15 +316,33 @@ CP_FAMILIES: Mapping[str, Tuple[str, ...]] = {
     "CP6": ("CP6_transition_decision",),
 }
 
+#: Reported, never pooled with the six above. CP4G asks whether a treatment has
+#: syndrome-level support *across* diseases -- knowledge transfer under 异病同治,
+#: not pathway execution. Its items are the ones whose gold this disease's own
+#: guideline cannot attest; keeping them inside CP4 made the pathway question
+#: answerable from another disease's evidence, which is not what it asks.
+CP_SECONDARY_FAMILIES: Mapping[str, Tuple[str, ...]] = {
+    "CP4G": ("CP4G_cross_disease_treatment",),
+}
+
 #: subtask id -> family, for the report.
 CP_SUBTASK_FAMILY: Mapping[str, str] = {
-    subtask: family for family, subtasks in CP_FAMILIES.items() for subtask in subtasks
+    subtask: family
+    for group in (CP_FAMILIES, CP_SECONDARY_FAMILIES)
+    for family, subtasks in group.items()
+    for subtask in subtasks
 }
 
 
 def cp_family(subtask: str) -> str:
     """Which capability a subtask belongs to; ``"other"`` for anything new."""
     return CP_SUBTASK_FAMILY.get(str(subtask), "other")
+
+
+def is_primary_cp(subtask_or_family: str) -> bool:
+    """Whether this subtask (or family) counts toward the CP endpoint."""
+    key = str(subtask_or_family)
+    return key in CP_FAMILIES or cp_family(key) in CP_FAMILIES
 
 
 CP_PRIMARY = "exact"

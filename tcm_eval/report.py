@@ -21,6 +21,7 @@ from .scorers import (
     CP_METRICS,
     CP_PRIMARY,
     cp_family,
+    is_primary_cp,
     PA_METRICS,
     PA_PRIMARY,
     SDT_METRICS,
@@ -402,7 +403,11 @@ def cp_subtask_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> s
     macro-average -- mean of family means, each of the six capabilities
     weighted equally -- is the endpoint the contrasts below test.
     """
-    scoped = [i for i in items if i.dataset == "cp"]
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
     if not scoped:
         return ""
     grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
@@ -454,7 +459,14 @@ def cp_macro_contrast_table(
     capability probed four ways, four ninths of the weight instead of one
     sixth.
     """
-    scoped = [i for i in items if i.dataset == "cp"]
+    # CP4G is deliberately absent: it asks about cross-disease knowledge
+    # transfer, not pathway execution, and averaging it into the endpoint would
+    # answer neither question.
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
     index = index_items(scoped)
     results: Dict[str, PairedResult] = {}
     rows: List[List[Any]] = []
@@ -564,6 +576,38 @@ def verification_stratum_table(
         ["model", "stratum", "what the pass could do", "n", "M3C", "M4", "Δ", "95% CI", "p"],
         rows,
     )
+
+
+def cp_secondary_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
+    """Subtasks reported beside the CP endpoint but never inside it.
+
+    CP4G holds the items whose gold this disease's own guideline cannot attest.
+    Under 异病同治 the treatment may still be right, so the items are real --
+    but "which treatment does this pathway recommend?" is not what they can
+    answer, and pooling them into CP4 made the pathway question answerable
+    from another disease's evidence. Reported here, as the different question
+    it is: does the model know a treatment has syndrome-level support across
+    diseases?
+    """
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and not is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
+    if not scoped:
+        return ""
+    grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for item in scoped:
+        value = item.metrics.get(metric)
+        if isinstance(value, (int, float)):
+            grid[
+                (item.model_key, item.condition, str(item.metrics.get("subtask") or "?"))
+            ].append(float(value))
+    rows = [
+        [model, CONDITION_LABELS.get(condition, condition), subtask, len(v), sum(v) / len(v)]
+        for (model, condition, subtask), v in sorted(grid.items())
+    ]
+    return _md_table(["model", "condition", "subtask", "n", metric], rows)
 
 
 def cp4_provenance_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
@@ -934,6 +978,23 @@ def build_report(
                 parts.append("")
                 parts.append(subtasks)
                 parts.append("")
+                secondary = cp_secondary_table(items, primary)
+                if secondary:
+                    parts.append("#### Reported separately: cross-disease generalisation")
+                    parts.append("")
+                    parts.append(
+                        "These are the items whose gold this disease's own guideline "
+                        "does not attest. Under **异病同治** the treatment may still be "
+                        "correct, so they are not discarded — but *which treatment does "
+                        "this pathway recommend* is not a question another disease's "
+                        "evidence can answer, so they are **excluded from the CP "
+                        "macro-average above** and reported here as the different "
+                        "question they ask: does the model know a treatment has "
+                        "syndrome-level support across diseases?"
+                    )
+                    parts.append("")
+                    parts.append(secondary)
+                    parts.append("")
                 provenance = cp4_provenance_table(items, primary)
                 if provenance:
                     parts.append("#### CP4 by treatment provenance")

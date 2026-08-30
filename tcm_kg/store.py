@@ -516,24 +516,56 @@ class KGStore:
         """
         out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
-        edge_types = {EdgeType.HAS_SYNDROME.value}
-        if include_subtypes:
-            edge_types.add(EdgeType.SUBTYPE_HAS_SYNDROME.value)
-        for edge in self.out_edges(disease_id, edge_types):
+
+        def _row(edge: Edge, syndrome: Node, subtype: Optional[Node]) -> Dict[str, Any]:
+            sentences = edge.evidence_sentences()
+            row: Dict[str, Any] = {
+                "id": syndrome.id,
+                "name": syndrome.name,
+                "presentation": sentences[0] if sentences else syndrome.sentence(),
+                "scope": "disease_specific" if sentences else "global_first_mention",
+                "source_docs": list(edge.source_docs[:4]),
+                "via": "disease" if subtype is None else "subtype",
+            }
+            if subtype is not None:
+                # Keep the subtype rather than flattening it away: 消渴病肾病
+                # differentiates by stage, and "which syndrome does this
+                # patient have" has a different answer per stage. A caller
+                # that cannot see which subtype a syndrome came from cannot
+                # tell a disease-level syndrome from a stage-specific one.
+                row["subtype"] = subtype.name
+                row["subtype_id"] = subtype.id
+            return row
+
+        for edge in self.out_edges(disease_id, {EdgeType.HAS_SYNDROME.value}):
             syndrome = self.nodes.get(edge.target)
             if syndrome is None or syndrome.id in seen:
                 continue
             seen.add(syndrome.id)
-            sentences = edge.evidence_sentences()
-            out.append(
-                {
-                    "id": syndrome.id,
-                    "name": syndrome.name,
-                    "presentation": sentences[0] if sentences else syndrome.sentence(),
-                    "scope": "disease_specific" if sentences else "global_first_mention",
-                    "source_docs": list(edge.source_docs[:4]),
-                }
-            )
+            out.append(_row(edge, syndrome, None))
+
+        if not include_subtypes:
+            return out
+
+        # Two hops, not one. ``SUBTYPE_HAS_SYNDROME`` starts at a
+        # DiseaseSubtype, so asking for it among a *Disease*'s out-edges
+        # matched nothing and the flag silently did nothing. Measured on this
+        # graph: 53 diseases carry subtype-level syndromes, 47 of them lost
+        # some, 224 Disease->subtype->Syndrome links were invisible, and five
+        # diseases -- 消渴病肾病, 肠澼, 瞳神紧小, 心衰病, 股肿病 -- exposed no
+        # syndrome knowledge at all through this method.
+        for sub_edge in self.out_edges(disease_id, {EdgeType.HAS_SUBTYPE.value}):
+            subtype = self.nodes.get(sub_edge.target)
+            if subtype is None:
+                continue
+            for edge in self.out_edges(
+                subtype.id, {EdgeType.SUBTYPE_HAS_SYNDROME.value}
+            ):
+                syndrome = self.nodes.get(edge.target)
+                if syndrome is None or syndrome.id in seen:
+                    continue
+                seen.add(syndrome.id)
+                out.append(_row(edge, syndrome, subtype))
         return out
 
     #: The four Syndrome->Treatment relations, in the order a plan reads.
@@ -544,14 +576,29 @@ class KGStore:
         (EdgeType.USES_EXTERNAL_THERAPY.value, "external_therapies"),
     )
 
+    def subtype_ids(self, disease_id: str) -> Set[str]:
+        """The DiseaseSubtype nodes belonging to a disease."""
+        return {
+            t.id for _e, t in self.neighbours(disease_id, {EdgeType.HAS_SUBTYPE.value})
+        }
+
     def disease_syndrome_docs(self, syndrome_id: str, disease_id: str) -> Set[str]:
-        """Documents that attest this syndrome *within this disease's* guideline."""
+        """Documents that attest this syndrome *within this disease's* guideline.
+
+        A ``SUBTYPE_HAS_SYNDROME`` edge starts at the subtype, not the disease,
+        so matching ``edge.source == disease_id`` alone found nothing for the
+        224 syndromes this graph reaches only through a subtype. Every one of
+        them then looked context-free, and their treatments were all filed as
+        ``cross_disease_general`` -- the disease's own guideline reclassified as
+        somebody else's, on 消渴病肾病, 心衰病 and 47 other diseases.
+        """
+        owners = {disease_id} | self.subtype_ids(disease_id)
         docs: Set[str] = set()
         for edge in self.in_edges(
             syndrome_id,
             {EdgeType.HAS_SYNDROME.value, EdgeType.SUBTYPE_HAS_SYNDROME.value},
         ):
-            if edge.source == disease_id:
+            if edge.source in owners:
                 docs.update(edge.source_docs)
         return docs
 
