@@ -251,6 +251,12 @@ def score_cp(
         "cp_family": cp_family(subtask),
         "is_multi": float(len(gold_letters) > 1),
     }
+    # CP4 only: whether this disease's own guideline attests the gold treatment,
+    # or whether it is the syndrome's treatment recorded under another disease.
+    # Labelled on the item by the builder and carried here so a reader can see
+    # the CP4 number both ways rather than take the pooled one on trust.
+    if gold.get("treatment_provenance"):
+        scores["treatment_provenance"] = str(gold["treatment_provenance"])
 
     if not prediction:
         scores.update({"answered": 0.0, "exact": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0})

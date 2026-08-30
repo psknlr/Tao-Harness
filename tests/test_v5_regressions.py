@@ -250,6 +250,31 @@ class V5_3_DiseaseConditionedTreatment(unittest.TestCase):
         # was 45.55% before the fix
         self.assertGreater(grounded / len(cp4), 0.80)
 
+    def test_the_provenance_label_reaches_the_report(self):
+        """A label the report cannot read is a label that does not exist."""
+        from tcm_eval.report import cp4_provenance_table
+        from tcm_eval.scorers import score_cp
+
+        row = score_cp(
+            {"answer": ["A"]},
+            {"subtask": "CP4_formula", "answer": ["A"],
+             "treatment_provenance": "cross_disease_general"},
+        )
+        self.assertEqual(row["treatment_provenance"], "cross_disease_general")
+
+        items = [
+            ScoredItem(f"{scope}{i}", "cp", "M3", "m", 0,
+                       {"exact": 1.0 if scope == "d" else 0.0,
+                        "subtask": "CP4_formula", "cp_family": "CP4",
+                        "treatment_provenance":
+                            "disease_specific" if scope == "d" else "cross_disease_general"})
+            for scope in ("d", "x")
+            for i in range(5)
+        ]
+        table = cp4_provenance_table(items)
+        self.assertIn("disease_specific", table)
+        self.assertIn("cross_disease_general", table)
+
     def test_the_treatment_tool_requires_a_disease(self):
         spec = REGISTRY.spec("retrieve_treatment_plan")
         self.assertIn("disease", spec.parameters["required"])

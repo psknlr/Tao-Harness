@@ -566,6 +566,38 @@ def verification_stratum_table(
     )
 
 
+def cp4_provenance_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
+    """CP4 split by whether this disease's guideline attests the gold treatment.
+
+    ``Syndrome -> Treatment`` is a global edge and TCM practises 异病同治, so a
+    treatment attested only under other diseases is not necessarily the wrong
+    answer for this pathway -- but it is a weaker item, and the two strata
+    deserve to be read separately rather than pooled and taken on trust. If a
+    model does markedly better on ``cross_disease_general``, it is being
+    rewarded for syndrome-level recall rather than pathway execution.
+    """
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and i.metrics.get("treatment_provenance")
+    ]
+    if not scoped:
+        return ""
+    grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for item in scoped:
+        value = item.metrics.get(metric)
+        if isinstance(value, (int, float)):
+            grid[
+                (item.model_key, item.condition, str(item.metrics["treatment_provenance"]))
+            ].append(float(value))
+    rows: List[List[Any]] = []
+    for (model, condition, scope), values in sorted(grid.items()):
+        rows.append(
+            [model, condition, scope, len(values), sum(values) / len(values)]
+        )
+    return _md_table(["model", "condition", "gold provenance", "n", metric], rows)
+
+
 def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
@@ -902,6 +934,22 @@ def build_report(
                 parts.append("")
                 parts.append(subtasks)
                 parts.append("")
+                provenance = cp4_provenance_table(items, primary)
+                if provenance:
+                    parts.append("#### CP4 by treatment provenance")
+                    parts.append("")
+                    parts.append(
+                        "`Syndrome → Treatment` is a global edge in this graph, and "
+                        "TCM practises 异病同治, so a gold treatment attested only "
+                        "under other diseases is not necessarily wrong for this "
+                        "pathway — but it is a weaker item. Read the two strata "
+                        "separately: a model doing markedly better on "
+                        "`cross_disease_general` is being rewarded for syndrome-level "
+                        "recall rather than pathway execution."
+                    )
+                    parts.append("")
+                    parts.append(provenance)
+                    parts.append("")
                 macro_table, macro_results = cp_macro_contrast_table(items, primary)
                 if macro_table:
                     parts.append("### Contrasts on the macro-average (prespecified endpoint)")
