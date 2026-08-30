@@ -153,6 +153,84 @@ class EndToEndTests(unittest.TestCase):
         finally:
             path.write_text(original, encoding="utf-8")
 
+    def test_08b_mixed_run_signatures_are_refused(self):
+        """The framework hash is equal across models; the signature is not."""
+        path = self.out / "traces.sdt.echo.jsonl"
+        original = path.read_text(encoding="utf-8")
+        try:
+            lines = original.splitlines()
+            payload = json.loads(lines[0])
+            payload["run_signature"] = "0000000000000000"
+            lines[0] = json.dumps(payload, ensure_ascii=False)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertEqual(main(["score", SDT_CONFIG]), 2)
+            # ...and --allow-drift scores it anyway, with the drift recorded
+            self.assertEqual(main(["score", SDT_CONFIG, "--allow-drift"]), 0)
+            scored = json.loads(
+                (self.out / "scored_manifest.sdt.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(scored["allow_drift"])
+            self.assertTrue(any("run signatures" in d for d in scored["drift"]))
+        finally:
+            path.write_text(original, encoding="utf-8")
+            main(["score", SDT_CONFIG])  # restore a clean scored manifest
+
+    def test_08c_traces_from_another_run_are_not_resumed(self):
+        """Resuming on the framework hash kept traces a resume must regenerate."""
+        path = self.out / "traces.sdt.echo.jsonl"
+        original = path.read_text(encoding="utf-8")
+        try:
+            lines = original.splitlines()
+            for i, line in enumerate(lines):
+                payload = json.loads(line)
+                payload["run_signature"] = "not-this-run"
+                lines[i] = json.dumps(payload, ensure_ascii=False)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertEqual(main(["run", SDT_CONFIG, "--echo-script", SDT_ANSWER]), 0)
+            traces = read_traces(path)
+            self.assertEqual(len(traces), N_SDT_CASES * 5, "traces were duplicated")
+            self.assertFalse(
+                any(t.run_signature == "not-this-run" for t in traces),
+                "a trace from a different run survived the resume",
+            )
+        finally:
+            path.write_text(original, encoding="utf-8")
+
+    def test_08d_a_manifest_for_another_experiment_is_not_overwritten(self):
+        manifest_path = self.out / "manifest.sdt.json"
+        original = manifest_path.read_text(encoding="utf-8")
+        try:
+            payload = json.loads(original)
+            payload["dataset_sha256"] = "0" * 64
+            manifest_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            with self.assertRaises(SystemExit) as caught:
+                main(["run", SDT_CONFIG, "--echo-script", SDT_ANSWER])
+            self.assertIn("dataset_sha256", str(caught.exception))
+            self.assertEqual(
+                json.loads(manifest_path.read_text(encoding="utf-8"))["dataset_sha256"],
+                "0" * 64,
+                "the conflicting manifest was overwritten",
+            )
+            # --new-run archives it rather than losing it
+            self.assertEqual(
+                main(["run", SDT_CONFIG, "--new-run", "--echo-script", SDT_ANSWER]), 0
+            )
+            archived = list(self.out.glob("manifest.sdt.*.json"))
+            self.assertTrue(archived, "the previous manifest was not archived")
+            self.assertTrue(
+                any(
+                    json.loads(p.read_text(encoding="utf-8")).get("dataset_sha256")
+                    == "0" * 64
+                    for p in archived
+                )
+            )
+            for stale in archived:
+                stale.unlink()
+        finally:
+            manifest_path.write_text(original, encoding="utf-8")
+
     def test_09_inspect_and_coverage_run(self):
         self.assertEqual(
             main(["inspect", "--dataset", "tests/fixtures/pa_mini.json", "--dataset-kind", "pa"]), 0

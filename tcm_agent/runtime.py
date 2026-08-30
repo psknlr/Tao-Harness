@@ -110,6 +110,7 @@ def _copy_trace(source: Trace, condition: str) -> Trace:
         condition=condition,
         model_key=source.model_key,
         framework_hash=source.framework_hash,
+        run_signature=source.run_signature,
         sample=source.sample,
         started_at=source.started_at,
     )
@@ -196,6 +197,12 @@ class FrameworkConfig:
     #: Content fingerprints of the inputs, filled in by the runner.
     kg_hash: str = ""
     dataset_hash: str = ""
+    #: The full run signature (framework + inputs + model + code), filled in by
+    #: the runner and stamped on every trace.  Deliberately *not* part of
+    #: ``framework_hash``: the framework hash certifies that two arms shared a
+    #: scaffold and must stay equal across models, while the signature also
+    #: pins the model and the code and so differs between them.
+    run_signature: str = ""
 
     def framework_hash(self) -> str:
         payload = json.dumps(
@@ -220,6 +227,7 @@ class FrameworkConfig:
     def describe(self) -> Dict[str, Any]:
         return {
             "framework_hash": self.framework_hash(),
+            "run_signature": self.run_signature,
             "task": self.task,
             "domain": self.domain,
             "kg_hash": self.kg_hash[:16],
@@ -267,6 +275,7 @@ class AgentRuntime:
             condition=condition,
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
+            run_signature=self.config.run_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )
@@ -409,6 +418,7 @@ class AgentRuntime:
             condition="M3",
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
+            run_signature=self.config.run_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )

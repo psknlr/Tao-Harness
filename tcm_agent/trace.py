@@ -68,6 +68,12 @@ class Trace:
     condition: str
     model_key: str
     framework_hash: str
+    #: Everything the framework hash omits: which model, which code revision,
+    #: which case set.  Two traces with the same framework hash but different
+    #: signatures came from different experiments and must never be pooled --
+    #: which the framework hash alone cannot tell you, because it is designed
+    #: to stay equal across models.
+    run_signature: str = ""
     sample: int = 0
     llm_steps: List[LLMStep] = field(default_factory=list)
     tool_steps: List[ToolStep] = field(default_factory=list)
@@ -160,6 +166,7 @@ class Trace:
             "condition": self.condition,
             "model_key": self.model_key,
             "framework_hash": self.framework_hash,
+            "run_signature": self.run_signature,
             "sample": self.sample,
             "started_at": self.started_at,
             "branch_group": self.branch_group,
@@ -198,6 +205,7 @@ class Trace:
             condition=str(payload.get("condition", "")),
             model_key=str(payload.get("model_key", "")),
             framework_hash=str(payload.get("framework_hash", "")),
+            run_signature=str(payload.get("run_signature", "")),
             sample=int(payload.get("sample", 0)),
             static_context_chars=int(payload.get("static_context_chars", 0)),
             final=payload.get("final"),

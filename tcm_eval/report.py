@@ -677,6 +677,17 @@ def explicit_vs_implicit_table(items: Sequence[ScoredItem]) -> str:
     )
 
 
+def _framework_blocks(
+    framework: Optional[Mapping[str, Any]]
+) -> Dict[str, Mapping[str, Any]]:
+    """Normalise the provenance argument to ``{dataset: block}``."""
+    if not framework:
+        return {}
+    if all(isinstance(v, Mapping) for v in framework.values()):
+        return {str(k): v for k, v in framework.items()}
+    return {str(framework.get("task") or "run"): framework}
+
+
 def build_report(
     items: Sequence[ScoredItem],
     *,
@@ -687,13 +698,27 @@ def build_report(
     """Assemble the full Markdown report."""
     parts: List[str] = [f"# {title}", ""]
 
+    # ``framework`` is ``{dataset: provenance}``; a single flat block is still
+    # accepted so older callers and tests keep working.
+    per_dataset = _framework_blocks(framework)
     if framework:
         parts.append("## Framework contract")
         parts.append("")
         parts.append(
-            "All arms share one frozen framework; only `model.generate()` differs."
+            "All arms share one frozen framework; only `model.generate()` differs. "
+            "Each dataset carries its own provenance: one block cannot attest to "
+            "a run it did not describe."
         )
         parts.append("")
+        forced = sorted(k for k, v in per_dataset.items() if v.get("scored_with_allow_drift"))
+        if forced:
+            parts.append(
+                f"> **Scored with `--allow-drift`: {', '.join(k.upper() for k in forced)}.** "
+                f"The traces did not match the frozen manifest for these datasets. "
+                f"See the `drift` list in the block below; the numbers are not "
+                f"reproducible from the recorded provenance."
+            )
+            parts.append("")
         parts.append("```json")
         parts.append(json.dumps(dict(framework), ensure_ascii=False, indent=2))
         parts.append("```")
@@ -823,11 +848,21 @@ def build_report(
     if trace_summaries:
         parts.append("## Agent behaviour (from traces)")
         parts.append("")
+        parts.append(
+            "`agent calls` are the tool calls the model chose; `verifier calls` "
+            "are the ones the M4 verification pass made for it. Only the former "
+            "reflect tool-use skill — the verifier calls the right checker by "
+            "construction."
+        )
+        parts.append("")
         headers = [
-            "arm",
+            "dataset",
+            "model",
+            "condition",
             "traces",
             "LLM calls",
-            "tool calls",
+            "agent calls",
+            "verifier calls",
             "invalid",
             "tool success",
             "tokens",
@@ -836,12 +871,24 @@ def build_report(
         ]
         rows = []
         for key, summary in sorted(trace_summaries.items()):
+            # keys are "dataset/model/condition"; older files wrote
+            # "model/condition" and are still rendered rather than dropped
+            parts_of_key = key.split("/")
+            if len(parts_of_key) == 3:
+                dataset, model, condition = parts_of_key
+            elif len(parts_of_key) == 2:
+                dataset, (model, condition) = "–", parts_of_key
+            else:
+                dataset, model, condition = "–", key, "–"
             rows.append(
                 [
-                    key,
+                    dataset,
+                    model,
+                    condition,
                     summary.get("n_traces"),
                     summary.get("mean_n_llm_calls"),
-                    summary.get("mean_n_tool_calls"),
+                    summary.get("mean_n_agent_tool_calls", summary.get("mean_n_tool_calls")),
+                    summary.get("mean_n_verification_tool_calls"),
                     summary.get("mean_n_invalid_tool_calls"),
                     summary.get("mean_tool_success_rate"),
                     summary.get("mean_total_tokens"),

@@ -327,5 +327,161 @@ class V4_4_PerCaseComputeParity(unittest.TestCase):
         self.assertIn("30", rows["not_applicable"])
 
 
+class V4_5_RunProvenance(unittest.TestCase):
+    """A trace must be able to prove what produced it, without a manifest."""
+
+    KW = dict(
+        framework_hash="fw", kg_hash="kg", dataset_hash="ds",
+        model_fingerprint="m", case_set="cs", code={"tools_impl_sha256": "t"},
+    )
+
+    def test_the_signature_covers_what_the_framework_hash_cannot(self):
+        from tcm_eval.provenance import run_signature
+
+        base = run_signature(**self.KW)
+        for field, value in (
+            ("model_fingerprint", "other-model"),
+            ("case_set", "other-cases"),
+        ):
+            self.assertNotEqual(
+                base, run_signature(**{**self.KW, field: value}), f"{field} not covered"
+            )
+        self.assertNotEqual(
+            base,
+            run_signature(**{**self.KW, "code": {"tools_impl_sha256": "rewritten"}}),
+            "a tool rewrite left the signature unchanged",
+        )
+
+    def test_the_signature_ignores_the_condition(self):
+        """Conditions are the independent variable; they must stay poolable."""
+        from tcm_eval.provenance import run_signature
+
+        self.assertEqual(run_signature(**self.KW), run_signature(**self.KW))
+
+    def test_every_trace_carries_the_signature(self):
+        task = build_task("sdt", graph(), retriever())
+        config = FrameworkConfig()
+        config.run_signature = "sig-123"
+        group = AgentRuntime(
+            graph(), retriever(), task, echo([ANSWER, REVISION, REVISION]), config
+        ).run_branch_group(SDT_ITEM, ["M3", "M3C", "M4"])
+        for condition, trace in group.items():
+            self.assertEqual(trace.run_signature, "sig-123", condition)
+        solo = AgentRuntime(
+            graph(), retriever(), task, echo([ANSWER]), config
+        ).run(SDT_ITEM, "M0")
+        self.assertEqual(solo.run_signature, "sig-123")
+
+    def test_the_signature_survives_a_trace_round_trip(self):
+        from tcm_agent.trace import Trace
+
+        t = Trace("r", "c", "sdt", "M0", "m", "fw", run_signature="sig-123")
+        again = Trace.from_dict(json.loads(json.dumps(t.to_dict(), ensure_ascii=False)))
+        self.assertEqual(again.run_signature, "sig-123")
+
+    def test_the_framework_hash_stays_blind_to_the_signature(self):
+        """It has to, or two models could never be certified as sharing a scaffold."""
+        a, b = FrameworkConfig(), FrameworkConfig()
+        a.run_signature, b.run_signature = "one", "two"
+        self.assertEqual(a.framework_hash(), b.framework_hash())
+
+    def test_manifest_conflicts_catch_a_repointed_experiment(self):
+        from tcm_eval.provenance import manifest_conflicts
+
+        frozen = {"task": "sdt", "framework_hash": "aaa", "dataset_sha256": "d1"}
+        self.assertEqual(manifest_conflicts(frozen, dict(frozen)), [])
+        conflicts = manifest_conflicts(frozen, {**frozen, "dataset_sha256": "d2"})
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("dataset_sha256", conflicts[0])
+
+    def test_manifest_conflicts_ignore_fields_a_resume_may_add(self):
+        from tcm_eval.provenance import manifest_conflicts
+
+        frozen = {"task": "sdt", "framework_hash": "aaa"}
+        self.assertEqual(
+            manifest_conflicts(frozen, {**frozen, "models": {"new": {}}, "n_items": 9}),
+            [],
+        )
+
+
+class V4_5_ReportProvenance(unittest.TestCase):
+    def test_each_dataset_keeps_its_own_provenance_block(self):
+        from tcm_eval.report import build_report
+        from tcm_eval.scorers import ScoredItem
+
+        items = [
+            ScoredItem("a", "sdt", "M0", "m", 0, {"sdt_composite": 0.5}),
+            ScoredItem("b", "pa", "M0", "m", 0, {"pa_accuracy": 0.5}),
+        ]
+        report = build_report(
+            items,
+            framework={
+                "sdt": {"framework_hash": "sdt-hash", "dataset_sha256": "sdt-data"},
+                "pa": {"framework_hash": "pa-hash", "dataset_sha256": "pa-data"},
+            },
+        )
+        for token in ("sdt-hash", "pa-hash", "sdt-data", "pa-data"):
+            self.assertIn(token, report, f"{token} missing from the provenance block")
+
+    def test_a_forced_score_run_is_labelled_in_the_report(self):
+        from tcm_eval.report import build_report
+        from tcm_eval.scorers import ScoredItem
+
+        report = build_report(
+            [ScoredItem("a", "sdt", "M0", "m", 0, {"sdt_composite": 0.5})],
+            framework={
+                "sdt": {
+                    "framework_hash": "h",
+                    "scored_with_allow_drift": True,
+                    "drift": ["dataset_sha256 differs from the frozen manifest"],
+                }
+            },
+        )
+        self.assertIn("--allow-drift", report)
+        self.assertIn("not\nreproducible", report.replace(" ", "\n"))
+
+    def test_a_flat_provenance_block_still_renders(self):
+        from tcm_eval.report import build_report
+        from tcm_eval.scorers import ScoredItem
+
+        report = build_report(
+            [ScoredItem("a", "sdt", "M0", "m", 0, {"sdt_composite": 0.5})],
+            framework={"task": "sdt", "framework_hash": "legacy-hash"},
+        )
+        self.assertIn("legacy-hash", report)
+
+    def test_trace_summaries_do_not_collide_across_datasets(self):
+        from tcm_eval.report import build_report
+        from tcm_eval.scorers import ScoredItem
+
+        report = build_report(
+            [ScoredItem("a", "sdt", "M3", "m", 0, {"sdt_composite": 0.5})],
+            trace_summaries={
+                "sdt/m/M3": {"n_traces": 11, "mean_n_llm_calls": 1.0},
+                "pa/m/M3": {"n_traces": 22, "mean_n_llm_calls": 2.0},
+            },
+        )
+        self.assertIn("| 11 ", report)
+        self.assertIn("| 22 ", report)
+
+    def test_the_behaviour_table_separates_agent_from_verifier_calls(self):
+        from tcm_eval.report import build_report
+        from tcm_eval.scorers import ScoredItem
+
+        report = build_report(
+            [ScoredItem("a", "sdt", "M4", "m", 0, {"sdt_composite": 0.5})],
+            trace_summaries={
+                "sdt/m/M4": {
+                    "n_traces": 3,
+                    "mean_n_tool_calls": 5.0,
+                    "mean_n_agent_tool_calls": 2.0,
+                    "mean_n_verification_tool_calls": 3.0,
+                }
+            },
+        )
+        self.assertIn("agent calls", report)
+        self.assertIn("verifier calls", report)
+
+
 if __name__ == "__main__":
     unittest.main()
