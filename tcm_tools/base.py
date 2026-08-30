@@ -92,6 +92,26 @@ class ToolResult:
         return text[: max_chars - 20] + '..."<truncated>"}'
 
 
+class ToolPhase(str, Enum):
+    """Which stage of a run may issue a tool.
+
+    ``verification=True`` alone was too coarse. It hid ``verify_tcm_decision``
+    from the agent but left the five deterministic PA checkers visible, and
+    those are exactly the tools the M4 verification pass uses. An M3 agent
+    could therefore call ``check_dose`` itself, which makes M3 an
+    *optionally-self-checking* arm and turns M3→M4 into "optional versus
+    mandatory verification" rather than "absent versus present" -- a weaker
+    claim than the tables imply.
+    """
+
+    #: the agent may call it; the verification pass may not
+    AGENT = "agent"
+    #: only the post-hoc verification pass may call it
+    VERIFICATION = "verification"
+    #: available to both (retrieval that either stage legitimately needs)
+    BOTH = "both"
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """Frozen declaration of one tool.
@@ -110,6 +130,8 @@ class ToolSpec:
     deterministic: bool = False
     #: verification tools may read verification-only node types
     verification: bool = False
+    #: which run stage may issue this tool
+    phase: ToolPhase = ToolPhase.AGENT
 
     def openai_schema(self) -> Dict[str, Any]:
         return {
@@ -258,9 +280,14 @@ class ToolRegistry:
     def spec(self, name: str) -> ToolSpec:
         return self._specs[name]
 
-    def specs_for(self, domain: Domain | str) -> List[ToolSpec]:
+    def specs_for(
+        self, domain: Domain | str, *, phase: Optional[ToolPhase] = None
+    ) -> List[ToolSpec]:
         domain = Domain(domain) if isinstance(domain, str) else domain
-        return [s for s in self._specs.values() if domain in s.domains]
+        specs = [s for s in self._specs.values() if domain in s.domains]
+        if phase is not None:
+            specs = [s for s in specs if s.phase in (phase, ToolPhase.BOTH)]
+        return specs
 
     def names_for(self, domain: Domain | str) -> List[str]:
         return [s.name for s in self.specs_for(domain)]
@@ -348,6 +375,7 @@ class ToolRegistry:
                     "parameters": s.parameters,
                     "domains": sorted(d.value for d in s.domains),
                     "deterministic": s.deterministic,
+                    "phase": s.phase.value,
                 }
                 for s in sorted(specs, key=lambda s: s.name)
             ],

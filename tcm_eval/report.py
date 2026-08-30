@@ -56,7 +56,7 @@ CONDITION_LABELS = {
     "M0": "M0 Base LLM",
     "M1": "M1 Structured",
     "M2": "M2 KG-RAG (static)",
-    "M2C": "M2C Iterative, no KG (control)",
+    "M2C": "M2C Iterative, static KG, no tools (control)",
     "M3": "M3 KG-Agent",
     "M3C": "M3C Sham revision (control)",
     "M4": "M4 KG-Agent + Verify",
@@ -70,7 +70,7 @@ CONTRASTS = (
     ("M0", "M1", "prompt structure alone"),
     ("M1", "M2", "static KG evidence"),
     ("M2", "M3", "agency + extra compute (confounded)"),
-    ("M2C", "M3", "agentic KG tool use, compute-matched"),
+    ("M2C", "M3", "agentic retrieval over the same KG, compute-matched"),
     ("M3", "M4", "verification + extra revision (confounded)"),
     ("M3C", "M4", "verification content, compute-matched"),
     ("M0", "M3", "whole scaffold (not a KG-only effect)"),
@@ -110,16 +110,74 @@ def paired_clusters(
     metric: str,
     cluster_field: str,
 ) -> List[str]:
-    """Cluster label per paired observation, aligned with ``paired_vectors``."""
+    """Cluster label per paired observation, aligned with ``paired_vectors``.
+
+    Alignment matters more than it looks: the bootstrap resamples clusters and
+    indexes into the value vectors positionally, so a label list built from a
+    different filter than the values silently mislabels every observation
+    after the first drop.
+    """
+    return [
+        str(li.metrics.get(cluster_field) or case_id)
+        for case_id, li, _ in _usable_pairs(index, model, left, right, metric)
+    ]
+
+
+def _usable_pairs(
+    index: Mapping[Tuple[str, str], Mapping[str, ScoredItem]],
+    model: str,
+    left: str,
+    right: str,
+    metric: str,
+    *,
+    stratum: Optional[str] = None,
+) -> List[Tuple[str, ScoredItem, ScoredItem]]:
+    """Case ids both conditions scored, minus the ones that are not comparable.
+
+    A case whose branches broke compute parity is dropped rather than scored.
+    The compute-matched contrasts exist precisely to hold test-time compute
+    fixed; including a pair where it was not fixed reintroduces the confound
+    the contrast was built to remove, and does it invisibly.  ``stratum``
+    additionally restricts to cases where the M4 verification pass reached a
+    given depth, so the gain can be read separately over items a checker
+    actually adjudicated and items where the pass had nothing to say.
+    """
     a = index.get((model, left), {})
     b = index.get((model, right), {})
-    labels: List[str] = []
+    out: List[Tuple[str, ScoredItem, ScoredItem]] = []
     for case_id in sorted(set(a) & set(b)):
-        left_value = a[case_id].metrics.get(metric)
-        right_value = b[case_id].metrics.get(metric)
+        li, ri = a[case_id], b[case_id]
+        if li.trace_metrics.get("parity_error") or ri.trace_metrics.get("parity_error"):
+            continue
+        if stratum is not None:
+            observed = ri.trace_metrics.get("verification_stratum") or li.trace_metrics.get(
+                "verification_stratum"
+            )
+            if observed != stratum:
+                continue
+        left_value = li.metrics.get(metric)
+        right_value = ri.metrics.get(metric)
         if isinstance(left_value, (int, float)) and isinstance(right_value, (int, float)):
-            labels.append(str(a[case_id].metrics.get(cluster_field) or case_id))
-    return labels
+            out.append((case_id, li, ri))
+    return out
+
+
+def dropped_for_parity(
+    items: Sequence[ScoredItem], left: str, right: str
+) -> Dict[str, int]:
+    """How many pairs each model lost to a compute-parity break."""
+    index = index_items(items)
+    out: Dict[str, int] = {}
+    for model in sorted({i.model_key for i in items}):
+        a = index.get((model, left), {})
+        b = index.get((model, right), {})
+        out[model] = sum(
+            1
+            for case_id in set(a) & set(b)
+            if a[case_id].trace_metrics.get("parity_error")
+            or b[case_id].trace_metrics.get("parity_error")
+        )
+    return out
 
 
 def paired_vectors(
@@ -128,18 +186,13 @@ def paired_vectors(
     left: str,
     right: str,
     metric: str,
+    *,
+    stratum: Optional[str] = None,
 ) -> Tuple[List[float], List[float]]:
-    """Aligned metric vectors over the cases both conditions attempted."""
-    a = index.get((model, left), {})
-    b = index.get((model, right), {})
-    shared = sorted(set(a) & set(b))
-    xs, ys = [], []
-    for case_id in shared:
-        left_value = a[case_id].metrics.get(metric)
-        right_value = b[case_id].metrics.get(metric)
-        if isinstance(left_value, (int, float)) and isinstance(right_value, (int, float)):
-            xs.append(float(left_value))
-            ys.append(float(right_value))
+    """Aligned metric vectors over the cases both conditions comparably attempted."""
+    pairs = _usable_pairs(index, model, left, right, metric, stratum=stratum)
+    xs = [float(li.metrics[metric]) for _, li, _ in pairs]
+    ys = [float(ri.metrics[metric]) for _, _, ri in pairs]
     return xs, ys
 
 
@@ -313,6 +366,68 @@ def leakage_table(items: Sequence[ScoredItem]) -> str:
     )
 
 
+#: Below this many paired cases a stratum is described but not tested: a
+#: significant-looking p over eight items is noise dressed as a finding.
+MIN_STRATUM_N = 20
+
+#: How deep the M4 verification pass got on an item, worst-supported last.
+VERIFICATION_STRATA: Tuple[Tuple[str, str], ...] = (
+    ("deterministic", "a rule checker adjudicated the answer"),
+    ("audit_only", "no checker applied; the prose was audited for over-claiming"),
+    ("not_applicable", "nothing to check; the revision turn ran for parity only"),
+)
+
+
+def verification_stratum_table(
+    items: Sequence[ScoredItem], dataset: str, metric: str
+) -> str:
+    """M3C→M4 split by how much the verification pass could actually check.
+
+    This is the test that keeps the M4 claim honest.  M4 always takes a
+    revision turn now, even on items no deterministic checker adjudicates, so
+    the arm contains two different treatments wearing one label: real
+    verification evidence, and a bare prompt to look again.  If the M4 gain is
+    concentrated in the ``not_applicable`` stratum then what the experiment
+    measured is a second turn, and the verification story does not survive.
+    Reporting the split makes that visible instead of leaving it for a
+    reviewer to suspect.
+
+    Strata with fewer than ``MIN_STRATUM_N`` pairs are shown with their n and
+    no test: an underpowered stratum tempts exactly the over-reading this
+    table exists to prevent.
+    """
+    scoped = [i for i in items if i.dataset == dataset]
+    index = index_items(scoped)
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for stratum, gloss in VERIFICATION_STRATA:
+            xs, ys = paired_vectors(index, model, "M3C", "M4", metric, stratum=stratum)
+            if not xs:
+                continue
+            mean_a = sum(xs) / len(xs)
+            mean_b = sum(ys) / len(ys)
+            if len(xs) >= MIN_STRATUM_N:
+                result = paired_test(xs, ys)
+                interval = (
+                    f"[{result.ci_low:+.3f}, {result.ci_high:+.3f}]"
+                    if result.ci_low == result.ci_low
+                    else "–"
+                )
+                p_value: Any = result.p_value
+            else:
+                interval, p_value = "–", None
+            rows.append(
+                [model, stratum, gloss, len(xs), mean_a, mean_b, mean_b - mean_a,
+                 interval, p_value]
+            )
+    if not rows:
+        return ""
+    return _md_table(
+        ["model", "stratum", "what the pass could do", "n", "M3C", "M4", "Δ", "95% CI", "p"],
+        rows,
+    )
+
+
 def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
@@ -345,6 +460,16 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                 control_tokens = _mean(control, "total_tokens")
                 arm_tokens = _mean(arm, "total_tokens")
                 ratio = control_calls / arm_calls if arm_calls else None
+                # Means can match while individual pairs do not, so the
+                # per-case count is the binding check; the ratio is only a
+                # readable summary beside it.
+                scope = [i for i in items if i.model_key == model and i.dataset == dataset]
+                broken = dropped_for_parity(scope, control, arm).get(model, 0)
+                verdict = (
+                    "MISMATCH"
+                    if broken
+                    else ("ok" if ratio is not None and 0.8 <= ratio <= 1.25 else "MISMATCH")
+                )
                 rows.append(
                     [
                         dataset,
@@ -355,7 +480,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                         ratio,
                         control_tokens,
                         arm_tokens,
-                        "ok" if ratio is not None and 0.8 <= ratio <= 1.25 else "MISMATCH",
+                        broken,
+                        verdict,
                     ]
                 )
     if not rows:
@@ -363,7 +489,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     return _md_table(
         [
             "dataset", "model", "pair", "control calls", "arm calls",
-            "call ratio", "control tokens", "arm tokens", "parity",
+            "call ratio", "control tokens", "arm tokens",
+            "per-case breaks (dropped)", "parity",
         ],
         rows,
     )
@@ -613,6 +740,23 @@ def build_report(
         parts.append("")
         parts.append(table)
         parts.append("")
+        strata = verification_stratum_table(items, dataset, primary)
+        if strata:
+            parts.append("### Is the M4 gain verification, or just a second turn?")
+            parts.append("")
+            parts.append(
+                "M4 takes its revision turn on **every** case, including the ones "
+                "no deterministic checker adjudicates — otherwise it would spend "
+                "one model call fewer than M3C on exactly those cases and the "
+                "compute match would fail where it matters most. The price is "
+                "that the arm mixes two treatments, so the gain is split by how "
+                "much the verification pass could actually check. A gain "
+                "concentrated in `not_applicable` is a second-turn effect and "
+                "must be reported as one."
+            )
+            parts.append("")
+            parts.append(strata)
+            parts.append("")
         comp_table, comp_stats = compensation_table(items, dataset, primary)
         parts.append("### Does the framework compensate weaker models?")
         parts.append("")
@@ -642,12 +786,15 @@ def build_report(
         parts.append("## Compute parity of the control arms")
         parts.append("")
         parts.append(
-            "M2C matches M3's budget without graph access; M3C matches M4's "
-            "without verification evidence. The compute-matched contrasts "
-            "(M2C→M3, M3C→M4) are only interpretable if the match actually "
-            "held, so the realised call and token counts are reported here. A "
-            "`MISMATCH` row means that contrast still carries a compute "
-            "difference and must be described as such."
+            "M2C matches M3's turn budget while keeping M2's static KG context "
+            "and withholding the tools -- so M2C→M3 isolates *agentic retrieval*, "
+            "not the graph, which both arms have. M3C matches M4's turn count "
+            "without the verification evidence. These contrasts are only "
+            "interpretable if the match actually held, so the realised call and "
+            "token counts are reported here alongside the number of pairs where "
+            "parity broke per case. Any per-case break drops that pair from the "
+            "contrast and marks the row `MISMATCH`; means alone can agree while "
+            "individual pairs do not."
         )
         parts.append("")
         parts.append(parity)

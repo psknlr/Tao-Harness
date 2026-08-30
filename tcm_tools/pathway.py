@@ -29,7 +29,7 @@ from tcm_kg.normalize import char_ngrams, normalize_text
 from tcm_kg.schema import Domain, EdgeType, NodeType
 
 from ._common import documents_block, edge_evidence, node_brief, resolve_entity
-from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
+from .base import REGISTRY, Coverage, ToolContext, ToolPhase, ToolResult, ToolSpec
 
 _PATHWAY_DOMAINS = (Domain.PATHWAY, Domain.FULL)
 
@@ -195,6 +195,7 @@ _TRANSITION_SPEC = ToolSpec(
     },
     domains=_PATHWAY_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.BOTH,
 )
 
 

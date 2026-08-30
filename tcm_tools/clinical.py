@@ -187,16 +187,20 @@ def retrieve_clinical_context(ctx: ToolContext, args: Mapping[str, Any]) -> Tool
     subtypes: List[Dict[str, Any]] = []
     for edge, target in kg.neighbours(disease.id, {EdgeType.HAS_SUBTYPE.value}):
         entry = node_brief(kg, target, with_sentence=False)
-        entry["syndromes"] = [
-            node_brief(kg, syn)
-            for _e, syn in kg.neighbours(target.id, {EdgeType.SUBTYPE_HAS_SYNDROME.value})
-        ][:max_syndromes]
+        entry["syndromes"] = kg.syndromes_of(target.id)[:max_syndromes]
         subtypes.append(entry)
     payload["subtypes"] = subtypes
 
+    # Presentations come from the disease's own edges, not the syndrome's
+    # global first mention -- see KGStore.syndrome_presentation.
     syndromes: List[Dict[str, Any]] = []
     for edge, target in kg.neighbours(disease.id, {EdgeType.HAS_SYNDROME.value}):
-        entry = node_brief(kg, target)
+        entry = node_brief(kg, target, with_sentence=False)
+        presentation = kg.syndrome_presentation(target.id, disease.id)
+        entry["presentation"] = presentation["sentence"][:300]
+        entry["presentation_scope"] = presentation["scope"]
+        if presentation.get("caveat"):
+            entry["presentation_caveat"] = presentation["caveat"]
         entry["provenance"] = edge_evidence(edge)
         syndromes.append(entry)
     payload["syndromes"] = syndromes[:max_syndromes]
@@ -285,19 +289,34 @@ def retrieve_syndrome_evidence(ctx: ToolContext, args: Mapping[str, Any]) -> Too
 
     syndrome = matches[0]
     ctx.assert_visible(syndrome.type)
-    payload: Dict[str, Any] = {
-        "resolved": node_brief(kg, syndrome, max_sentence=400),
-        "definition_sentence": syndrome.sentence(),
-    }
 
+    # Per-disease presentations, because the same syndrome presents differently
+    # by disease. The global first-mention sentence is still reported, clearly
+    # labelled and caveated, rather than passed off as a definition.
     diseases: List[Dict[str, Any]] = []
     for edge in kg.in_edges(syndrome.id, {EdgeType.HAS_SYNDROME.value}):
         parent = kg.nodes[edge.source]
         if disease_filter and disease_filter not in parent.name:
             continue
         entry = node_brief(kg, parent, with_sentence=False, with_attrs=("tcm_name", "western_name"))
+        presentation = kg.syndrome_presentation(syndrome.id, parent.id)
+        entry["presentation_in_this_disease"] = presentation["sentence"][:300]
+        entry["presentation_scope"] = presentation["scope"]
         entry["provenance"] = edge_evidence(edge)
         diseases.append(entry)
+
+    focus = kg.syndrome_presentation(
+        syndrome.id,
+        next((d["id"] for d in diseases if disease_filter and disease_filter in d["name"]), None),
+    )
+    payload: Dict[str, Any] = {
+        "resolved": node_brief(kg, syndrome, with_sentence=False),
+        "presentation": focus["sentence"],
+        "presentation_scope": focus["scope"],
+        "presentations_by_disease": diseases[:10],
+    }
+    if focus.get("caveat"):
+        payload["presentation_caveat"] = focus["caveat"]
     payload["diseases"] = diseases[:10]
 
     subtypes: List[Dict[str, Any]] = []
@@ -319,13 +338,20 @@ def retrieve_syndrome_evidence(ctx: ToolContext, args: Mapping[str, Any]) -> Too
     payload["pathway_stages"] = stages[:6]
     payload["documents"] = documents_block(kg, [syndrome.id])
     payload["sibling_syndromes"] = _siblings(ctx, syndrome, diseases)
+    payload.pop("definition_sentence", None)
 
-    coverage = Coverage.SUPPORTED if syndrome.sentence() else Coverage.PARTIAL
+    coverage = Coverage.SUPPORTED if focus["sentence"] else Coverage.PARTIAL
     caveats: List[str] = []
-    if not syndrome.sentence():
+    if not focus["sentence"]:
         caveats.append(
-            "该证候节点没有保留原文定义句，只能依据其所属疾病与文献推断，"
-            "证据强度低于带定义句的证候。"
+            "该证候没有保留原文表现描述，只能依据其所属疾病与文献推断，"
+            "证据强度低于带描述的证候。"
+        )
+    elif focus["scope"] == "global_first_mention":
+        caveats.append(
+            "返回的表现描述来自该证候在图谱中最早出现的文献，"
+            "可能属于其他疾病的语境；同一证候在不同疾病中的表现可能明显不同。"
+            "如需特定疾病下的表现，请提供 disease_filter。"
         )
     return ToolResult(
         tool=_SYNDROME_SPEC.name, ok=True, coverage=coverage, data=payload, caveats=caveats
@@ -333,16 +359,21 @@ def retrieve_syndrome_evidence(ctx: ToolContext, args: Mapping[str, Any]) -> Too
 
 
 def _siblings(ctx: ToolContext, syndrome: Node, diseases: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    """Competing syndromes under the same diseases -- the discriminative set."""
+    """Competing syndromes under the same diseases -- the discriminative set.
+
+    Presentations are disease-conditioned: the point of the sibling list is to
+    let a model tell these syndromes apart *in this disease*, which a global
+    sentence from some other disease actively hinders.
+    """
     kg = ctx.kg
     out: List[Dict[str, Any]] = []
     seen = {syndrome.id}
     for entry in diseases[:2]:
-        for _edge, sibling in kg.neighbours(entry["id"], {EdgeType.HAS_SYNDROME.value}):
-            if sibling.id in seen:
+        for sibling in kg.syndromes_of(entry["id"]):
+            if sibling["id"] in seen:
                 continue
-            seen.add(sibling.id)
-            out.append(node_brief(kg, sibling))
+            seen.add(sibling["id"])
+            out.append(sibling)
     return out[:10]
 
 

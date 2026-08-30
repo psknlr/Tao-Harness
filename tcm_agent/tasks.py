@@ -215,12 +215,15 @@ class SDTTask(Task):
             node = self.kg.node(hit.node_id)
             if node is None:
                 continue
+            # disease-conditioned presentations; the global first-mention
+            # sentence often describes the syndrome in a different disease
             children = [
-                {"name": syn.name, "definition": syn.sentence()[:200]}
-                for _e, syn in self.kg.neighbours(
-                    node.id,
-                    {EdgeType.HAS_SYNDROME.value, EdgeType.SUBTYPE_HAS_SYNDROME.value},
-                )
+                {
+                    "name": syn["name"],
+                    "presentation": syn["presentation"][:200],
+                    "scope": syn["scope"],
+                }
+                for syn in self.kg.syndromes_of(node.id)
             ][:limit]
             subgraph.append(
                 {
@@ -288,21 +291,33 @@ class SDTTask(Task):
                         break
             if matches:
                 node = matches[0]
+                parents = [
+                    self.kg.nodes[e.source]
+                    for e in self.kg.in_edges(
+                        node.id,
+                        {EdgeType.HAS_SYNDROME.value, EdgeType.SUBTYPE_HAS_SYNDROME.value},
+                    )
+                ]
+                # One presentation per disease, each from its own edge. A
+                # single "definition" here would be whichever disease happened
+                # to mention the syndrome first, which for 58% of edges is not
+                # the disease under discussion.
+                presentations = []
+                for parent in parents[:4]:
+                    detail = self.kg.syndrome_presentation(node.id, parent.id)
+                    presentations.append(
+                        {
+                            "disease": parent.name,
+                            "presentation": detail["sentence"][:180],
+                            "scope": detail["scope"],
+                        }
+                    )
                 record.update(
                     {
                         "found": True,
                         "graph_name": node.name,
-                        "definition": node.sentence()[:220],
-                        "diseases": [
-                            self.kg.nodes[e.source].name
-                            for e in self.kg.in_edges(
-                                node.id,
-                                {
-                                    EdgeType.HAS_SYNDROME.value,
-                                    EdgeType.SUBTYPE_HAS_SYNDROME.value,
-                                },
-                            )
-                        ][:4],
+                        "presentations": presentations,
+                        "diseases": [p.name for p in parents[:4]],
                     }
                 )
             out.append(record)
