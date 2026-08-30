@@ -246,7 +246,62 @@ A compute-matched control only licenses its conclusion if the match held in
 practice, so the report includes a parity table of realised calls and tokens
 per pair, flagging any pair outside a 0.8–1.25 call ratio as `MISMATCH`.
 
-## 8. Known limitations
+## 8. What each contrast licenses
+
+The point of the control arms is that only some contrasts support a causal
+claim. Stated plainly, so a table cannot be read as more than it is:
+
+| contrast | claim it supports | what it still contains |
+|---|---|---|
+| `M1 − M0` | prompt structure helps | – |
+| `M2 − M1` | static KG evidence helps | – |
+| `M3 − M2` | *nothing on its own* | agency **and** extra compute |
+| `M3 − M2C` | adaptive retrieval helps | – (KG and compute held constant) |
+| `M4 − M3` | *nothing on its own* | verification **and** an extra turn |
+| `M4 − M3C` | verification content helps | – (trajectory and compute held constant) |
+| `M0 − M3` | the whole scaffold helps | everything at once; not a KG result |
+
+Three properties make the last two rows trustworthy, and each was absent in an
+earlier version:
+
+1. **Nothing routes on the answer key.** PA's verifier selects its checker from
+   the model's own `rule_category`, not the benchmark's `rule_id`. Reading the
+   annotation would have told M4 which safety rule was in play — a large part
+   of the task, given to one arm only.
+2. **M3, M3C and M4 share one agent phase.** Running them independently meant
+   `M3C → M4` carried trajectory noise on top of the verification difference,
+   and inconsistent provider seed support means a seed cannot remove it.
+3. **The verifier is not reachable by the agent.** Otherwise M3 is an
+   optionally-self-verifying arm and `M3 → M4` contrasts optional with
+   mandatory verification — a much weaker claim, easily misread as the stronger
+   one.
+
+## 9. Reproducibility: what a manifest freezes
+
+A framework hash proves two arms shared a scaffold. It does not say which
+graph, dataset, code revision or model snapshots produced a number. The
+per-run manifest does:
+
+| recorded | catches |
+|---|---|
+| `kg_content_sha256` | any edited node, edge, evidence or `source_docs` — the last because the SourceEvidence retrieval term reads it |
+| `dataset_sha256`, `dataset_results_sha256` | a swapped or re-exported split |
+| `case_ids` + `case_set_sha256` | a changed `limit` silently re-scoring more cases than the run covered |
+| model `fingerprint_sha256` | a repointed model key, or an `extra_body` change such as switching on a reasoning mode |
+| `tools_impl_sha256`, `scorers_impl_sha256`, `retrieval_impl_sha256`, `runtime_impl_sha256` | a rewritten checker body that leaves its `ToolSpec` untouched |
+| `git_commit`, `python`, `created_at` | everything else |
+
+`score` and `report` read the frozen manifest rather than recomputing from the
+config as it reads today — recomputation at report time produced a *different*
+framework hash from the one the traces were generated under, so the report
+attested to a run that never happened. Code drift since generation is reported
+rather than blocked: re-scoring recorded traces with a fixed scorer is the
+point of separating generation from scoring, but doing it unnoticed is not.
+
+The generation cache keys on the model fingerprint, so turning on a vendor
+reasoning mode no longer serves responses generated without it.
+
+## 10. Known limitations
 
 1. **Coverage.** 10 of 19 PA rule families are ungroundable here — **166 of
    328 released items (51%)**, including the largest family, A-003 dosage (87

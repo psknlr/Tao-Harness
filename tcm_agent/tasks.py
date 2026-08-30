@@ -36,6 +36,33 @@ _NOISE_PATTERNS = (
 _NOISE_RE = re.compile("|".join(_NOISE_PATTERNS))
 
 
+#: Clause separators in Chinese clinical prose.
+_CLAUSE_RE = re.compile(r"[，,。；;、\n]+")
+#: Leading narrative that carries no findings.
+_NARRATIVE_PREFIX_RE = re.compile(
+    r"^(?:主诉及病史|主诉|现病史|诊查|既往史|初诊|复诊|患者)[:：]?"
+)
+
+
+def case_clauses(text: Any, *, max_clauses: int = 40, min_len: int = 2) -> List[str]:
+    """Split raw case text into candidate findings, deterministically.
+
+    Used by the verifier so that its evidence comes from the case rather than
+    from the model's own summary. Crude on purpose: any cleverness here would
+    become a second, unvalidated extraction model sitting inside the
+    verification path.
+    """
+    out: List[str] = []
+    for clause in _CLAUSE_RE.split(str(text or "")):
+        clause = _NARRATIVE_PREFIX_RE.sub("", clause.strip()).strip()
+        clause = _NOISE_RE.sub(" ", clause).strip()
+        if len(clause) >= min_len and clause not in out:
+            out.append(clause)
+        if len(out) >= max_clauses:
+            break
+    return out
+
+
 def clinical_query(text: str, *, max_chars: int = 400) -> str:
     """Deterministic retrieval query derived from raw case text."""
     cleaned = _NOISE_RE.sub(" ", str(text or ""))
@@ -138,8 +165,8 @@ class SDTTask(Task):
         if condition == "M0":
             return load_prompt("sdt_m0_base")
         parts = [load_prompt("sdt_structured")]
-        # M2C is the no-knowledge compute control: it must not see the KG note
-        if condition in {"M2", "M3", "M4", "M3C"}:
+        # M2C sees the same static KG block as M2, so it needs the same note
+        if condition in {"M2", "M2C", "M3", "M4", "M3C"}:
             parts.append(load_prompt("sdt_kg_note"))
         if condition in {"M3", "M4", "M3C"}:
             parts.append(load_prompt("sdt_agent"))
@@ -295,7 +322,14 @@ class SDTTask(Task):
         """
         options = item.get("syndrome_options") or {}
         letters = self.clamp_letters(result.get("syndrome_answer"), options)
-        features = coerce_list(result.get("clinical_information"))[:20]
+        # Features come from the **raw case**, not from the model's own
+        # extraction. Verifying a syndrome against the findings the model
+        # itself chose to report is circular: a model that decided on 肝郁气滞
+        # tends to have listed 胸胁胀痛 and 脉弦, so the verifier confirms the
+        # claim using evidence the claimant curated. Deriving them from the
+        # case text keeps the verifier independent of the claim-maker, which is
+        # the whole point of having one.
+        features = case_clauses(item.get("clinical_data"))
         return [
             {
                 "syndrome": canonical_syndrome(str(options[letter]).strip()),
@@ -357,7 +391,7 @@ class PATask(Task):
         if condition == "M0":
             return load_prompt("pa_m0_base")
         parts = [load_prompt("pa_structured")]
-        if condition in {"M2", "M3", "M4", "M3C"}:
+        if condition in {"M2", "M2C", "M3", "M4", "M3C"}:
             parts.append(load_prompt("pa_kg_note"))
         if condition in {"M3", "M4", "M3C"}:
             parts.append(load_prompt("pa_agent"))
@@ -514,6 +548,23 @@ class PATask(Task):
         "N-009": ("check_restricted_item",),
     }
 
+    #: Surface forms a model may use for a rule family, mapped to its code.
+    #: This is how the verifier learns which checker to run **from the model's
+    #: own stated category**, never from the benchmark's annotation.
+    CATEGORY_ALIASES: Mapping[str, str] = {
+        "特殊煎煮": "N-003", "煎煮": "N-003", "煎法": "N-003", "先煎": "N-003",
+        "后下": "N-003", "包煎": "N-003", "烊化": "N-003", "冲服": "N-003",
+        "用法": "A-005", "服法": "A-005", "用法用量": "A-005",
+        "重复用药": "A-008", "重复": "A-008",
+        "使用禁忌": "A-007", "禁忌": "A-007", "禁忌症": "A-007",
+        "配伍禁忌": "A-009", "配伍": "A-009", "十八反": "A-009", "十九畏": "A-009",
+        "联合用药": "A-009", "相互作用": "A-009",
+        "剂量": "A-003", "单味药剂量": "A-003", "超量": "A-003", "用量": "A-003",
+        "总剂量": "A-004", "药味数": "A-004",
+        "特殊药品": "N-007", "毒性药品": "N-007", "有毒": "N-007",
+        "新生儿": "N-009", "婴幼儿": "N-009", "儿童用药": "N-009",
+    }
+
     def verify_arguments(
         self, result: Mapping[str, Any], item: Mapping[str, Any]
     ) -> Optional[List[Dict[str, Any]]]:
@@ -530,9 +581,20 @@ class PATask(Task):
         never written -- M4 was only a coverage audit plus one more revision
         turn, and any M3→M4 gain would have measured extra thinking rather
         than verification.
+
+        **Routing comes from the model, not from the answer key.** The
+        benchmark annotates each item with a ``rule_id``, and an earlier
+        version read it here to pick the checker. That is oracle routing: a
+        model in M4 was silently told which safety rule the question was about
+        -- dose, or contraindication, or incompatibility -- which is a large
+        part of the work, and no other arm received it. Any M3→M4 gain would
+        then have partly measured a label the deployment setting cannot
+        supply. The category now comes from the model's own
+        ``rule_category`` output, which the structured prompt already asks
+        for; ``rule_id`` survives only in scoring, where it belongs.
         """
-        rule = str(item.get("rule_id") or "").upper()
-        checkers = self.RULE_CHECKERS.get(rule)
+        rule = self._declared_rule(result)
+        checkers = self.RULE_CHECKERS.get(rule) if rule else None
         if not checkers:
             return None
         entities = self._entities_in_play(result, item)
@@ -578,6 +640,27 @@ class PATask(Task):
             for marker in DECOCTION_MARKERS:
                 if marker in text:
                     return marker
+        return None
+
+    def _declared_rule(self, result: Mapping[str, Any]) -> Optional[str]:
+        """Map the model's own stated rule category onto a family code.
+
+        Accepts an explicit code (``"A-003"``) or a Chinese surface form
+        (``"剂量"``). Returns ``None`` when the model said nothing usable, in
+        which case verification falls back to the coverage audit -- a model
+        that cannot categorise its own question does not get routed for free.
+        """
+        declared = coerce_str(result.get("rule_category"))
+        if not declared:
+            return None
+        upper = declared.upper()
+        match = re.search(r"\b([ANC]-\d{3})\b", upper)
+        if match and match.group(1) in self.RULE_CHECKERS:
+            return match.group(1)
+        # longest alias first, so 单味药剂量 beats 剂量
+        for alias in sorted(self.CATEGORY_ALIASES, key=len, reverse=True):
+            if alias in declared:
+                return self.CATEGORY_ALIASES[alias]
         return None
 
     def _entities_in_play(

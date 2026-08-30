@@ -48,7 +48,7 @@ Every figure below is computed from the delivered graph by `scripts/kg_coverage.
   },
   "n_documents": 632,
   "n_identity_clusters": 222,
-  "content_hash": "c94e3dd59d776323"
+  "content_hash": "57ddff137df1984e"
 }
 ```
 

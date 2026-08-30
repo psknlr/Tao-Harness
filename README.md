@@ -215,6 +215,16 @@ endorse a classical contraindication. `check_combination` therefore returns
 `not_covered`, labels co-occurrence as weak compatibility evidence only, and
 says the incompatibility table is absent. There is a test for exactly this.
 
+### 3a. Nothing routes on the answer key
+
+PA's deterministic verification picks its checker from the **model's own
+declared `rule_category`**, never from the benchmark's `rule_id` annotation.
+Reading the annotation would tell an M4 model which safety rule the question
+was about — dose, or contraindication, or incompatibility — which is a large
+part of the work, and no other arm receives it. A model that miscategorises its
+own question gets routed to the wrong checker, exactly as it would in
+deployment. `rule_id` survives only in scoring, where it belongs.
+
 ### 3b. Verification is deterministic, and checks the whole answer
 
 M4 re-runs rule-engine checks over the answer the model just gave, then gives
@@ -229,6 +239,12 @@ the model one revision turn. Two properties matter:
   on. For the majority of PA items no checker applies, and there M4 falls back
   to the coverage audit: "the graph cannot speak to this — did you claim it
   could?" That is the honest verification for a rule with no data behind it.
+- **The verifier is independent of the claim-maker.** SDT verification matches
+  a candidate syndrome against findings derived from the **raw case text**, not
+  against the findings the model itself chose to report. Verifying a syndrome
+  against evidence the claimant curated is self-confirmation: a model that
+  decided on 肝郁气滞 will have listed 胸胁胀痛 and 脉弦, and the verifier would
+  duly agree.
 
 ### 4b. The SDT leakage check
 
@@ -276,7 +292,16 @@ framework_hash = sha256(prompts ‖ tools ‖ retrieval ‖ budgets ‖ decode �
                         ‖ task ‖ domain ‖ kg_content ‖ dataset_content)
 ```
 
-The last four matter. Without `task` and `domain` an SDT run and a PA run
+Beyond the framework hash, each run freezes a `manifest.json` recording the
+KG content hash, dataset hash, **case list and its hash**, **model
+fingerprints** (provider + model id + base URL + `extra_body`, so repointing a
+model key is detectable), and **implementation hashes** of the tool, scorer,
+retrieval and runtime modules — because a framework hash over tool
+*descriptions* does not notice a rewritten `check_dose` body. `score` and
+`report` read that frozen manifest rather than recomputing from the config as
+it reads today, and report any code drift since generation.
+
+The last four hash inputs matter. Without `task` and `domain` an SDT run and a PA run
 hashed **identically**, certifying as comparable two runs that read different
 sub-graphs and answered different questions. Without the content hashes, an
 edited graph or a swapped dataset file left the hash unchanged. The graph hash
@@ -319,34 +344,52 @@ across 300 cases × 5 models × 5 conditions.
 | **M0** Base LLM | – | – | – | – | 1 |
 | **M1** Structured | ✓ | – | – | – | 1 |
 | **M2** KG-RAG | ✓ | static, deterministic | – | – | 1 |
-| **M2C** Iterative control | ✓ | **none** | – | – | = M3 |
+| **M2C** Iterative control | ✓ | **same static KG as M2** | – | – | = M3 |
 | **M3** KG-Agent | ✓ | agentic | ✓ | – | multi |
 | **M3C** Sham-revision control | ✓ | agentic | ✓ | **no evidence** | = M4 |
 | **M4** KG-Agent + Verify | ✓ | agentic | ✓ | ✓ | multi |
 
-**The two controls exist because M3 and M4 spend more test-time compute than
-the arms they are compared against.** Without them, `M2→M3` confounds "the
-agent used the graph" with "the model got more turns to think", and `M3→M4`
-confounds "verification helped" with "being asked to look again helped". M2C
-gets M3's turn budget with no graph access at all; M3C gets M4's extra
-revision turn with no verification evidence in it. The report includes a
-compute-parity table so the matching claim is evidenced, not asserted.
+**The controls exist because M3 and M4 spend more test-time compute than the
+arms they are compared against.** Without them, `M2→M3` confounds "the agent
+used the graph" with "the model got more turns to think", and `M3→M4`
+confounds "verification helped" with "being asked to look again helped".
 
-M2's retrieval is built from a **rule-based** query (demographics and
-administrative fragments stripped identically for every model), so the
-retrieval contrast is not confounded with a better query. The interpretable
-contrasts are:
+Each control changes exactly one thing from the arm it is matched to:
+
+- **M2C** receives the *same static KG block M2 receives* and M3's turn budget,
+  with no tool access. So `M2C→M3` isolates adaptive retrieval alone. (An
+  earlier version built M2C with no graph evidence at all, which moved four
+  variables together and could not isolate agency.)
+- **M3C** takes M4's extra revision turn with no verification evidence in it,
+  so `M3C→M4` isolates the verification content.
+
+**M3, M3C and M4 share one agent phase.** The reasoning loop runs once per
+case and the branches fork after the first answer, so M3C and M4 differ *only*
+in the verification report — not in whatever the model happened to do
+differently on an independent run. Provider seed support is inconsistent, so
+this cannot be left to a seed. Both revision turns re-receive the full case,
+question and option list: told only that option C is unsupported, a model with
+no view of the alternatives cannot choose among them, and that is an amnesia
+effect rather than a verification effect.
+
+**Agents cannot call the verifier themselves.** `verify_tcm_decision` is
+withheld from the agent tool list, so M3 is genuinely unverified rather than
+optionally self-verifying, and `M3→M4` contrasts absent with present rather
+than optional with mandatory.
+
+The interpretable contrasts are:
 
 ```
 Δ_structure     = M1  − M0     prompt scaffold only
 Δ_retrieval     = M2  − M1     static KG evidence
-Δ_agency        = M3  − M2C    agentic KG tool use, compute held constant
-Δ_verification  = M4  − M3C    verification content, compute held constant
+Δ_agency        = M3  − M2C    adaptive retrieval, KG and compute held constant
+Δ_verification  = M4  − M3C    verification content, trajectory and compute held constant
 ```
 
 `M0→M3` is reported too, but labelled the **whole-scaffold effect** — it
 contains prompt structure, retrieval and agency together and is not a KG-only
-result.
+result. A compute-parity table reports realised calls and tokens per control
+pair, so the matching claim is evidenced rather than asserted.
 
 ---
 
@@ -460,6 +503,26 @@ debug and analyse; use the runner to measure.
 | **TCMEval-SDT** | effectiveness: the graph improved clinical reasoning |
 | **TCMEval-PA** | effectiveness: the graph reduced rule and knowledge errors — but only in the ~half of items whose rule family it can ground |
 | **TCM-CP** | **capability only**: the agent can execute a staged pathway faithfully |
+
+TCM-CP covers six subtask families — eligibility (CP1), stage identification
+(CP2), stage actions (CP3), treatment planning across principle/formula/patent
+medicine/external therapy (CP4), monitoring (CP5) and transition decisions
+(CP6). Two things about its construction matter:
+
+- **CP2 items are filtered for discriminability.** The first build was
+  underdetermined: of 1,210 stage-identification items, *zero* could be
+  resolved from what the vignette exposed, and the median item fit five stages
+  of its own pathway — clinical pathway stages within one disease share their
+  monitoring text almost verbatim. Items are now emitted only when every
+  distractor differs observably from the gold stage, and vignettes carry a
+  treatment-history line locating the patient in time. The build reports what
+  it dropped and why.
+- **CP6 includes `insufficient_evidence`.** A pathway agent forced to always
+  choose an action will choose one when the record supports none, which in a
+  discharge decision is the dangerous direction. `unsafe_transition` counts any
+  answer that moves a patient onward when the criteria are unmet *or*
+  unassessed — including a mixed answer that contains both a safe and an
+  unsafe option.
 
 TCM-CP is built from the graph's own pathway layer (`scripts/build_tcm_cp.py`),
 because no published TCM pathway benchmark exists. Its gold answers therefore

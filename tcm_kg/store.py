@@ -494,10 +494,18 @@ class KGStore:
     def content_hash(self) -> str:
         """Semantic fingerprint of the graph's contents.
 
-        Computed over every node's identity, type, name and attributes and
-        every edge's endpoints, type and evidence -- not over the file bytes,
-        so the JSON and GraphML exports of one graph hash identically while any
-        change to a node attribute or a relation changes the hash.
+        Computed over every node's identity, type, name, attributes and
+        provenance, and every edge's endpoints, type, evidence and provenance
+        -- not over the file bytes, so the JSON and GraphML exports of one
+        graph hash identically while any change to a node attribute or a
+        relation changes the hash.
+
+        ``source_docs``, ``evidence_type`` and ``claim_type`` are included
+        deliberately. They are not decoration: the retrieval score's
+        SourceEvidence term is computed from document co-occurrence, so editing
+        a node's ``source_docs`` changes ranking. Leaving them out of the hash
+        would break the property the hash exists to guarantee -- that an
+        unchanged hash means unchanged retrieval behaviour.
 
         This is what the retrieval cache and the run manifest key on. Keying on
         node *count*, as an earlier version did, meant that editing a thousand
@@ -518,10 +526,14 @@ class KGStore:
                 digest.update(
                     json.dumps(node.first_mention, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
                 )
+                digest.update("|".join(node.source_docs).encode("utf-8"))
             for edge in sorted(self.edges, key=lambda e: (e.source, e.type, e.target, e.id)):
                 digest.update(f"{edge.source}|{edge.type}|{edge.target}".encode("utf-8"))
                 digest.update(
                     json.dumps(edge.evidence, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                )
+                digest.update(
+                    f"{edge.evidence_type}|{edge.claim_type}|{'|'.join(edge.source_docs)}".encode("utf-8")
                 )
             self._content_hash = digest.hexdigest()
         return self._content_hash

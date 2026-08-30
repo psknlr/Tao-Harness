@@ -172,9 +172,11 @@ def pathogenesis_probe_rate(
     return hits / len(queries)
 
 
-def aggregate_trace_metrics(traces: Sequence[Trace]) -> Dict[str, Any]:
+def aggregate_trace_metrics(
+    traces: Sequence[Trace], *, cost_per_mtok: Sequence[float] = (0.0, 0.0)
+) -> Dict[str, Any]:
     """Means over a set of traces, skipping metrics that are ``None``."""
-    rows = [trace_metrics(t) for t in traces]
+    rows = [trace_metrics(t, cost_per_mtok=cost_per_mtok) for t in traces]
     numeric_keys = [
         "n_llm_calls",
         "n_tool_calls",

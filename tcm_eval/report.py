@@ -29,6 +29,7 @@ from .scorers import (
 )
 from .stats import (
     PairedResult,
+    cluster_paired_bootstrap,
     holm_bonferroni,
     is_binary,
     mcnemar,
@@ -101,6 +102,26 @@ def index_items(
     return out
 
 
+def paired_clusters(
+    index: Mapping[Tuple[str, str], Mapping[str, ScoredItem]],
+    model: str,
+    left: str,
+    right: str,
+    metric: str,
+    cluster_field: str,
+) -> List[str]:
+    """Cluster label per paired observation, aligned with ``paired_vectors``."""
+    a = index.get((model, left), {})
+    b = index.get((model, right), {})
+    labels: List[str] = []
+    for case_id in sorted(set(a) & set(b)):
+        left_value = a[case_id].metrics.get(metric)
+        right_value = b[case_id].metrics.get(metric)
+        if isinstance(left_value, (int, float)) and isinstance(right_value, (int, float)):
+            labels.append(str(a[case_id].metrics.get(cluster_field) or case_id))
+    return labels
+
+
 def paired_vectors(
     index: Mapping[Tuple[str, str], Mapping[str, ScoredItem]],
     model: str,
@@ -153,6 +174,7 @@ def contrast_table(
     *,
     binary: Optional[bool] = None,
     contrasts: Sequence[Tuple[str, str, str]] = CONTRASTS,
+    clusters: Optional[str] = None,
 ) -> Tuple[str, Dict[str, PairedResult]]:
     """Paired condition contrasts per model, with multiplicity control.
 
@@ -177,7 +199,11 @@ def contrast_table(
             xs, ys = paired_vectors(index, model, left, right, metric)
             if not xs:
                 continue
-            if binary is None:
+            if clusters is not None:
+                # CP items cluster by disease; see cluster_paired_bootstrap
+                labels = paired_clusters(index, model, left, right, metric, clusters)
+                result = cluster_paired_bootstrap(xs, ys, labels)
+            elif binary is None:
                 result = paired_test(xs, ys)
             else:
                 result = mcnemar(xs, ys) if binary else paired_bootstrap(xs, ys)
@@ -230,6 +256,61 @@ def contrast_table(
         "sig",
     ]
     return _md_table(headers, rows), results
+
+
+def leakage_table(items: Sequence[ScoredItem]) -> str:
+    """How often agents probed the graph for their task-2 answer options.
+
+    The static context no longer offers a pathogenesis lookup, but an agent can
+    type an option into the search tool. The prompt forbids it; this reports
+    whether it happened anyway, per model and arm. Publishing the rate is what
+    lets a reader judge the leakage claim instead of taking it on trust -- and
+    if the rate is non-trivial, the sensitivity row below says what the result
+    looks like with those cases removed.
+    """
+    scoped = [i for i in items if i.dataset == "sdt"]
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for condition in [c for c in CONDITION_LABELS if any(
+            i.model_key == model and i.condition == c for i in scoped
+        )]:
+            bucket = [
+                i for i in scoped if i.model_key == model and i.condition == condition
+            ]
+            rates = [
+                float(i.trace_metrics["pathogenesis_probe_rate"])
+                for i in bucket
+                if isinstance(i.trace_metrics.get("pathogenesis_probe_rate"), (int, float))
+            ]
+            if not rates:
+                continue
+            probed = [r for r in rates if r > 0]
+            clean = [
+                float(i.metrics.get("sdt_composite", 0.0))
+                for i in bucket
+                if not i.trace_metrics.get("pathogenesis_probe_rate")
+            ]
+            everything = [float(i.metrics.get("sdt_composite", 0.0)) for i in bucket]
+            rows.append(
+                [
+                    model,
+                    condition,
+                    len(bucket),
+                    len(probed),
+                    len(probed) / len(rates) if rates else None,
+                    sum(everything) / len(everything) if everything else None,
+                    sum(clean) / len(clean) if clean else None,
+                ]
+            )
+    if not rows:
+        return ""
+    return _md_table(
+        [
+            "model", "arm", "cases", "cases that probed", "probe rate",
+            "composite (all)", "composite (non-probing only)",
+        ],
+        rows,
+    )
 
 
 def compute_parity_table(items: Sequence[ScoredItem]) -> str:
@@ -515,7 +596,9 @@ def build_report(
         parts.append("")
         parts.append(main_table(items, dataset, metrics))
         parts.append("")
-        table, results = contrast_table(items, dataset, primary)
+        table, results = contrast_table(
+            items, dataset, primary, clusters="disease" if dataset == "cp" else None
+        )
         tests_used = sorted({r.test for r in results.values()}) or ["–"]
         family = HYPOTHESIS_FAMILIES.get(dataset, f"{dataset} family")
         parts.append("### Paired condition contrasts")
@@ -537,6 +620,21 @@ def build_report(
         parts.append("")
         parts.append(f"Spearman ρ(base, Δ) = `{comp_stats['spearman_rho_base_vs_delta']}` "
                      f"over {comp_stats['n_models']} models — {comp_stats['interpretation']}.")
+        parts.append("")
+
+    leakage = leakage_table(items)
+    if leakage:
+        parts.append("## Option-probing leakage check (SDT)")
+        parts.append("")
+        parts.append(
+            "Task-2 pathogenesis options are never looked up for the model, and "
+            "the agent prompt forbids searching them. This table reports whether "
+            "agents did so anyway, and what the headline metric looks like with "
+            "the probing cases removed — the sensitivity analysis a reviewer "
+            "would otherwise have to ask for."
+        )
+        parts.append("")
+        parts.append(leakage)
         parts.append("")
 
     parity = compute_parity_table(items)

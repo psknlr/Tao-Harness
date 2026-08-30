@@ -149,7 +149,11 @@ class P0_3_and_4_Verification(unittest.TestCase):
             "rule_id": "N-003",
         }
         task = build_task("pa", graph(), retriever())
-        plans = task.verify_arguments({"answer": ["A"]}, item)
+        # V3: routing comes from the model's own declared category, not from
+        # the benchmark's rule_id, so the answer must carry rule_category
+        plans = task.verify_arguments(
+            {"answer": ["A"], "rule_category": "特殊煎煮"}, item
+        )
         self.assertIsNotNone(plans, "PA M4 produced no deterministic check")
         self.assertEqual(plans[0]["_tool"], "check_decoction_requirement")
         # the claim must be passed through, or the checker adjudicates nothing
@@ -158,7 +162,9 @@ class P0_3_and_4_Verification(unittest.TestCase):
     def test_pa_falls_back_to_coverage_audit_when_no_checker_applies(self):
         item = {"id": "p2", "question": "处方审核的定义是", "options": {"A": "x"}, "rule_id": "C-001"}
         task = build_task("pa", graph(), retriever())
-        self.assertIsNone(task.verify_arguments({"answer": ["A"]}, item))
+        self.assertIsNone(
+            task.verify_arguments({"answer": ["A"], "rule_category": "基础概念"}, item)
+        )
 
 
 class P0_8_and_9_Reproducibility(unittest.TestCase):

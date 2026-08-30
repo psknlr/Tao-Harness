@@ -135,7 +135,7 @@ class CachedClient(LLMClient):
         sample: int = 0,
     ) -> Completion:
         decode = decode or DecodeParams()
-        key = request_key(self.spec.model_id, messages, decode, sample)
+        key = request_key(self.spec, messages, decode, sample)
         hit = self.cache.get(key)
         if hit is not None:
             self.n_hits += 1
@@ -154,7 +154,14 @@ class CachedClient(LLMClient):
             )
         completion = self.inner.generate(messages, decode, sample=sample)
         if not completion.error:
-            self.cache.put(key, completion, meta={"model_key": self.spec.key})
+            self.cache.put(
+                key,
+                completion,
+                meta={
+                    "model_key": self.spec.key,
+                    "model_fingerprint": self.spec.fingerprint()[:16],
+                },
+            )
         self.n_calls += 1
         return completion
 
