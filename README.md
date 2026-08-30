@@ -416,8 +416,19 @@ Each control changes exactly one thing from the arm it is matched to:
   with no tool access. So `M2C→M3` isolates adaptive retrieval alone. (An
   earlier version built M2C with no graph evidence at all, which moved four
   variables together and could not isolate agency.)
+  The match is **per case**: M2C is generated alongside its M3 twin and pinned
+  to the calls that twin actually spent, because a mean can match while no
+  individual pair does.
 - **M3C** takes M4's extra revision turn with no verification evidence in it,
   so `M3C→M4` isolates the verification content.
+
+Both are **turn-matched, not compute-matched**. Model calls are equal per case
+by construction; tokens are not, and should not be — an agent's tool results
+enter its later prompts, so M3 carries up to 23.5% more tokens than M2C at the
+same turn count, and M4's verification report is longer than M3C's sham one.
+Forcing tokens equal would delete the evidence the intervention *consists of*,
+so the report gives the call ratio and the token ratio side by side and the
+claim stays the one that is true.
 
 **M3, M3C and M4 share one agent phase.** The reasoning loop runs once per
 case and the branches fork after the first answer, so M3C and M4 differ *only*
@@ -459,8 +470,8 @@ The interpretable contrasts are:
 ```
 Δ_structure     = M1  − M0     prompt scaffold only
 Δ_retrieval     = M2  − M1     static KG evidence
-Δ_agency        = M3  − M2C    adaptive retrieval, KG and compute held constant
-Δ_verification  = M4  − M3C    verification content, trajectory and compute held constant
+Δ_agency        = M3  − M2C    adaptive retrieval, KG and turns held constant
+Δ_verification  = M4  − M3C    verification content, trajectory and turns held constant
 ```
 
 `M0→M3` is reported too, but labelled the **whole-scaffold effect** — it

@@ -73,9 +73,9 @@ CONTRASTS = (
     ("M0", "M1", "prompt structure alone"),
     ("M1", "M2", "static KG evidence"),
     ("M2", "M3", "agency + extra compute (confounded)"),
-    ("M2C", "M3", "agentic retrieval over the same KG, compute-matched"),
+    ("M2C", "M3", "agentic retrieval over the same KG, turn-matched"),
     ("M3", "M4", "verification + extra revision (confounded)"),
-    ("M3C", "M4", "verification content, compute-matched"),
+    ("M3C", "M4", "verification content, turn-matched"),
     ("M0", "M3", "whole scaffold (not a KG-only effect)"),
 )
 
@@ -142,7 +142,7 @@ def _usable_pairs(
     """Case ids both conditions scored, minus the ones that are not comparable.
 
     A case whose branches broke compute parity is dropped rather than scored.
-    The compute-matched contrasts exist precisely to hold test-time compute
+    The turn-matched contrasts exist precisely to hold test-time turns
     fixed; including a pair where it was not fixed reintroduces the confound
     the contrast was built to remove, and does it invisibly.  ``stratum``
     additionally restricts to cases where the M4 verification pass reached a
@@ -734,10 +734,10 @@ def contamination_table(
     )
 
 
-def compute_parity_table(items: Sequence[ScoredItem]) -> str:
+def turn_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
-    A compute-matched control only licenses its conclusion if the match held in
+    A turn-matched control only licenses its conclusion if the match held in
     practice. If M2C used half as many model calls as M3, then M2C→M3 is still
     partly a compute contrast and must be reported as such. This table is the
     evidence for -- or against -- the matching claim, and belongs in the paper
@@ -766,6 +766,18 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                 control_tokens = _mean(control, "total_tokens")
                 arm_tokens = _mean(arm, "total_tokens")
                 ratio = control_calls / arm_calls if arm_calls else None
+                # Calls match exactly by construction; tokens do not and should
+                # not. An agent's tool results enter its later prompts, so M3
+                # carries more input tokens than M2C at the same turn count --
+                # measured at up to +23.5%. Forcing those equal would delete the
+                # evidence the intervention consists of. The ratio is reported
+                # so the claim stays "turn-matched", which is true, rather than
+                # "compute-matched", which is not.
+                token_ratio = (
+                    control_tokens / arm_tokens
+                    if control_tokens and arm_tokens
+                    else None
+                )
                 # Means can match while individual pairs do not, so the
                 # per-case count is the binding check; the ratio is only a
                 # readable summary beside it.
@@ -786,6 +798,7 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                         ratio,
                         control_tokens,
                         arm_tokens,
+                        token_ratio,
                         broken,
                         verdict,
                     ]
@@ -795,8 +808,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     return _md_table(
         [
             "dataset", "model", "pair", "control calls", "arm calls",
-            "call ratio", "control tokens", "arm tokens",
-            "per-case breaks (dropped)", "parity",
+            "call ratio", "control tokens", "arm tokens", "token ratio",
+            "per-case breaks (dropped)", "turn parity",
         ],
         rows,
     )
@@ -1195,20 +1208,25 @@ def build_report(
         parts.append(leakage)
         parts.append("")
 
-    parity = compute_parity_table(items)
+    parity = turn_parity_table(items)
     if parity:
-        parts.append("## Compute parity of the control arms")
+        parts.append("## Turn parity of the control arms")
         parts.append("")
         parts.append(
             "M2C matches M3's turn budget while keeping M2's static KG context "
             "and withholding the tools -- so M2C→M3 isolates *agentic retrieval*, "
             "not the graph, which both arms have. M3C matches M4's turn count "
-            "without the verification evidence. These contrasts are only "
-            "interpretable if the match actually held, so the realised call and "
-            "token counts are reported here alongside the number of pairs where "
-            "parity broke per case. Any per-case break drops that pair from the "
-            "contrast and marks the row `MISMATCH`; means alone can agree while "
-            "individual pairs do not."
+            "without the verification evidence.\n\n"
+            "**These are turn-matched, not compute-matched.** Model calls are "
+            "equal per case by construction; tokens are not, and should not be. "
+            "An agent's tool results enter its later prompts, so M3 carries more "
+            "input tokens than M2C at the same turn count -- measured at up to "
+            "+23.5% -- and the same holds for M4's verification report against "
+            "M3C's sham one. Forcing those equal would delete the evidence the "
+            "intervention *consists of*. The token ratio is reported so the "
+            "residual difference is visible rather than assumed away.\n\n"
+            "Any per-case break drops that pair from the contrast and marks the "
+            "row `MISMATCH`; means alone can agree while individual pairs do not."
         )
         parts.append("")
         parts.append(parity)

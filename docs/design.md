@@ -248,11 +248,19 @@ them:
   invocation as its M3 twin and pinned to the calls that twin actually spent:
   it cannot answer early (it is asked to reconsider) or run long (the final
   turn demands an answer).
+
+  **Turn-matched, not compute-matched.** Calls are equal per case; tokens are
+  not. An agent's tool results enter its later prompts, so M3 carries more
+  input tokens than M2C at the same turn count -- measured at up to +23.5% --
+  and M4's verification report is longer than M3C's sham one. Forcing tokens
+  equal would delete the evidence the intervention *consists of*, so the report
+  states the call ratio and the token ratio side by side and the claim is the
+  one that is true.
 - **M3C** — M4's extra revision turn, with no verification evidence in it.
   `M3C→M4` is the effect of the verification *content* rather than of being
   asked to look again.
 
-A compute-matched control only licenses its conclusion if the match held **per
+A turn-matched control only licenses its conclusion if the match held **per
 case**, not on average. M4 used to return early when no deterministic checker
 adjudicated an item, spending one model call fewer than M3C on exactly those
 cases — the mean stayed close while the contrast over that subset was a
@@ -465,7 +473,7 @@ carry a paired test on precisely the subtask with a patient-safety reading.
    change and the hash will differ.
 5. **No test-set contamination check.** SDT cases are classical published
    medical records and may overlap frontier pre-training data. The
-   compute-matched *deltas* are more trustworthy than any absolute number.
+   turn-matched *deltas* are more trustworthy than any absolute number.
 6. **TCM-CP is circular with respect to the KG arms.** Its gold answers come
    from the graph, so it measures pathway-execution faithfulness, not clinical
    effectiveness. Never pool it with SDT or PA. Its contrasts use a

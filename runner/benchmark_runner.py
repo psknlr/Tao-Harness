@@ -68,6 +68,9 @@ from tcm_eval.provenance import (
 from tcm_eval.stats import mcnemar, paired_bootstrap
 from tcm_kg import load_kg
 from tcm_kg.index import KGRetriever
+from tcm_agent.parsing import extract_json_object
+from tcm_eval.report import _md_table
+from tcm_models.base import DecodeParams, Message
 from tcm_models.registry import build_client
 from tcm_tools.base import REGISTRY
 
@@ -206,6 +209,30 @@ def write_manifest(
             previous = None
         if isinstance(previous, Mapping):
             conflicts = manifest_conflicts(previous, manifest)
+            if not conflicts:
+                # Same experiment, fewer models: `run --models gpt` used to
+                # rewrite the model map to just gpt while the other four
+                # traces.*.jsonl stayed on disk and kept being scored, so the
+                # manifest described a one-model experiment beside a five-model
+                # report. Per-model maps merge; everything else is the current
+                # run's, which the conflict check has already agreed matches.
+                for key in ("models", "run_signatures", "design_signatures"):
+                    merged = dict(previous.get(key) or {})
+                    merged.update(manifest.get(key) or {})
+                    if merged:
+                        manifest[key] = merged
+                added = sorted(
+                    set(manifest.get("models") or {}) - set(previous.get("models") or {})
+                )
+                kept = sorted(
+                    set(previous.get("models") or {}) - set(manifest.get("models") or {})
+                )
+                if added or kept:
+                    print(
+                        f"manifest: {len(manifest.get('models') or {})} model(s) "
+                        f"recorded" + (f", added {added}" if added else ""),
+                        file=sys.stderr,
+                    )
             if conflicts:
                 if not allow_conflict:
                     raise SystemExit(
@@ -718,7 +745,17 @@ def cmd_score(args: argparse.Namespace) -> int:
         if frozen_cases:
             expected = case_set_hash([str(c) for c in frozen_cases])
             if expected != manifest.get("case_set_sha256"):
-                print("WARNING: manifest case list does not match its own hash.", file=sys.stderr)
+                # The manifest is the immutable record of what this run was.
+                # If it contradicts itself, it is not a record of anything, and
+                # scoring against it certifies a run that cannot be described.
+                code = _refuse_or_note(
+                    "the manifest contradicts its own case-set hash",
+                    f"case_ids hash to {expected[:12]} but case_set_sha256 says "
+                    f"{str(manifest.get('case_set_sha256'))[:12]}; the file has been "
+                    f"edited or truncated.",
+                )
+                if code is not None:
+                    return code
             gold = {cid: gold[cid] for cid in map(str, frozen_cases) if cid in gold}
             print(
                 f"scoring the {len(gold)} cases frozen in the manifest "
@@ -765,9 +802,8 @@ def cmd_score(args: argparse.Namespace) -> int:
             )
             if code is not None:
                 return code
-        frozen_signature = (manifest or {}).get("run_signatures", {}).get(
-            traces[0].model_key
-        )
+        model_key = traces[0].model_key
+        frozen_signature = (manifest or {}).get("run_signatures", {}).get(model_key)
         observed = next(iter(signatures))
         if frozen_signature and observed and frozen_signature != observed:
             code = _refuse_or_note(
@@ -776,6 +812,63 @@ def cmd_score(args: argparse.Namespace) -> int:
             )
             if code is not None:
                 return code
+
+        if manifest is not None:
+            # Score what the manifest describes, not what happens to be in the
+            # directory. `run --models gpt` rewrote the model list while the
+            # other four trace files stayed on disk, and score globbed them all
+            # back in -- so the manifest said one model and the report showed
+            # five. A file the manifest does not list is from another run.
+            # ``or {}`` would have made an *empty* model map -- exactly what a
+            # subset re-run leaves behind -- disable the check it exists for.
+            declared_models = (
+                set(manifest["models"]) if "models" in manifest else None
+            )
+            if declared_models is not None and model_key not in declared_models:
+                code = _refuse_or_note(
+                    f"{trace_file.name} is for a model this manifest does not list",
+                    f"{model_key!r} is not in {sorted(declared_models)}; it belongs to "
+                    f"a different run. Move or delete the stale trace file.",
+                )
+                if code is not None:
+                    return code
+
+            # The design fingerprint, per trace. run_signature deliberately
+            # omits the condition so the arms can be pooled, which leaves a
+            # trace from a dropped condition or a retired sample index matching
+            # on signature alone.
+            frozen_design = (manifest.get("design_signatures") or {}).get(model_key)
+            declared_conditions = set(manifest.get("conditions") or config.conditions)
+            declared_samples = int(manifest.get("samples") or config.samples)
+            bad_design = {
+                t.design_signature for t in traces if t.design_signature
+            } - ({frozen_design} if frozen_design else set())
+            if frozen_design and bad_design:
+                code = _refuse_or_note(
+                    f"{trace_file.name} mixes experiment designs",
+                    f"manifest {str(frozen_design)[:12]} != {sorted(s[:12] for s in bad_design)}; "
+                    f"the condition list, sample count or sampling rule changed after "
+                    f"these traces were generated.",
+                )
+                if code is not None:
+                    return code
+            stray_conditions = {t.condition for t in traces} - declared_conditions
+            if stray_conditions:
+                code = _refuse_or_note(
+                    f"{trace_file.name} holds conditions this experiment does not declare",
+                    f"{sorted(stray_conditions)} not in {sorted(declared_conditions)}",
+                )
+                if code is not None:
+                    return code
+            stray_samples = {t.sample for t in traces if 0 <= t.sample >= declared_samples}
+            if stray_samples:
+                code = _refuse_or_note(
+                    f"{trace_file.name} holds sample indices beyond samples={declared_samples}",
+                    f"{sorted(stray_samples)}; scoring would weight those cases "
+                    f"more heavily than their neighbours.",
+                )
+                if code is not None:
+                    return code
 
         all_scored.extend(_score_traces(config, traces, gold, kg, pricing))
         by_condition: Dict[str, List[Trace]] = {}
@@ -1063,6 +1156,107 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+#: One structured answer, in the schema every task uses. Short enough to cost
+#: almost nothing across five providers, strict enough that a provider which
+#: cannot hold the output contract fails here rather than mid-run.
+_SMOKE_PROMPT = (
+    "请只输出一个 JSON 对象，不要输出任何其他内容，格式为："
+    '{"action": "answer", "result": {"syndrome_answer": ["A"], "note": "ok"}}'
+)
+
+
+def cmd_smoke(args: argparse.Namespace) -> int:
+    """Check every configured provider before spending a real run on it.
+
+    A five-model comparison is only a comparison of models if the adapters
+    behave the same. Each one is asked the same short question twice at
+    temperature 0 with a fixed seed, and the reply is checked for the things
+    that would otherwise turn into a silent per-provider confound: whether the
+    JSON contract holds, whether token usage is reported (a provider that
+    returns none makes its cost and its context growth unmeasurable), and
+    whether two identical seeded calls agree.
+
+    Determinism is *reported, not required*. Providers differ in whether they
+    honour a seed at all, and the run is still valid if they do not -- but with
+    ``samples > 1`` a provider that ignores the seed is not drawing the
+    independent samples self-consistency assumes, and that has to be known
+    before the run rather than inferred from the results.
+    """
+    specs = load_models(args.models_config)
+    wanted = args.models or sorted(specs)
+    decode = DecodeParams(temperature=0.0, top_p=1.0, max_tokens=256, seed=20260829)
+    rows: List[List[Any]] = []
+    failures: List[str] = []
+
+    for key in wanted:
+        spec = specs.get(key)
+        if spec is None:
+            failures.append(f"{key}: not in {args.models_config}")
+            continue
+        client = build_client(spec)
+        messages = [Message("user", _SMOKE_PROMPT)]
+        try:
+            first = client.generate(messages, decode, sample=0)
+            second = client.generate(messages, decode, sample=0)
+        except Exception as exc:  # a provider that cannot answer at all
+            failures.append(f"{key}: {type(exc).__name__}: {exc}")
+            rows.append([key, spec.model_id, "ERROR", "-", "-", "-", "-", str(exc)[:40]])
+            continue
+
+        parsed = extract_json_object(first.text)
+        usage = first.to_dict().get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        deterministic = first.text.strip() == second.text.strip()
+
+        problems = []
+        if parsed.value is None:
+            problems.append("no parseable JSON")
+        if not prompt_tokens or not completion_tokens:
+            problems.append("no token usage")
+        if first.error:
+            problems.append(f"error: {first.error}")
+        if problems:
+            failures.append(f"{key}: " + "; ".join(problems))
+
+        rows.append([
+            key,
+            spec.model_id,
+            "ok" if not problems else "FAIL",
+            "yes" if parsed.value is not None else "no",
+            prompt_tokens or None,
+            completion_tokens or None,
+            "yes" if deterministic else "no",
+            spec.fingerprint()[:12],
+        ])
+
+    print(_md_table(
+        ["model", "model_id", "status", "JSON", "prompt tok", "completion tok",
+         "seed→identical", "fingerprint"],
+        rows,
+    ))
+    if any(r[6] == "no" for r in rows if r[2] != "ERROR"):
+        print(
+            "\nNOTE: a provider whose two seeded calls differ does not pin its "
+            "sampling. Fine at samples=1; with samples>1 its self-consistency "
+            "draws are not comparable to a seeded provider's, and the paper has "
+            "to say so.",
+            file=sys.stderr,
+        )
+    if failures:
+        print("\nFAILURES:", file=sys.stderr)
+        for line in failures:
+            print(f"  {line}", file=sys.stderr)
+        print(
+            "\nFix these before generating: an adapter defect becomes a "
+            "per-model confound that no paired test can remove.",
+            file=sys.stderr,
+        )
+        return 2
+    print("\nall providers ready", file=sys.stderr)
+    return 0
+
+
 def cmd_contaminate(args: argparse.Namespace) -> int:
     """Audit the benchmark against the graph's own text.
 
@@ -1145,6 +1339,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--replay", action="store_true", help="offline: cache only, no API key")
     run.add_argument("--echo-script", nargs="*", default=None, help="scripted offline responses")
     run.set_defaults(func=cmd_run)
+
+    smoke = sub.add_parser(
+        "smoke", help="check every provider adapter before a real run"
+    )
+    smoke.add_argument("--models", nargs="*", help="subset to check")
+    smoke.set_defaults(func=cmd_smoke)
 
     contaminate = sub.add_parser(
         "contaminate",
