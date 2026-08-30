@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 #: Modules whose implementation determines a run's outputs.
 TOOL_MODULES: Sequence[str] = (
@@ -95,6 +95,75 @@ def code_fingerprints() -> Dict[str, str]:
         "retrieval_impl_sha256": source_hash(RETRIEVAL_MODULES),
         "runtime_impl_sha256": source_hash(RUNTIME_MODULES),
     }
+
+
+#: Manifest keys that describe *what the run was*.  A resumed run may add
+#: models or extend a case list; it may not change any of these and still be
+#: the same experiment.
+IMMUTABLE_MANIFEST_KEYS: Sequence[str] = (
+    "task",
+    "domain",
+    "framework_hash",
+    "kg_content_sha256",
+    "dataset_sha256",
+    "dataset_results_sha256",
+    "case_set_sha256",
+)
+
+
+def run_signature(
+    *,
+    framework_hash: str,
+    kg_hash: str,
+    dataset_hash: str,
+    model_fingerprint: str,
+    case_set: str = "",
+    code: Optional[Mapping[str, str]] = None,
+) -> str:
+    """One value identifying the apparatus that produced a trace.
+
+    ``framework_hash`` is deliberately blind to the model and the code: it has
+    to stay equal across arms, which is what makes "every model saw the same
+    scaffold" checkable.  That blindness is also a hole -- traces generated
+    before and after a tool rewrite, or by two different model snapshots, carry
+    the same framework hash and pool together silently.
+
+    The signature closes it by covering the model spec, the implementation
+    hashes and the frozen case set as well.  It is stamped on every trace, so
+    the check does not depend on a manifest file still being present or still
+    describing the traces beside it.  Condition is *not* included: conditions
+    are the independent variable and must share a signature to be comparable.
+    """
+    payload = {
+        "framework": framework_hash,
+        "kg": kg_hash,
+        "dataset": dataset_hash,
+        "model": model_fingerprint,
+        "case_set": case_set,
+        "code": dict(sorted((code or code_fingerprints()).items())),
+    }
+    import json as _json
+
+    return hashlib.sha256(
+        _json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def manifest_conflicts(
+    frozen: Mapping[str, Any], current: Mapping[str, Any]
+) -> List[str]:
+    """Immutable manifest fields that a re-run would be changing.
+
+    Non-empty means the output directory already holds a *different*
+    experiment, and writing over its manifest would destroy the only record of
+    what the traces beside it were generated under.
+    """
+    out: List[str] = []
+    for key in IMMUTABLE_MANIFEST_KEYS:
+        before, after = frozen.get(key), current.get(key)
+        if before and after and before != after:
+            out.append(f"{key}: {str(before)[:12]} -> {str(after)[:12]}")
+    return out
 
 
 def compare_fingerprints(

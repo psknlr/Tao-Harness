@@ -244,7 +244,13 @@ def score_cp(
     """
     subtask = str(gold.get("subtask") or "unknown")
     gold_letters = set(normalise_options(gold.get("answer")))
-    scores: Dict[str, Any] = {"subtask": subtask, "is_multi": float(len(gold_letters) > 1)}
+    scores: Dict[str, Any] = {
+        "subtask": subtask,
+        # the stratum the macro-average weights equally; carried on the item so
+        # the report never has to re-derive it from the id
+        "cp_family": cp_family(subtask),
+        "is_multi": float(len(gold_letters) > 1),
+    }
 
     if not prediction:
         scores.update({"answered": 0.0, "exact": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0})
@@ -285,6 +291,33 @@ def score_cp(
             CP6_INSUFFICIENT in gold_letters and CP6_INSUFFICIENT not in predicted
         )
     return scores
+
+
+#: The six pathway-execution capabilities TCM-CP tests, in pathway order, with
+#: the subtask ids that make up each. CP4 is one capability probed four ways.
+CP_FAMILIES: Mapping[str, Tuple[str, ...]] = {
+    "CP1": ("CP1_pathway_eligibility",),
+    "CP2": ("CP2_stage_identification",),
+    "CP3": ("CP3_stage_actions",),
+    "CP4": (
+        "CP4_treatment_principle",
+        "CP4_formula",
+        "CP4_patent_medicine",
+        "CP4_external_therapy",
+    ),
+    "CP5": ("CP5_monitoring",),
+    "CP6": ("CP6_transition_decision",),
+}
+
+#: subtask id -> family, for the report.
+CP_SUBTASK_FAMILY: Mapping[str, str] = {
+    subtask: family for family, subtasks in CP_FAMILIES.items() for subtask in subtasks
+}
+
+
+def cp_family(subtask: str) -> str:
+    """Which capability a subtask belongs to; ``"other"`` for anything new."""
+    return CP_SUBTASK_FAMILY.get(str(subtask), "other")
 
 
 CP_PRIMARY = "exact"

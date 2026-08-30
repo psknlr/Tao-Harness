@@ -15,7 +15,13 @@ name: tcm-cp
 dataset:
   kind: cp
   path: data/cp/TCM-CP.json
-  limit: 400            # the full build is ~3.7k items; sample for cost
+  limit: 450            # the full build is 5,544 items; sample for cost
+  # Balance the sample across subtasks. The prespecified endpoint is the
+  # per-subtask macro-average, so every subtask needs enough items to carry a
+  # paired test. A head-slice is proportional, which gives CP6 -- the
+  # transition decision, and the only subtask with a patient-safety reading --
+  # 28 of 400. Even allocation gives it 50.
+  stratify: subtask
 
 task: cp
 domain: clinical_pathway

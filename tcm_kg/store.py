@@ -449,6 +449,93 @@ class KGStore:
                 parts.extend(edge.evidence_sentences())
         return " ".join(dedupe(p.strip() for p in parts if p and str(p).strip()))
 
+    def syndrome_presentation(
+        self, syndrome_id: str, disease_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The clinical picture of a syndrome **in a given disease context**.
+
+        A ``Syndrome`` node is global: ``气滞血瘀证`` links to dozens of
+        diseases, and its ``first_mention`` comes from whichever document
+        happened to mention it first. In TCM the same syndrome presents
+        differently by disease -- 气滞血瘀证 in 膝关节半月板损伤 is joint pain,
+        swelling and locking; in a cardiovascular protocol it is 心悸、胸闷、
+        胸痛阵发. Handing the global sentence to a model reasoning about the
+        knee is clinical context pollution.
+
+        Measured on this graph, the global ``first_mention`` comes from a
+        document outside the edge's own ``source_docs`` for **58% of
+        Disease→Syndrome edges and 63% of Subtype→Syndrome edges** -- and every
+        one of those edges carries its own evidence sentence. The right
+        information was already there; it just was not the one being read.
+
+        Returns the disease-conditioned sentence where one exists, the global
+        sentence otherwise, and always says which it gave.
+        """
+        node = self.nodes.get(syndrome_id)
+        if node is None:
+            return {"sentence": "", "scope": "unknown", "disease": None}
+
+        if disease_id:
+            for edge in self.in_edges(
+                syndrome_id,
+                {EdgeType.HAS_SYNDROME.value, EdgeType.SUBTYPE_HAS_SYNDROME.value},
+            ):
+                if edge.source != disease_id:
+                    continue
+                sentences = edge.evidence_sentences()
+                if sentences:
+                    return {
+                        "sentence": sentences[0],
+                        "scope": "disease_specific",
+                        "disease": self.nodes[edge.source].name,
+                        "source_docs": list(edge.source_docs[:4]),
+                    }
+
+        global_sentence = node.sentence()
+        first_doc = (node.first_mention or {}).get("doc_id") if node.first_mention else None
+        return {
+            "sentence": global_sentence,
+            "scope": "global_first_mention" if global_sentence else "absent",
+            "disease": None,
+            "source_docs": [first_doc] if first_doc else [],
+            "caveat": (
+                "此句来自该证候在图谱中最早出现的文献，可能属于其他疾病的语境，"
+                "不一定适用于当前疾病。"
+            )
+            if global_sentence
+            else None,
+        }
+
+    def syndromes_of(
+        self, disease_id: str, *, include_subtypes: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Syndromes under a disease, each with its *own* presentation.
+
+        The presentation is taken from the edge, so two diseases sharing a
+        syndrome name each get their own clinical picture.
+        """
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        edge_types = {EdgeType.HAS_SYNDROME.value}
+        if include_subtypes:
+            edge_types.add(EdgeType.SUBTYPE_HAS_SYNDROME.value)
+        for edge in self.out_edges(disease_id, edge_types):
+            syndrome = self.nodes.get(edge.target)
+            if syndrome is None or syndrome.id in seen:
+                continue
+            seen.add(syndrome.id)
+            sentences = edge.evidence_sentences()
+            out.append(
+                {
+                    "id": syndrome.id,
+                    "name": syndrome.name,
+                    "presentation": sentences[0] if sentences else syndrome.sentence(),
+                    "scope": "disease_specific" if sentences else "global_first_mention",
+                    "source_docs": list(edge.source_docs[:4]),
+                }
+            )
+        return out
+
     def preparation_markers(self, herb_id: str) -> Dict[str, List[str]]:
         """Preparation requirements attested for a herb, with their evidence.
 

@@ -235,16 +235,29 @@ M3 spends more model calls than M2, and M4 more than M3. A raw `M2→M3` gain
 therefore measures agency *and* extra thinking together. Two controls separate
 them:
 
-- **M2C** — M3's turn budget, no graph access. Each turn the model is prompted
-  onward with no new information, so no evidence enters while the compute
-  matches. `M2C→M3` is the agentic KG effect.
+- **M2C** — M3's turn budget, **M2's static KG block**, no tools. Both arms
+  hold the same graph evidence, so `M2C→M3` isolates *adaptive retrieval*, not
+  graph access. (An earlier version gave M2C no graph at all, which folded the
+  KG effect back into a contrast whose whole purpose was to exclude it.)
 - **M3C** — M4's extra revision turn, with no verification evidence in it.
   `M3C→M4` is the effect of the verification *content* rather than of being
   asked to look again.
 
-A compute-matched control only licenses its conclusion if the match held in
-practice, so the report includes a parity table of realised calls and tokens
-per pair, flagging any pair outside a 0.8–1.25 call ratio as `MISMATCH`.
+A compute-matched control only licenses its conclusion if the match held **per
+case**, not on average. M4 used to return early when no deterministic checker
+adjudicated an item, spending one model call fewer than M3C on exactly those
+cases — the mean stayed close while the contrast over that subset was a
+second-turn effect. M4 now always takes its revision turn, on an explicit
+`not_applicable` report. Branch groups check parity case by case, flag both
+arms on a break, and the report drops flagged pairs from the contrast and
+counts them in the parity table.
+
+Because M4's arm now contains two treatments under one label — real
+verification evidence, and a bare prompt to look again — the report splits the
+`M3C→M4` gain by **verification stratum**: `deterministic` (a checker
+adjudicated the answer), `audit_only` (the prose was audited for over-claiming)
+and `not_applicable`. A gain concentrated in the last stratum is a second-turn
+effect and has to be reported as one.
 
 ## 8. What each contrast licenses
 
@@ -256,7 +269,7 @@ claim. Stated plainly, so a table cannot be read as more than it is:
 | `M1 − M0` | prompt structure helps | – |
 | `M2 − M1` | static KG evidence helps | – |
 | `M3 − M2` | *nothing on its own* | agency **and** extra compute |
-| `M3 − M2C` | adaptive retrieval helps | – (KG and compute held constant) |
+| `M3 − M2C` | adaptive retrieval helps | – (KG evidence and compute held constant) |
 | `M4 − M3` | *nothing on its own* | verification **and** an extra turn |
 | `M4 − M3C` | verification content helps | – (trajectory and compute held constant) |
 | `M0 − M3` | the whole scaffold helps | everything at once; not a KG result |
@@ -274,7 +287,18 @@ earlier version:
 3. **The verifier is not reachable by the agent.** Otherwise M3 is an
    optionally-self-verifying arm and `M3 → M4` contrasts optional with
    mandatory verification — a much weaker claim, easily misread as the stronger
-   one.
+   one. This means the *whole* verification surface, not just
+   `verify_tcm_decision`: every tool carries a `phase` (`agent`,
+   `verification`, `both`), and the five deterministic PA checkers are
+   verification-phase. Hiding only `verify_tcm_decision` left `check_dose` and
+   its four siblings callable by the agent, which is exactly the weaker
+   contrast.
+4. **Tool calls record who made them.** A `ToolStep` carries its phase, so
+   `tool_selection_accuracy`, `coverage_honesty` and `pathogenesis_probe_rate`
+   read only the calls the *model* chose. The M4 verifier calls the correct
+   checker by construction; counting those would have credited M4 with tool-use
+   skill for a choice it never made, and the report separates
+   `agent calls` from `verifier calls` for the same reason.
 
 ## 9. Reproducibility: what a manifest freezes
 
@@ -289,19 +313,62 @@ per-run manifest does:
 | `case_ids` + `case_set_sha256` | a changed `limit` silently re-scoring more cases than the run covered |
 | model `fingerprint_sha256` | a repointed model key, or an `extra_body` change such as switching on a reasoning mode |
 | `tools_impl_sha256`, `scorers_impl_sha256`, `retrieval_impl_sha256`, `runtime_impl_sha256` | a rewritten checker body that leaves its `ToolSpec` untouched |
+| `run_signatures` | traces that pooled across models or code revisions (below) |
 | `git_commit`, `python`, `created_at` | everything else |
 
 `score` and `report` read the frozen manifest rather than recomputing from the
 config as it reads today — recomputation at report time produced a *different*
 framework hash from the one the traces were generated under, so the report
-attested to a run that never happened. Code drift since generation is reported
-rather than blocked: re-scoring recorded traces with a fixed scorer is the
-point of separating generation from scoring, but doing it unnoticed is not.
+attested to a run that never happened.
+
+**Run signature.** The framework hash has to stay *equal* across models: that
+is what makes "every arm saw the same scaffold" a checkable claim. The same
+blindness means traces from two model snapshots, or from before and after a
+tool rewrite, carry one hash and pool silently. `run_signature` covers what the
+framework hash omits — the model spec, the four implementation hashes and the
+frozen case set — and is stamped on **every trace**, so the check survives a
+missing or stale manifest. Condition is deliberately excluded: conditions are
+the independent variable and must stay poolable.
+
+It is used in three places:
+
+- **Resume** matches on the signature. Resuming on the framework hash kept
+  exactly the traces a resume exists to regenerate.
+- **`write_manifest` never overwrites** a manifest describing a different
+  experiment. It was the only record of what the traces beside it were produced
+  under, and a resumed run with an edited config replaced that record while
+  leaving the traces. `--new-run` archives it instead.
+- **`score` fails closed.** Mixed framework hashes, mixed run signatures,
+  traces that do not match the manifest's signature, a changed KG or dataset,
+  or changed tool/retrieval/runtime code all stop the run. A changed *scorer*
+  stays a note — re-scoring recorded traces with a fixed scorer is the point of
+  separating generation from scoring. `--allow-drift` overrides, and the drift
+  is written into `scored_manifest` and surfaced as a banner at the top of the
+  report, so a forced number cannot later be mistaken for a clean one.
 
 The generation cache keys on the model fingerprint, so turning on a vendor
 reasoning mode no longer serves responses generated without it.
 
-## 10. Known limitations
+## 10. Reading TCM-CP: the macro-average
+
+TCM-CP's nine subtasks run from 306 items (CP6, transition decisions) to 988
+(CP3 and CP5). A pooled accuracy is therefore 53% stage lookup and monitoring
+and 5.5% transition decision — so a model that reads stages well and moves
+patients on badly reads as a good pathway executor.
+
+The **prespecified CP endpoint is the macro-average**: the mean of the six
+capability means (CP4 is one capability probed four ways, averaged first), each
+weighted equally. Its contrasts use a stratified macro bootstrap — resample
+diseases *within* each subtask, take subtask means, then weight the six
+families equally — so the interval describes the same quantity as the point
+estimate rather than a pooled one. The pooled cluster-bootstrap contrast is
+kept as a secondary table.
+
+The sample is drawn stratified by subtask (`dataset.stratify: subtask`) for the
+same reason: a head-slice of 400 gives CP6 twenty-eight items, too thin to
+carry a paired test on precisely the subtask with a patient-safety reading.
+
+## 11. Known limitations
 
 1. **Coverage.** 10 of 19 PA rule families are ungroundable here — **166 of
    328 released items (51%)**, including the largest family, A-003 dosage (87
@@ -328,10 +395,19 @@ reasoning mode no longer serves responses generated without it.
    effectiveness. Never pool it with SDT or PA. Its contrasts use a
    **disease-clustered** bootstrap: many items derive from one pathway, and
    treating them as independent understates the interval several-fold.
-7. **CP2 is small by construction.** Only 313 of 1,212 stages are
-   discriminable enough to build a fair identification item from. That is the
-   ceiling this graph supports; a larger CP2 would be a larger set of
-   unanswerable questions.
+7. **TCM-CP drops what it cannot ask fairly.** The build emits 5,544 items
+   from 299 diseases and discards 1,154 candidate stages: 884 with no exit
+   criteria, 222 first stages rebalanced down to a 25% share (a first stage is
+   identifiable from "no prior treatment" alone, which is a position cue and
+   not stage reasoning), 46 whose distractors were not distinguishable from the
+   gold stage, and 2 with too few distractor actions. That is the ceiling this
+   graph supports; a larger CP2 would be a larger set of unanswerable
+   questions.
+   Every subtask is checked for answer leakage — no emitted field may contain
+   the gold string, in either direction — and all nine are at 0%. Two leaks
+   were found this way and fixed: CP5 at 100% (the monitoring plan was printed
+   in the vignette it asked about) and CP3 at 59.8%, which no review had
+   flagged and which only a general per-field guard caught.
 8. **No longitudinal patient state.** TCM-CP items are independent decisions,
    not a trajectory. There is no persistent `PatientState`, no episode, no
    T0→T1→T2 sequence carrying treatment response, monitoring results, safety

@@ -35,7 +35,14 @@ from tcm_kg.index import KGRetriever, RetrievalParams
 from tcm_kg.schema import Domain
 from tcm_kg.store import KGStore
 from tcm_models.base import Completion, DecodeParams, LLMClient, Message
-from tcm_tools.base import REGISTRY, ToolBudget, ToolContext, ToolRegistry, ToolResult
+from tcm_tools.base import (
+    REGISTRY,
+    ToolBudget,
+    ToolContext,
+    ToolPhase,
+    ToolRegistry,
+    ToolResult,
+)
 
 from .parsing import ParseOutcome, coerce_str, extract_json_object
 from .prompts import load_prompt, prompt_fingerprint
@@ -58,6 +65,42 @@ BRANCHABLE: Tuple[str, ...] = ("M3", "M3C", "M4")
 _BRANCHABLE = BRANCHABLE
 
 
+def _stratum(report: Mapping[str, Any]) -> str:
+    """How much the verification pass could actually say about this item."""
+    if report.get("verdict") == "not_applicable":
+        return "not_applicable"
+    if int(report.get("n_checks") or 0) > 0:
+        return "deterministic"
+    return "audit_only"
+
+
+def _check_compute_parity(branches: Mapping[str, Trace]) -> None:
+    """Confirm each control spent exactly what the arm it matches spent.
+
+    The controls exist so that "M4 beat M3C" cannot be read as "M4 got another
+    turn". That argument only holds if the turn counts are equal *per case*,
+    not on average: a control that skips its revision turn on the 12% of items
+    no checker adjudicates still averages close, while the contrast on exactly
+    those items is a second-turn effect wearing a verification label.
+
+    A mismatch is recorded on both traces rather than raised. Losing the whole
+    case would be worse than scoring it and saying it is unusable, and the
+    report drops flagged cases from the paired contrast.
+    """
+    for control, arm in COMPUTE_MATCHED.items():
+        left, right = branches.get(control), branches.get(arm)
+        if left is None or right is None:
+            continue
+        if left.n_llm_calls == right.n_llm_calls:
+            continue
+        note = (
+            f"compute parity broken: {control} used {left.n_llm_calls} LLM calls, "
+            f"{arm} used {right.n_llm_calls}"
+        )
+        left.parity_error = note
+        right.parity_error = note
+
+
 def _copy_trace(source: Trace, condition: str) -> Trace:
     """A trace carrying the shared prefix, ready for its own branch."""
     branch = Trace(
@@ -67,6 +110,7 @@ def _copy_trace(source: Trace, condition: str) -> Trace:
         condition=condition,
         model_key=source.model_key,
         framework_hash=source.framework_hash,
+        run_signature=source.run_signature,
         sample=source.sample,
         started_at=source.started_at,
     )
@@ -76,6 +120,7 @@ def _copy_trace(source: Trace, condition: str) -> Trace:
     branch.parse_strategy = source.parse_strategy
     branch.error = source.error
     branch.wall_ms = source.wall_ms
+    branch.branch_group = source.branch_group
     return branch
 
 #: Topics the knowledge graph does not encode.  Used by the PA verification
@@ -152,6 +197,12 @@ class FrameworkConfig:
     #: Content fingerprints of the inputs, filled in by the runner.
     kg_hash: str = ""
     dataset_hash: str = ""
+    #: The full run signature (framework + inputs + model + code), filled in by
+    #: the runner and stamped on every trace.  Deliberately *not* part of
+    #: ``framework_hash``: the framework hash certifies that two arms shared a
+    #: scaffold and must stay equal across models, while the signature also
+    #: pins the model and the code and so differs between them.
+    run_signature: str = ""
 
     def framework_hash(self) -> str:
         payload = json.dumps(
@@ -176,6 +227,7 @@ class FrameworkConfig:
     def describe(self) -> Dict[str, Any]:
         return {
             "framework_hash": self.framework_hash(),
+            "run_signature": self.run_signature,
             "task": self.task,
             "domain": self.domain,
             "kg_hash": self.kg_hash[:16],
@@ -223,6 +275,7 @@ class AgentRuntime:
             condition=condition,
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
+            run_signature=self.config.run_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )
@@ -365,9 +418,11 @@ class AgentRuntime:
             condition="M3",
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
+            run_signature=self.config.run_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )
+        shared.branch_group = f"{shared.case_id}#{sample}"
         started = time.perf_counter()
         try:
             result, ctx = self._agent_phase(item, "M3", shared, sample)
@@ -392,6 +447,7 @@ class AgentRuntime:
                 branch.final = self.task.normalise_result(branch_result, item)
                 branch.final_raw = json.dumps(branch_result, ensure_ascii=False)
             out[condition] = branch
+        _check_compute_parity(out)
         return out
 
     def _run_agent(
@@ -501,7 +557,20 @@ class AgentRuntime:
         else:
             report = self._verification_report(item, result, ctx, trace)
             if report is None:
-                return dict(result)
+                # No checker adjudicates this item and the answer carried no
+                # prose to audit.  Returning here would let M4 skip the
+                # revision turn that M3C always takes, so on exactly these
+                # cases M4 would have one LLM call fewer and an answer that
+                # was never reconsidered.  Any M4-minus-M3C difference over
+                # them would then measure *a second turn*, not verification.
+                # Take the turn, and say honestly that there was nothing to
+                # check -- which is also the more informative stimulus: a
+                # model told "no automatic check applies" is being asked to
+                # rely on its own knowledge, and whether it then wobbles is
+                # itself a finding.
+                report = self._not_applicable_report(trace)
+        if not sham:
+            trace.verification_stratum = _stratum(report)
 
         # Both branches re-receive the full original case, question and option
         # list. Without them a revision turn is asked to change its answer
@@ -593,7 +662,9 @@ class AgentRuntime:
             arguments = {k: v for k, v in plan.items() if not k.startswith("_")}
             tool_name = str(plan.get("_tool") or "verify_tcm_decision")
             tool_result = self.config.registry.call(tool_name, verify_ctx, arguments)
-            self._record_tool(tool_result, verify_ctx, trace)
+            # the harness chose this call, not the model: tag it so tool-selection
+            # metrics do not credit M4 for checkers its verifier ran for it
+            self._record_tool(tool_result, verify_ctx, trace, phase="verification")
             entry = tool_result.to_dict()
             if plan.get("_option"):
                 entry["option"] = plan["_option"]
@@ -612,6 +683,28 @@ class AgentRuntime:
             report["coverage_audit"] = audit
         return report
 
+    def _not_applicable_report(self, trace: Trace) -> Dict[str, Any]:
+        """The verification report for an item no deterministic check covers.
+
+        Emitted rather than skipping the turn, so every M4 case costs exactly
+        one revision turn and pairs one-to-one with its M3C twin.  It is
+        marked ``not_applicable`` so the scorer can report the M4 gain
+        separately over adjudicated and unadjudicated items -- if the gain
+        lives entirely in the latter, it is a second-turn effect wearing a
+        verification label.
+        """
+        return {
+            "check": "deterministic_verification",
+            "n_checks": 0,
+            "checks": [],
+            "verdict": "not_applicable",
+            "note": (
+                "本题没有可自动核验的确定性规则，图谱亦无相关记录。"
+                "请依据自身医学知识复核上述结论；若无需修改，请原样保留。"
+            ),
+            "tool_coverage_observed": trace.coverage_counts(phase="agent"),
+        }
+
     def _coverage_audit(
         self, result: Mapping[str, Any], trace: Trace
     ) -> Optional[Dict[str, Any]]:
@@ -622,9 +715,14 @@ class AgentRuntime:
         ``no problem found`` and asserting graph support for a dose or a
         compatibility rule the graph never encoded.
         """
+        # ``.strip()`` is load-bearing: joining two absent fields with a space
+        # yields " ", which is truthy, so without it the guard never fired and
+        # every answer got an audit report -- including answers with no prose
+        # to over-claim in.  That in turn meant the ``not_applicable`` stratum
+        # was unreachable and the parity fix below it was never exercised.
         reasoning = " ".join(
             coerce_str(result.get(key)) for key in ("reasoning", "option_analysis")
-        )
+        ).strip()
         if not reasoning:
             return None
         flagged: List[Dict[str, Any]] = []
@@ -640,12 +738,14 @@ class AgentRuntime:
                         ),
                     }
                 )
-        coverage_counts = trace.coverage_counts()
+        # what the *agent* saw, not what the verifier has just looked up: the
+        # audit asks whether the model over-claimed given its own evidence
+        coverage_counts = trace.coverage_counts(phase="agent")
         return {
             "check": "evidence_coverage_audit",
             "tool_coverage_observed": coverage_counts,
             "uncovered_topics_referenced": flagged,
-            "n_tool_calls": trace.n_tool_calls,
+            "n_tool_calls": trace.n_agent_tool_calls,
             "verdict": "review_recommended" if flagged else "no_coverage_conflict",
         }
 
@@ -679,7 +779,9 @@ class AgentRuntime:
         return result
 
     @staticmethod
-    def _record_tool(result: ToolResult, ctx: ToolContext, trace: Trace) -> None:
+    def _record_tool(
+        result: ToolResult, ctx: ToolContext, trace: Trace, *, phase: str = "agent"
+    ) -> None:
         record = ctx.calls[-1]
         trace.tool_steps.append(
             ToolStep(
@@ -692,24 +794,22 @@ class AgentRuntime:
                 n_results=record.n_results,
                 error=record.error,
                 result_chars=len(result.to_model_text()),
+                phase=phase,
             )
         )
 
     def _tool_protocol(self) -> str:
         """The tool list an agent sees.
 
-        Verification-only tools are withheld. If the agent could call
-        ``verify_tcm_decision`` itself, M3 would already be an
-        optionally-self-verifying arm and M3→M4 would contrast *optional* with
-        *mandatory* verification rather than absent with present -- a much
-        weaker claim, and one easy to misread. The verifier remains reachable
-        only from the M4 verification pass, which the agent does not control.
+        Verification-phase tools are withheld -- which now means the five
+        deterministic PA checkers as well as ``verify_tcm_decision``. Hiding
+        only the latter left ``check_dose`` and friends callable by the agent,
+        so M3 was an optionally-self-checking arm and M3→M4 contrasted
+        *optional* with *mandatory* verification rather than absent with
+        present. Those checkers are exactly what the M4 pass runs, so they
+        belong to it alone.
         """
-        specs = [
-            spec
-            for spec in self.config.registry.specs_for(self.task.domain)
-            if not spec.verification
-        ]
+        specs = self.config.registry.specs_for(self.task.domain, phase=ToolPhase.AGENT)
         tool_list = "\n".join(spec.prompt_block() for spec in specs)
         return (
             load_prompt("tool_protocol")

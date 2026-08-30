@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from .scorers import (
     CP_METRICS,
     CP_PRIMARY,
+    cp_family,
     PA_METRICS,
     PA_PRIMARY,
     SDT_METRICS,
@@ -28,6 +29,7 @@ from .scorers import (
     aggregate,
 )
 from .stats import (
+    stratified_macro_bootstrap,
     PairedResult,
     cluster_paired_bootstrap,
     holm_bonferroni,
@@ -56,7 +58,7 @@ CONDITION_LABELS = {
     "M0": "M0 Base LLM",
     "M1": "M1 Structured",
     "M2": "M2 KG-RAG (static)",
-    "M2C": "M2C Iterative, no KG (control)",
+    "M2C": "M2C Iterative, static KG, no tools (control)",
     "M3": "M3 KG-Agent",
     "M3C": "M3C Sham revision (control)",
     "M4": "M4 KG-Agent + Verify",
@@ -70,7 +72,7 @@ CONTRASTS = (
     ("M0", "M1", "prompt structure alone"),
     ("M1", "M2", "static KG evidence"),
     ("M2", "M3", "agency + extra compute (confounded)"),
-    ("M2C", "M3", "agentic KG tool use, compute-matched"),
+    ("M2C", "M3", "agentic retrieval over the same KG, compute-matched"),
     ("M3", "M4", "verification + extra revision (confounded)"),
     ("M3C", "M4", "verification content, compute-matched"),
     ("M0", "M3", "whole scaffold (not a KG-only effect)"),
@@ -110,16 +112,74 @@ def paired_clusters(
     metric: str,
     cluster_field: str,
 ) -> List[str]:
-    """Cluster label per paired observation, aligned with ``paired_vectors``."""
+    """Cluster label per paired observation, aligned with ``paired_vectors``.
+
+    Alignment matters more than it looks: the bootstrap resamples clusters and
+    indexes into the value vectors positionally, so a label list built from a
+    different filter than the values silently mislabels every observation
+    after the first drop.
+    """
+    return [
+        str(li.metrics.get(cluster_field) or case_id)
+        for case_id, li, _ in _usable_pairs(index, model, left, right, metric)
+    ]
+
+
+def _usable_pairs(
+    index: Mapping[Tuple[str, str], Mapping[str, ScoredItem]],
+    model: str,
+    left: str,
+    right: str,
+    metric: str,
+    *,
+    stratum: Optional[str] = None,
+) -> List[Tuple[str, ScoredItem, ScoredItem]]:
+    """Case ids both conditions scored, minus the ones that are not comparable.
+
+    A case whose branches broke compute parity is dropped rather than scored.
+    The compute-matched contrasts exist precisely to hold test-time compute
+    fixed; including a pair where it was not fixed reintroduces the confound
+    the contrast was built to remove, and does it invisibly.  ``stratum``
+    additionally restricts to cases where the M4 verification pass reached a
+    given depth, so the gain can be read separately over items a checker
+    actually adjudicated and items where the pass had nothing to say.
+    """
     a = index.get((model, left), {})
     b = index.get((model, right), {})
-    labels: List[str] = []
+    out: List[Tuple[str, ScoredItem, ScoredItem]] = []
     for case_id in sorted(set(a) & set(b)):
-        left_value = a[case_id].metrics.get(metric)
-        right_value = b[case_id].metrics.get(metric)
+        li, ri = a[case_id], b[case_id]
+        if li.trace_metrics.get("parity_error") or ri.trace_metrics.get("parity_error"):
+            continue
+        if stratum is not None:
+            observed = ri.trace_metrics.get("verification_stratum") or li.trace_metrics.get(
+                "verification_stratum"
+            )
+            if observed != stratum:
+                continue
+        left_value = li.metrics.get(metric)
+        right_value = ri.metrics.get(metric)
         if isinstance(left_value, (int, float)) and isinstance(right_value, (int, float)):
-            labels.append(str(a[case_id].metrics.get(cluster_field) or case_id))
-    return labels
+            out.append((case_id, li, ri))
+    return out
+
+
+def dropped_for_parity(
+    items: Sequence[ScoredItem], left: str, right: str
+) -> Dict[str, int]:
+    """How many pairs each model lost to a compute-parity break."""
+    index = index_items(items)
+    out: Dict[str, int] = {}
+    for model in sorted({i.model_key for i in items}):
+        a = index.get((model, left), {})
+        b = index.get((model, right), {})
+        out[model] = sum(
+            1
+            for case_id in set(a) & set(b)
+            if a[case_id].trace_metrics.get("parity_error")
+            or b[case_id].trace_metrics.get("parity_error")
+        )
+    return out
 
 
 def paired_vectors(
@@ -128,18 +188,13 @@ def paired_vectors(
     left: str,
     right: str,
     metric: str,
+    *,
+    stratum: Optional[str] = None,
 ) -> Tuple[List[float], List[float]]:
-    """Aligned metric vectors over the cases both conditions attempted."""
-    a = index.get((model, left), {})
-    b = index.get((model, right), {})
-    shared = sorted(set(a) & set(b))
-    xs, ys = [], []
-    for case_id in shared:
-        left_value = a[case_id].metrics.get(metric)
-        right_value = b[case_id].metrics.get(metric)
-        if isinstance(left_value, (int, float)) and isinstance(right_value, (int, float)):
-            xs.append(float(left_value))
-            ys.append(float(right_value))
+    """Aligned metric vectors over the cases both conditions comparably attempted."""
+    pairs = _usable_pairs(index, model, left, right, metric, stratum=stratum)
+    xs = [float(li.metrics[metric]) for _, li, _ in pairs]
+    ys = [float(ri.metrics[metric]) for _, _, ri in pairs]
     return xs, ys
 
 
@@ -313,6 +368,171 @@ def leakage_table(items: Sequence[ScoredItem]) -> str:
     )
 
 
+def cp_subtask_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
+    """Per-subtask CP results, plus the prespecified macro-average.
+
+    A pooled CP accuracy is not a pathway-execution score. The nine subtasks
+    run from 306 items (CP6, transition decisions) to 988 (CP3 and CP5), so
+    over half the pooled number is stage lookup and monitoring, and the
+    safety-relevant transition decision contributes 5.5%. A model that reads
+    stages well and moves patients on badly would read as a good pathway
+    executor. Per-subtask rows show where a model actually fails, and the
+    macro-average -- mean of family means, each of the six capabilities
+    weighted equally -- is the endpoint the contrasts below test.
+    """
+    scoped = [i for i in items if i.dataset == "cp"]
+    if not scoped:
+        return ""
+    grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for item in scoped:
+        value = item.metrics.get(metric)
+        if not isinstance(value, (int, float)):
+            continue
+        family = str(item.metrics.get("cp_family") or cp_family(item.metrics.get("subtask", "")))
+        subtask = str(item.metrics.get("subtask") or "unknown")
+        grid[(item.model_key, item.condition, f"{family}\u0000{subtask}")].append(float(value))
+
+    rows: List[List[Any]] = []
+    for model in sorted({m for m, _c, _s in grid}):
+        for condition in [c for c in CONDITION_LABELS if (model, c) in {
+            (m, c) for m, c, _s in grid
+        }]:
+            per_family: Dict[str, List[float]] = defaultdict(list)
+            for (m, c, key), values in sorted(grid.items()):
+                if (m, c) != (model, condition):
+                    continue
+                family, subtask = key.split("\u0000")
+                mean = sum(values) / len(values)
+                per_family[family].append(mean)
+                rows.append([model, condition, family, subtask, len(values), mean])
+            if per_family:
+                macro = sum(
+                    sum(v) / len(v) for v in per_family.values()
+                ) / len(per_family)
+                rows.append(
+                    [model, condition, "**macro**",
+                     f"mean of {len(per_family)} family means", "–", macro]
+                )
+    return _md_table(["model", "condition", "family", "subtask", "n", metric], rows)
+
+
+def cp_macro_contrast_table(
+    items: Sequence[ScoredItem],
+    metric: str = CP_PRIMARY,
+    *,
+    contrasts: Sequence[Tuple[str, str, str]] = CONTRASTS,
+) -> Tuple[str, Dict[str, PairedResult]]:
+    """Condition contrasts on the CP macro-average.
+
+    Built with ``stratified_macro_bootstrap`` so the interval describes the
+    same quantity as the point estimate: resample diseases within each subtask,
+    average within subtask, then weight the six families equally. Using the
+    pooled cluster bootstrap here would give an interval for a different
+    estimand than the one reported above it.
+    """
+    scoped = [i for i in items if i.dataset == "cp"]
+    index = index_items(scoped)
+    results: Dict[str, PairedResult] = {}
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for left, right, label in contrasts:
+            pairs = _usable_pairs(index, model, left, right, metric)
+            if not pairs:
+                continue
+            xs = [float(li.metrics[metric]) for _c, li, _r in pairs]
+            ys = [float(ri.metrics[metric]) for _c, _l, ri in pairs]
+            strata = [
+                str(li.metrics.get("subtask") or "unknown") for _c, li, _r in pairs
+            ]
+            clusters = [
+                str(li.metrics.get("disease") or case_id) for case_id, li, _r in pairs
+            ]
+            result = stratified_macro_bootstrap(xs, ys, strata, clusters)
+            key = f"cp-macro|{model}|{left}->{right}"
+            results[key] = result
+            rows.append(
+                [
+                    model, f"{left}→{right}", label, result.n,
+                    result.mean_a, result.mean_b, result.delta,
+                    f"[{result.ci_low:+.3f}, {result.ci_high:+.3f}]",
+                    result.p_value,
+                ]
+            )
+    if not rows:
+        return "", results
+    corrected = holm_bonferroni({k: v.p_value for k, v in results.items()})
+    for row, key in zip(rows, results):
+        row.append(corrected[key]["p_adjusted"])
+        row.append("✓" if corrected[key]["reject"] else "")
+    headers = [
+        "model", "contrast", "what it isolates", "n items",
+        "macro before", "macro after", "Δ macro", "95% CI", "p", "p (Holm)", "sig",
+    ]
+    return _md_table(headers, rows), results
+
+
+#: Below this many paired cases a stratum is described but not tested: a
+#: significant-looking p over eight items is noise dressed as a finding.
+MIN_STRATUM_N = 20
+
+#: How deep the M4 verification pass got on an item, worst-supported last.
+VERIFICATION_STRATA: Tuple[Tuple[str, str], ...] = (
+    ("deterministic", "a rule checker adjudicated the answer"),
+    ("audit_only", "no checker applied; the prose was audited for over-claiming"),
+    ("not_applicable", "nothing to check; the revision turn ran for parity only"),
+)
+
+
+def verification_stratum_table(
+    items: Sequence[ScoredItem], dataset: str, metric: str
+) -> str:
+    """M3C→M4 split by how much the verification pass could actually check.
+
+    This is the test that keeps the M4 claim honest.  M4 always takes a
+    revision turn now, even on items no deterministic checker adjudicates, so
+    the arm contains two different treatments wearing one label: real
+    verification evidence, and a bare prompt to look again.  If the M4 gain is
+    concentrated in the ``not_applicable`` stratum then what the experiment
+    measured is a second turn, and the verification story does not survive.
+    Reporting the split makes that visible instead of leaving it for a
+    reviewer to suspect.
+
+    Strata with fewer than ``MIN_STRATUM_N`` pairs are shown with their n and
+    no test: an underpowered stratum tempts exactly the over-reading this
+    table exists to prevent.
+    """
+    scoped = [i for i in items if i.dataset == dataset]
+    index = index_items(scoped)
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for stratum, gloss in VERIFICATION_STRATA:
+            xs, ys = paired_vectors(index, model, "M3C", "M4", metric, stratum=stratum)
+            if not xs:
+                continue
+            mean_a = sum(xs) / len(xs)
+            mean_b = sum(ys) / len(ys)
+            if len(xs) >= MIN_STRATUM_N:
+                result = paired_test(xs, ys)
+                interval = (
+                    f"[{result.ci_low:+.3f}, {result.ci_high:+.3f}]"
+                    if result.ci_low == result.ci_low
+                    else "–"
+                )
+                p_value: Any = result.p_value
+            else:
+                interval, p_value = "–", None
+            rows.append(
+                [model, stratum, gloss, len(xs), mean_a, mean_b, mean_b - mean_a,
+                 interval, p_value]
+            )
+    if not rows:
+        return ""
+    return _md_table(
+        ["model", "stratum", "what the pass could do", "n", "M3C", "M4", "Δ", "95% CI", "p"],
+        rows,
+    )
+
+
 def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
@@ -345,6 +565,16 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                 control_tokens = _mean(control, "total_tokens")
                 arm_tokens = _mean(arm, "total_tokens")
                 ratio = control_calls / arm_calls if arm_calls else None
+                # Means can match while individual pairs do not, so the
+                # per-case count is the binding check; the ratio is only a
+                # readable summary beside it.
+                scope = [i for i in items if i.model_key == model and i.dataset == dataset]
+                broken = dropped_for_parity(scope, control, arm).get(model, 0)
+                verdict = (
+                    "MISMATCH"
+                    if broken
+                    else ("ok" if ratio is not None and 0.8 <= ratio <= 1.25 else "MISMATCH")
+                )
                 rows.append(
                     [
                         dataset,
@@ -355,7 +585,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                         ratio,
                         control_tokens,
                         arm_tokens,
-                        "ok" if ratio is not None and 0.8 <= ratio <= 1.25 else "MISMATCH",
+                        broken,
+                        verdict,
                     ]
                 )
     if not rows:
@@ -363,7 +594,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     return _md_table(
         [
             "dataset", "model", "pair", "control calls", "arm calls",
-            "call ratio", "control tokens", "arm tokens", "parity",
+            "call ratio", "control tokens", "arm tokens",
+            "per-case breaks (dropped)", "parity",
         ],
         rows,
     )
@@ -550,6 +782,17 @@ def explicit_vs_implicit_table(items: Sequence[ScoredItem]) -> str:
     )
 
 
+def _framework_blocks(
+    framework: Optional[Mapping[str, Any]]
+) -> Dict[str, Mapping[str, Any]]:
+    """Normalise the provenance argument to ``{dataset: block}``."""
+    if not framework:
+        return {}
+    if all(isinstance(v, Mapping) for v in framework.values()):
+        return {str(k): v for k, v in framework.items()}
+    return {str(framework.get("task") or "run"): framework}
+
+
 def build_report(
     items: Sequence[ScoredItem],
     *,
@@ -560,13 +803,27 @@ def build_report(
     """Assemble the full Markdown report."""
     parts: List[str] = [f"# {title}", ""]
 
+    # ``framework`` is ``{dataset: provenance}``; a single flat block is still
+    # accepted so older callers and tests keep working.
+    per_dataset = _framework_blocks(framework)
     if framework:
         parts.append("## Framework contract")
         parts.append("")
         parts.append(
-            "All arms share one frozen framework; only `model.generate()` differs."
+            "All arms share one frozen framework; only `model.generate()` differs. "
+            "Each dataset carries its own provenance: one block cannot attest to "
+            "a run it did not describe."
         )
         parts.append("")
+        forced = sorted(k for k, v in per_dataset.items() if v.get("scored_with_allow_drift"))
+        if forced:
+            parts.append(
+                f"> **Scored with `--allow-drift`: {', '.join(k.upper() for k in forced)}.** "
+                f"The traces did not match the frozen manifest for these datasets. "
+                f"See the `drift` list in the block below; the numbers are not "
+                f"reproducible from the recorded provenance."
+            )
+            parts.append("")
         parts.append("```json")
         parts.append(json.dumps(dict(framework), ensure_ascii=False, indent=2))
         parts.append("```")
@@ -596,12 +853,45 @@ def build_report(
         parts.append("")
         parts.append(main_table(items, dataset, metrics))
         parts.append("")
+        if dataset == "cp":
+            subtasks = cp_subtask_table(items, primary)
+            if subtasks:
+                parts.append("### Per-subtask results")
+                parts.append("")
+                parts.append(
+                    "The pooled row above is not a pathway-execution score: CP3 and "
+                    "CP5 contribute 988 items each while CP6 — the transition "
+                    "decision, the one with a patient-safety reading — contributes "
+                    "306. **The prespecified CP endpoint is the macro-average**, "
+                    "the mean of the six family means, so each capability counts "
+                    "once. Per-subtask rows show where a model actually fails."
+                )
+                parts.append("")
+                parts.append(subtasks)
+                parts.append("")
+                macro_table, macro_results = cp_macro_contrast_table(items, primary)
+                if macro_table:
+                    parts.append("### Contrasts on the macro-average (prespecified endpoint)")
+                    parts.append("")
+                    parts.append(
+                        "Stratified macro bootstrap: diseases are resampled within "
+                        "each subtask, subtask means are taken, then the six "
+                        "families are weighted equally — so the interval describes "
+                        "the same quantity as the point estimate. Holm-corrected "
+                        f"within this table ({len(macro_results)} comparisons)."
+                    )
+                    parts.append("")
+                    parts.append(macro_table)
+                    parts.append("")
         table, results = contrast_table(
             items, dataset, primary, clusters="disease" if dataset == "cp" else None
         )
         tests_used = sorted({r.test for r in results.values()}) or ["–"]
         family = HYPOTHESIS_FAMILIES.get(dataset, f"{dataset} family")
-        parts.append("### Paired condition contrasts")
+        parts.append(
+            "### Paired condition contrasts"
+            + (" (pooled, secondary)" if dataset == "cp" else "")
+        )
         parts.append("")
         parts.append(
             f"Test chosen from the data: {', '.join(tests_used)}. "
@@ -613,6 +903,23 @@ def build_report(
         parts.append("")
         parts.append(table)
         parts.append("")
+        strata = verification_stratum_table(items, dataset, primary)
+        if strata:
+            parts.append("### Is the M4 gain verification, or just a second turn?")
+            parts.append("")
+            parts.append(
+                "M4 takes its revision turn on **every** case, including the ones "
+                "no deterministic checker adjudicates — otherwise it would spend "
+                "one model call fewer than M3C on exactly those cases and the "
+                "compute match would fail where it matters most. The price is "
+                "that the arm mixes two treatments, so the gain is split by how "
+                "much the verification pass could actually check. A gain "
+                "concentrated in `not_applicable` is a second-turn effect and "
+                "must be reported as one."
+            )
+            parts.append("")
+            parts.append(strata)
+            parts.append("")
         comp_table, comp_stats = compensation_table(items, dataset, primary)
         parts.append("### Does the framework compensate weaker models?")
         parts.append("")
@@ -642,12 +949,15 @@ def build_report(
         parts.append("## Compute parity of the control arms")
         parts.append("")
         parts.append(
-            "M2C matches M3's budget without graph access; M3C matches M4's "
-            "without verification evidence. The compute-matched contrasts "
-            "(M2C→M3, M3C→M4) are only interpretable if the match actually "
-            "held, so the realised call and token counts are reported here. A "
-            "`MISMATCH` row means that contrast still carries a compute "
-            "difference and must be described as such."
+            "M2C matches M3's turn budget while keeping M2's static KG context "
+            "and withholding the tools -- so M2C→M3 isolates *agentic retrieval*, "
+            "not the graph, which both arms have. M3C matches M4's turn count "
+            "without the verification evidence. These contrasts are only "
+            "interpretable if the match actually held, so the realised call and "
+            "token counts are reported here alongside the number of pairs where "
+            "parity broke per case. Any per-case break drops that pair from the "
+            "contrast and marks the row `MISMATCH`; means alone can agree while "
+            "individual pairs do not."
         )
         parts.append("")
         parts.append(parity)
@@ -676,11 +986,21 @@ def build_report(
     if trace_summaries:
         parts.append("## Agent behaviour (from traces)")
         parts.append("")
+        parts.append(
+            "`agent calls` are the tool calls the model chose; `verifier calls` "
+            "are the ones the M4 verification pass made for it. Only the former "
+            "reflect tool-use skill — the verifier calls the right checker by "
+            "construction."
+        )
+        parts.append("")
         headers = [
-            "arm",
+            "dataset",
+            "model",
+            "condition",
             "traces",
             "LLM calls",
-            "tool calls",
+            "agent calls",
+            "verifier calls",
             "invalid",
             "tool success",
             "tokens",
@@ -689,12 +1009,24 @@ def build_report(
         ]
         rows = []
         for key, summary in sorted(trace_summaries.items()):
+            # keys are "dataset/model/condition"; older files wrote
+            # "model/condition" and are still rendered rather than dropped
+            parts_of_key = key.split("/")
+            if len(parts_of_key) == 3:
+                dataset, model, condition = parts_of_key
+            elif len(parts_of_key) == 2:
+                dataset, (model, condition) = "–", parts_of_key
+            else:
+                dataset, model, condition = "–", key, "–"
             rows.append(
                 [
-                    key,
+                    dataset,
+                    model,
+                    condition,
                     summary.get("n_traces"),
                     summary.get("mean_n_llm_calls"),
-                    summary.get("mean_n_tool_calls"),
+                    summary.get("mean_n_agent_tool_calls", summary.get("mean_n_tool_calls")),
+                    summary.get("mean_n_verification_tool_calls"),
                     summary.get("mean_n_invalid_tool_calls"),
                     summary.get("mean_tool_success_rate"),
                     summary.get("mean_total_tokens"),

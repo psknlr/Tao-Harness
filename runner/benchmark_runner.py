@@ -57,7 +57,13 @@ from tcm_eval import (
 from tcm_eval.judge import SDTJudge, aggregate_judge
 from tcm_eval.metrics import pathogenesis_probe_rate, tool_selection_accuracy
 from tcm_eval.official_sdt import write_submission
-from tcm_eval.provenance import case_set_hash, code_fingerprints, compare_fingerprints
+from tcm_eval.provenance import (
+    case_set_hash,
+    code_fingerprints,
+    compare_fingerprints,
+    manifest_conflicts,
+    run_signature,
+)
 from tcm_eval.stats import mcnemar, paired_bootstrap
 from tcm_kg import load_kg
 from tcm_kg.index import KGRetriever
@@ -85,6 +91,25 @@ def _load_graph(kg_path: Optional[str], config: Optional[ExperimentConfig] = Non
         retriever.warm()
         retriever.save(cache_file)
     return kg, retriever
+
+
+_KG_HASH_CACHE: Dict[str, str] = {}
+
+
+def _kg_hash_for(config: ExperimentConfig, args: argparse.Namespace) -> str:
+    """Content hash of the graph this config would use, without warming an index.
+
+    ``score`` needs it to check the traces against the frozen manifest, but for
+    PA and CP it does not otherwise load the graph, and building the retrieval
+    index just to compute a hash would make every score run minutes slower.
+    """
+    key = str(getattr(args, "kg", None) or "")
+    if key not in _KG_HASH_CACHE:
+        try:
+            _KG_HASH_CACHE[key] = load_kg(getattr(args, "kg", None)).content_hash()
+        except Exception:
+            _KG_HASH_CACHE[key] = ""
+    return _KG_HASH_CACHE[key]
 
 
 def _file_hash(path: Path) -> str:
@@ -122,6 +147,7 @@ def write_manifest(
     *,
     n_items: int,
     extra: Optional[Mapping[str, Any]] = None,
+    allow_conflict: bool = False,
 ) -> Dict[str, Any]:
     """Record everything needed to reproduce or audit this run.
 
@@ -165,9 +191,40 @@ def write_manifest(
     if extra:
         manifest.update(extra)
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    (config.output_dir / f"manifest.{config.task}.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    path = config.output_dir / f"manifest.{config.task}.json"
+
+    # A manifest is the only record of what the traces beside it were produced
+    # under. Overwriting it on every `run` meant a resumed run with an edited
+    # config silently replaced that record: the traces stayed, the description
+    # of how they were made became the new config, and nothing was left to say
+    # they disagreed. So a conflicting manifest is preserved, never replaced.
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = None
+        if isinstance(previous, Mapping):
+            conflicts = manifest_conflicts(previous, manifest)
+            if conflicts:
+                if not allow_conflict:
+                    raise SystemExit(
+                        f"{path} describes a different experiment:\n  "
+                        + "\n  ".join(conflicts)
+                        + "\n\nThe traces in this directory were generated under those "
+                        "settings. Point --config at a fresh output_dir, or pass "
+                        "--new-run to archive the old manifest and start a new one "
+                        "here (existing traces will not resume)."
+                    )
+                archive = (
+                    config.output_dir
+                    / f"manifest.{config.task}.{str(previous.get('run_signature') or previous.get('created_at') or 'previous')}.json"
+                )
+                archive.write_text(
+                    json.dumps(previous, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                print(f"archived the previous manifest to {archive.name}", file=sys.stderr)
+
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 
@@ -201,7 +258,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"scoring for those fields will be skipped.",
             file=sys.stderr,
         )
-    items = dataset.subset(config.dataset_limit).items
+    items = dataset.subset(
+        config.dataset_limit, stratify=config.dataset_stratify
+    ).items
     if not items:
         print("no items to run", file=sys.stderr)
         return 1
@@ -215,12 +274,31 @@ def cmd_run(args: argparse.Namespace) -> int:
     framework_hash = config.framework.framework_hash()
 
     case_ids = [str(item["id"]) for item in items]
+    case_set = case_set_hash(case_ids)
+    code = code_fingerprints()
+
+    def _signature(model_key: str) -> str:
+        spec = specs.get(model_key)
+        return run_signature(
+            framework_hash=framework_hash,
+            kg_hash=config.framework.kg_hash,
+            dataset_hash=config.framework.dataset_hash,
+            model_fingerprint=spec.fingerprint() if spec else "",
+            case_set=case_set,
+            code=code,
+        )
+
     manifest = write_manifest(
         config,
         kg,
         specs,
         n_items=len(items),
-        extra={"case_ids": case_ids, "case_set_sha256": case_set_hash(case_ids)},
+        extra={
+            "case_ids": case_ids,
+            "case_set_sha256": case_set,
+            "run_signatures": {k: _signature(k) for k in config.models if k in specs},
+        },
+        allow_conflict=bool(getattr(args, "new_run", False)),
     )
     print(
         f"framework_hash={framework_hash}  kg={manifest['kg_content_sha256'][:12]}  "
@@ -237,13 +315,30 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"skipping unknown model {model_key!r}", file=sys.stderr)
             continue
         trace_file = _trace_path(config, model_key)
+        signature = _signature(model_key)
+        config.framework.run_signature = signature
+
+        # Resume on the *signature*, not the framework hash. The framework hash
+        # is designed to stay equal across models and says nothing about the
+        # code, so resuming on it silently kept traces from a different model
+        # snapshot or from before a tool rewrite -- exactly the traces a resume
+        # must regenerate. Traces predating the signature carry "" and are
+        # never resumed: they cannot prove what produced them.
+        recorded = read_traces(trace_file) if not args.overwrite else []
         existing = {
             (t.case_id, t.condition, t.sample): t
-            for t in read_traces(trace_file)
-            if t.framework_hash == framework_hash and not args.overwrite
+            for t in recorded
+            if t.run_signature == signature
         }
+        stale = len(recorded) - len(existing)
         if existing:
             print(f"{model_key}: resuming, {len(existing)} traces already recorded", file=sys.stderr)
+        if stale:
+            print(
+                f"{model_key}: discarding {stale} trace(s) from a different run "
+                f"signature; they will be regenerated",
+                file=sys.stderr,
+            )
 
         client = build_client(
             specs[model_key],
@@ -445,6 +540,32 @@ def cmd_score(args: argparse.Namespace) -> int:
     # the run actually was. Scoring against the current config would let a
     # later edit (a smaller `limit`, a repointed model, a changed dataset)
     # silently reinterpret traces produced under different conditions.
+    allow_drift = bool(getattr(args, "allow_drift", False))
+    #: Every reason this score run is not what the manifest describes.  Carried
+    #: into the scored manifest so a number produced under --allow-drift can
+    #: never be mistaken later for a clean one.
+    drift_notes: List[str] = []
+
+    def _refuse_or_note(reason: str, detail: str) -> Optional[int]:
+        """Fail closed, unless the operator has explicitly taken the risk.
+
+        Warnings were the wrong shape for these: they scroll past, they do not
+        reach the report, and a scored file produced despite one is
+        indistinguishable afterwards from a clean one.  Scoring the wrong
+        traces silently is worse than not scoring.
+        """
+        drift_notes.append(f"{reason}: {detail}")
+        if allow_drift:
+            print(f"--allow-drift: {reason} — {detail}", file=sys.stderr)
+            return None
+        print(
+            f"REFUSING to score: {reason}.\n  {detail}\n"
+            f"  Re-run generation, or pass --allow-drift to score anyway "
+            f"(the drift is then recorded in scored_manifest and the report).",
+            file=sys.stderr,
+        )
+        return 2
+
     manifest = _load_manifest(config)
     if manifest is None:
         print(
@@ -452,16 +573,43 @@ def cmd_score(args: argparse.Namespace) -> int:
             f"the config as it reads now, which may not describe the run.",
             file=sys.stderr,
         )
+        drift_notes.append("no frozen manifest: the config may not describe the run")
     else:
         drift = compare_fingerprints(manifest, code_fingerprints())
         if drift:
-            print(
-                "NOTE: code has changed since generation — "
-                + "; ".join(drift)
-                + ". Re-scoring recorded traces with fixed scorers is expected; "
-                "re-scoring with changed tools or runtime is not comparable.",
-                file=sys.stderr,
-            )
+            # Scoring code changing is the expected case -- that is the point of
+            # separating generation from scoring -- so it is a note. Tool,
+            # retrieval or runtime code changing means the traces could not be
+            # reproduced by this checkout, and that fails closed.
+            scoring_only = all(k.startswith("scorers_impl") for k in (d.split(":")[0] for d in drift))
+            if scoring_only:
+                print(
+                    "NOTE: scoring code has changed since generation — "
+                    + "; ".join(drift)
+                    + ". Re-scoring recorded traces with fixed scorers is expected.",
+                    file=sys.stderr,
+                )
+                drift_notes.append("scoring code changed since generation: " + "; ".join(drift))
+            else:
+                code = _refuse_or_note(
+                    "code that produced the traces has changed",
+                    "; ".join(drift),
+                )
+                if code is not None:
+                    return code
+        current_inputs = {
+            "kg_content_sha256": _kg_hash_for(config, args),
+            "dataset_sha256": _file_hash(config.dataset_path),
+        }
+        for key, value in current_inputs.items():
+            frozen_value = manifest.get(key)
+            if value and frozen_value and value != frozen_value:
+                code = _refuse_or_note(
+                    f"{key} differs from the frozen manifest",
+                    f"manifest {str(frozen_value)[:12]} != current {str(value)[:12]}",
+                )
+                if code is not None:
+                    return code
         frozen_cases = manifest.get("case_ids")
         if frozen_cases:
             expected = case_set_hash([str(c) for c in frozen_cases])
@@ -493,19 +641,49 @@ def cmd_score(args: argparse.Namespace) -> int:
             continue
         hashes = {t.framework_hash for t in traces}
         if len(hashes) > 1:
-            print(
-                f"REFUSING {trace_file.name}: mixed framework hashes {sorted(hashes)}. "
-                f"These traces were produced by different frameworks and are not "
-                f"comparable. Re-run the older ones.",
-                file=sys.stderr,
+            code = _refuse_or_note(
+                f"{trace_file.name} mixes framework hashes",
+                f"{sorted(hashes)} — these traces were produced by different "
+                f"frameworks and are not comparable. Re-run the older ones.",
             )
-            return 2
+            if code is not None:
+                return code
+
+        # The framework hash is equal across models by design, so it cannot
+        # catch a file that mixes model snapshots or pre/post-rewrite code.
+        # The signature can.
+        signatures = {t.run_signature for t in traces}
+        if len(signatures) > 1:
+            code = _refuse_or_note(
+                f"{trace_file.name} mixes run signatures",
+                f"{sorted(s or '(unsigned)' for s in signatures)} — different "
+                f"models, code revisions or case sets produced these traces.",
+            )
+            if code is not None:
+                return code
+        frozen_signature = (manifest or {}).get("run_signatures", {}).get(
+            traces[0].model_key
+        )
+        observed = next(iter(signatures))
+        if frozen_signature and observed and frozen_signature != observed:
+            code = _refuse_or_note(
+                f"{trace_file.name} was not produced by the run this manifest describes",
+                f"manifest {str(frozen_signature)[:12]} != traces {str(observed)[:12]}",
+            )
+            if code is not None:
+                return code
+
         all_scored.extend(_score_traces(config, traces, gold, kg, pricing))
         by_condition: Dict[str, List[Trace]] = {}
         for trace in traces:
             by_condition.setdefault(trace.condition, []).append(trace)
         for condition, bucket in by_condition.items():
-            trace_summaries[f"{bucket[0].model_key}/{condition}"] = aggregate_trace_metrics(
+            # Keyed by dataset as well: `report` merges several configs into one
+            # document, and a bare "model/condition" key let the PA summary for
+            # a model overwrite its SDT summary, so the behavioural table showed
+            # one dataset's numbers under both headings.
+            key = f"{bucket[0].dataset or config.task}/{bucket[0].model_key}/{condition}"
+            trace_summaries[key] = aggregate_trace_metrics(
                 bucket, cost_per_mtok=pricing.get(bucket[0].model_key, (0.0, 0.0))
             )
 
@@ -528,6 +706,9 @@ def cmd_score(args: argparse.Namespace) -> int:
                     "scored_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
                     "scoring_code": code_fingerprints(),
                     "n_scored": len(all_scored),
+                    # a score run that had to be forced says so permanently
+                    "allow_drift": allow_drift,
+                    "drift": drift_notes,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -616,37 +797,59 @@ def cmd_judge(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Manifest fields the report reproduces verbatim, so a reader can check any
+#: number in it against the run that produced it.
+_MANIFEST_REPORT_KEYS = (
+    "framework_hash", "task", "domain", "git_commit",
+    "kg_content_sha256", "dataset_sha256", "case_set_sha256",
+    "n_items", "created_at", "models", "run_signatures",
+    "tools_impl_sha256", "scorers_impl_sha256", "retrieval_impl_sha256",
+    "runtime_impl_sha256",
+)
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     items: List[ScoredItem] = []
     summaries: Dict[str, Any] = {}
-    framework: Optional[Mapping[str, Any]] = None
+    # One provenance block per dataset. Keeping only the first config's block
+    # meant a three-dataset report carried the SDT hashes and silently
+    # attested that the PA and CP numbers came from the same run -- the one
+    # claim the block exists to make, and the only one it could not support.
+    framework: Dict[str, Any] = {}
     for config_path in args.configs:
         config = load_experiment(config_path)
         items.extend(_load_scores(config.output_dir / f"scores.{config.task}.jsonl"))
         summary_path = config.output_dir / f"trace_summary.{config.task}.json"
         if summary_path.exists():
             summaries.update(json.loads(summary_path.read_text(encoding="utf-8")))
-        if framework is None:
-            # Read the frozen manifest, never recompute: at report time the
-            # config's kg_hash and dataset_hash are unset, so a recomputed
-            # framework hash would differ from the one the traces were actually
-            # generated under and the report would attest to a run that never
-            # happened.
-            manifest = _load_manifest(config)
-            framework = (
-                {
-                    k: manifest[k]
-                    for k in (
-                        "framework_hash", "task", "domain", "git_commit",
-                        "kg_content_sha256", "dataset_sha256", "case_set_sha256",
-                        "created_at", "models", "tools_impl_sha256",
-                        "scorers_impl_sha256", "retrieval_impl_sha256",
-                    )
-                    if k in manifest
-                }
-                if manifest
-                else {"note": "no frozen manifest found; run `run` first", **config.framework.describe()}
-            )
+
+        # Read the frozen manifest, never recompute: at report time the
+        # config's kg_hash and dataset_hash are unset, so a recomputed
+        # framework hash would differ from the one the traces were actually
+        # generated under and the report would attest to a run that never
+        # happened.
+        manifest = _load_manifest(config)
+        block: Dict[str, Any] = (
+            {k: manifest[k] for k in _MANIFEST_REPORT_KEYS if k in manifest}
+            if manifest
+            else {
+                "note": "no frozen manifest found; run `run` first",
+                **config.framework.describe(),
+            }
+        )
+        scored_manifest = config.output_dir / f"scored_manifest.{config.task}.json"
+        if scored_manifest.exists():
+            try:
+                payload = json.loads(scored_manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            # A number scored under --allow-drift must carry that label into
+            # the report, not only into a file nobody opens.
+            if payload.get("allow_drift"):
+                block["scored_with_allow_drift"] = True
+                block["drift"] = payload.get("drift") or []
+        framework[config.task] = block
+
     if not items:
         print("no scores found; run `score` first", file=sys.stderr)
         return 1
@@ -792,12 +995,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--conditions", nargs="*", help="override the condition list")
     run.add_argument("--limit", type=int, default=None, help="first N dataset items")
     run.add_argument("--overwrite", action="store_true", help="ignore recorded traces")
+    run.add_argument(
+        "--new-run",
+        action="store_true",
+        help="this output_dir holds a different experiment: archive its manifest "
+        "and start a new one here",
+    )
     run.add_argument("--replay", action="store_true", help="offline: cache only, no API key")
     run.add_argument("--echo-script", nargs="*", default=None, help="scripted offline responses")
     run.set_defaults(func=cmd_run)
 
     score = sub.add_parser("score", help="score recorded traces")
     score.add_argument("config")
+    score.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="score anyway when the traces do not match the frozen manifest "
+        "(mixed run signatures, changed KG, dataset or framework). Reports "
+        "produced this way must say so.",
+    )
     score.set_defaults(func=cmd_score)
 
     judge = sub.add_parser("judge", help="LLM-judge the SDT free-text steps")

@@ -58,20 +58,27 @@ def trace_metrics(trace: Trace, *, cost_per_mtok: Sequence[float] = (0.0, 0.0)) 
         float(step.completion.get("latency_ms") or 0.0) for step in trace.llm_steps
     )
     coverage = trace.coverage_counts()
+    agent_coverage = trace.coverage_counts(phase="agent")
     context_chars = trace.static_context_chars + sum(
         step.result_chars for step in trace.tool_steps
     )
+    n_agent = trace.n_agent_tool_calls
     return {
         "n_llm_calls": trace.n_llm_calls,
+        # ``n_tool_calls`` is every call the harness issued (cost accounting);
+        # ``n_agent_tool_calls`` is what the model chose (behaviour accounting).
+        # Mixing them makes M4 look like a better tool user because its
+        # verifier called the right checker for it.
         "n_tool_calls": trace.n_tool_calls,
+        "n_agent_tool_calls": n_agent,
+        "n_verification_tool_calls": trace.n_verification_tool_calls,
         "n_invalid_tool_calls": trace.n_invalid_tool_calls,
         "tool_success_rate": (
-            (trace.n_tool_calls - trace.n_invalid_tool_calls) / trace.n_tool_calls
-            if trace.n_tool_calls
-            else None
+            (n_agent - trace.n_invalid_tool_calls) / n_agent if n_agent else None
         ),
-        "n_distinct_tools": len(trace.tools_used()),
-        "tools_used": trace.tools_used(),
+        "n_distinct_tools": len(trace.agent_tools_used()),
+        "tools_used": trace.agent_tools_used(),
+        "verification_tools_used": trace.tools_used(phase="verification"),
         "n_retries": trace.n_retries,
         "prompt_tokens": trace.prompt_tokens,
         "completion_tokens": trace.completion_tokens,
@@ -86,7 +93,8 @@ def trace_metrics(trace: Trace, *, cost_per_mtok: Sequence[float] = (0.0, 0.0)) 
             6,
         ),
         "coverage_counts": coverage,
-        "n_not_covered": coverage.get("not_covered", 0),
+        "agent_coverage_counts": agent_coverage,
+        "n_not_covered": agent_coverage.get("not_covered", 0),
         "parse_strategy": trace.parse_strategy or (
             trace.llm_steps[-1].parse_strategy if trace.llm_steps else ""
         ),
@@ -94,15 +102,27 @@ def trace_metrics(trace: Trace, *, cost_per_mtok: Sequence[float] = (0.0, 0.0)) 
             trace.parse_strategy in {"fenced", "balanced_span", "repaired", "repaired_whole"}
         ),
         "errored": bool(trace.error),
+        # experiment-validity flags, carried so the report can act on them
+        # without re-reading the traces
+        "verification_stratum": trace.verification_stratum,
+        "parity_error": trace.parity_error,
+        "branch_group": trace.branch_group,
     }
 
 
 def tool_selection_accuracy(trace: Trace, rule_id: Optional[str]) -> Optional[float]:
-    """Fraction of valid calls that hit the tool family the rule calls for."""
+    """Fraction of the *agent's own* valid calls that hit the right tool family.
+
+    Verification-phase calls are excluded. The M4 verifier calls the checker
+    the item's declared rule family names, by construction; counting those
+    would hand M4 a near-perfect selection score for a choice the model never
+    made, and the M3→M4 tool-use comparison would measure the harness.
+    """
     expected = RULE_TOOL_EXPECTATIONS.get(str(rule_id or "").upper())
-    if not expected or not trace.tool_steps:
+    agent_steps = [step for step in trace.tool_steps if step.phase == "agent"]
+    if not expected or not agent_steps:
         return None
-    valid = [step for step in trace.tool_steps if step.ok]
+    valid = [step for step in agent_steps if step.ok]
     if not valid:
         return 0.0
     # search_tcm_entities is a legitimate first move for any rule family
@@ -118,7 +138,13 @@ def coverage_honesty(trace: Trace) -> Optional[float]:
     ``None`` when the trace made no ``not_covered`` call, so honest-by-default
     runs do not dilute the average.
     """
-    uncovered = [step for step in trace.tool_steps if step.coverage == "not_covered" and step.ok]
+    # only calls the agent made itself: it cannot be dishonest about a
+    # not_covered verdict the verifier produced after it had already answered
+    uncovered = [
+        step
+        for step in trace.tool_steps
+        if step.coverage == "not_covered" and step.ok and step.phase == "agent"
+    ]
     if not uncovered:
         return None
     final = trace.final or {}
@@ -162,7 +188,7 @@ def pathogenesis_probe_rate(
     queries = [
         str(step.arguments.get("query") or "")
         for step in trace.tool_steps
-        if step.tool == "search_tcm_entities"
+        if step.tool == "search_tcm_entities" and step.phase == "agent"
     ]
     queries = [q for q in queries if q.strip()]
     if not queries:
@@ -180,6 +206,8 @@ def aggregate_trace_metrics(
     numeric_keys = [
         "n_llm_calls",
         "n_tool_calls",
+        "n_agent_tool_calls",
+        "n_verification_tool_calls",
         "n_invalid_tool_calls",
         "tool_success_rate",
         "n_distinct_tools",

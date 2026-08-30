@@ -48,10 +48,11 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -60,6 +61,11 @@ if str(REPO_ROOT) not in sys.path:
 from tcm_kg import load_kg
 from tcm_kg.schema import EdgeType, NodeType
 from tcm_kg.store import KGStore
+
+#: Fraction of first-stage CP2 items to keep. First stages are the easiest to
+#: identify, and letting them dominate turns stage identification into
+#: admission spotting.
+FIRST_STAGE_KEEP_RATE = 0.25
 
 #: A stage must carry enough content to make a fair item.
 MIN_ACTIONS = 4
@@ -77,16 +83,34 @@ def _stages_by_disease(kg: KGStore) -> Dict[str, List[Any]]:
     return out
 
 
-def _stage_signature(stage: Any) -> frozenset:
-    """What a vignette can expose about a stage without naming its answer.
+def _stage_signature(stage: Any, stages: Sequence[Any] = ()) -> frozenset:
+    """What a CP2 vignette exposes about a stage, without naming the answer.
 
-    Monitoring items plus entry criteria: observable, and not the day actions
-    or the stage name that CP2 and CP3 ask for.
+    Monitoring items and entry criteria, **plus the treatment already
+    completed** when the stage set is supplied. The cumulative prior-action set
+    is what the history line states, and it differs by position, so including
+    it makes mid-pathway stages identifiable from treatment progress rather
+    than from a date.
+
+    Without it only first stages were discriminable -- they alone carry entry
+    criteria -- and 87% of CP2 golds were first stages, which made the task
+    "spot the admission" rather than "locate the patient in the pathway".
     """
-    return frozenset(
-        [str(m).strip() for m in (stage.get("monitoring_items") or [])]
-        + [str(c).strip() for c in (stage.get("entry_criteria") or [])]
-    )
+    base = [str(m).strip() for m in (stage.get("monitoring_items") or [])] + [
+        str(c).strip() for c in (stage.get("entry_criteria") or [])
+    ]
+    if stages:
+        ordered = sorted(
+            stages, key=lambda st: (str(st.get("variant") or ""), st.get("order") or 0)
+        )
+        index = next((i for i, st in enumerate(ordered) if st.id == stage.id), 0)
+        prior = [
+            f"done::{a}"
+            for earlier in ordered[:index]
+            for a in (earlier.get("day_actions") or [])
+        ]
+        base.extend(dict.fromkeys(prior))
+    return frozenset(base)
 
 
 def stage_label(stage: Any, stages: Sequence[Any]) -> str:
@@ -111,11 +135,11 @@ def distinguishable_from(stage: Any, stages: Sequence[Any]) -> List[Any]:
     stage's entire signature is not a wrong answer the vignette rules out, it
     is a second correct answer the item pretends does not exist.
     """
-    signature = _stage_signature(stage)
+    signature = _stage_signature(stage, stages)
     return [
         other
         for other in stages
-        if other.id != stage.id and _stage_signature(other) != signature
+        if other.id != stage.id and _stage_signature(other, stages) != signature
     ]
 
 
@@ -132,12 +156,14 @@ def discriminable_stages(stages: Sequence[Any], *, min_distractors: int = 2) -> 
     return [
         stage
         for stage in stages
-        if _stage_signature(stage)
+        if _stage_signature(stage, stages)
         and len(distinguishable_from(stage, stages)) >= min_distractors
     ]
 
 
-def _history_line(stages: Sequence[Any], stage: Any) -> str:
+def _history_line(
+    stages: Sequence[Any], stage: Any, forbidden: Optional[Set[str]] = None
+) -> str:
     """A treatment-history sentence locating the patient in the pathway.
 
     Without it a vignette describes a patient at no particular time, and every
@@ -147,13 +173,43 @@ def _history_line(stages: Sequence[Any], stage: Any) -> str:
     ordered = sorted(stages, key=lambda s: (str(s.get("variant") or ""), s.get("order") or 0))
     index = next((i for i, s in enumerate(ordered) if s.id == stage.id), 0)
     if index == 0:
-        return "患者今日入院，尚未开始本路径的治疗。"
-    previous = ordered[index - 1]
-    done = [str(a) for a in (previous.get("day_actions") or [])][:3]
-    line = f"此前已完成「{previous.name}」阶段的诊疗，"
-    if done:
-        line += "包括" + "、".join(done) + "，"
-    return line + "现进入下一次查房。"
+        # No "今日入院": naming the admission day makes "第1天" readable off the
+        # question. State the clinical fact -- no pathway treatment has been
+        # given yet -- and let the model infer the stage from it.
+        return "本次住院尚未开始路径内的诊疗措施。"
+    # Prior treatment, without naming the stage it belonged to: the model has
+    # to map treatment progress onto a stage rather than read a label.
+    blocked = {b for b in (forbidden or set()) if b}
+
+    done: List[str] = []
+    for earlier in ordered[:index]:
+        done.extend(_without_leaks([str(a) for a in (earlier.get("day_actions") or [])], blocked))
+    unique = list(dict.fromkeys(done))[:5]
+    line = "至本次查房，已完成的诊疗包括：" + "、".join(unique) if unique else "已按路径开始治疗"
+    return line + "。"
+
+
+#: Which stage fields each subtask's vignette may expose.
+#:
+#: A single shared vignette is unsafe: CP5 asks which items the pathway
+#: requires monitoring, and the shared vignette printed exactly those items
+#: under "本次查房重点观察". Measured on the previous build, **1,210 of 1,210
+#: CP5 items (100%)** had their full gold answer present verbatim in their own
+#: question, so the task was string matching and no knowledge was needed. Each
+#: subtask now gets a vignette that withholds what it asks for.
+#: The stage field each subtask asks about -- and therefore must never leak,
+#: whether directly or through the treatment-history line.
+ANSWER_FIELD: Mapping[str, str] = {
+    "CP3": "day_actions",
+    "CP5": "monitoring_items",
+}
+
+VIGNETTE_FIELDS: Mapping[str, Tuple[str, ...]] = {
+    "CP2": ("history", "entry_criteria", "monitoring"),   # asks: which stage
+    "CP3": ("history", "monitoring"),                     # asks: which actions
+    "CP5": ("history", "progress"),                       # asks: what to monitor
+    "CP6": ("history", "monitoring"),                     # asks: transition
+}
 
 
 def _vignette(
@@ -162,6 +218,7 @@ def _vignette(
     stage: Any,
     syndrome: Optional[Any],
     all_stages: Sequence[Any] = (),
+    subtask: str = "CP2",
 ) -> str:
     """Render a case vignette from stage content, withholding the answers.
 
@@ -170,22 +227,75 @@ def _vignette(
     the stage name, its day actions and its criteria are all withheld because
     they are what the item asks for.
     """
+    allowed = VIGNETTE_FIELDS.get(subtask, VIGNETTE_FIELDS["CP2"])
+    # Everything this subtask asks for, withheld from every part of the
+    # vignette rather than from one field at a time. Patching fields
+    # individually kept re-surfacing the same leak somewhere else: pathway
+    # text is repetitive, so an item withheld from the history reappears in
+    # the monitoring list, and vice versa.
+    blocked = {
+        str(x).strip()
+        for x in (stage.get(ANSWER_FIELD[subtask]) or ())
+        if str(x).strip()
+    } if subtask in ANSWER_FIELD else set()
     parts = [f"患者因{disease.get('tcm_name') or disease.name}入院，进入该病种中医临床路径。"]
     if stage.get("variant"):
         parts.append(f"路径分支：{stage.get('variant')}。")
     if syndrome is not None:
         parts.append(f"入院辨证为{syndrome.name}。")
-        if syndrome.sentence():
-            parts.append(f"四诊所见：{syndrome.sentence()[:160]}")
-    if all_stages:
-        parts.append(_history_line(all_stages, stage))
-    entry = [str(c) for c in (stage.get("entry_criteria") or [])][:3]
-    if entry:
-        parts.append("当前状况符合：" + "；".join(entry) + "。")
-    monitoring = [str(m) for m in (stage.get("monitoring_items") or [])][:4]
-    if monitoring:
-        parts.append("本次查房重点观察：" + "；".join(monitoring) + "。")
+        # this disease's own presentation, never the syndrome's global first
+        # mention, which for most edges describes a different disease
+        presentation = kg.syndrome_presentation(syndrome.id, disease.id)
+        if presentation["scope"] == "disease_specific" and presentation["sentence"]:
+            parts.append(f"四诊所见：{presentation['sentence'][:160]}")
+    if "history" in allowed and all_stages:
+        parts.append(_history_line(all_stages, stage, blocked))
+    if "progress" in allowed:
+        parts.append(_progress_line(all_stages, stage))
+    if "entry_criteria" in allowed:
+        entry = _without_leaks(
+            [str(c) for c in (stage.get("entry_criteria") or [])], blocked
+        )[:3]
+        if entry:
+            parts.append("当前状况符合：" + "；".join(entry) + "。")
+    if "monitoring" in allowed:
+        monitoring = _without_leaks(
+            [str(m) for m in (stage.get("monitoring_items") or [])], blocked
+        )[:4]
+        if monitoring:
+            parts.append("本次查房重点观察：" + "；".join(monitoring) + "。")
     return "".join(parts)
+
+
+def _without_leaks(values: Sequence[str], blocked: Set[str]) -> List[str]:
+    """Drop entries that would reveal a withheld answer.
+
+    Substring in both directions: a gold item hides inside a longer line
+    (``中医证候判断`` within ``完成皮损PRSS评分及中医证候判断``) as readily as a
+    longer gold item contains a shorter line.
+    """
+    if not blocked:
+        return [v.strip() for v in values if v.strip()]
+    return [
+        v.strip()
+        for v in values
+        if v.strip() and not any(b in v or v in b for b in blocked)
+    ]
+
+
+def _progress_line(stages: Sequence[Any], stage: Any) -> str:
+    """Clinical progress, with no monitoring content and no stage label.
+
+    Used by CP5, which asks what the pathway requires monitoring: naming any
+    monitoring item here would hand over the answer.
+    """
+    ordered = sorted(stages, key=lambda s: (str(s.get("variant") or ""), s.get("order") or 0))
+    index = next((i for i, s in enumerate(ordered) if s.id == stage.id), 0)
+    if index == 0:
+        return "患者尚未开始本路径的治疗，现按路径规定安排本阶段诊疗。"
+    if index >= len(ordered) - 1:
+        return "经前期治疗后病情稳定，现进入本路径的收尾阶段。"
+    return "经前期治疗后症状有所缓解，病情平稳，现按路径进入下一诊疗节点。"
 
 
 def _options(correct: str, pool: Sequence[str], rng: random.Random, n: int = N_OPTIONS) -> Tuple[Dict[str, str], List[str]]:
@@ -253,14 +363,20 @@ def build(
                 dropped["too_few_distractor_actions"] += 1
                 continue
 
-            base = {
-                "disease": disease.name,
-                "stage_id": stage.id,
-                "stage_name": stage.name,
-                "variant": stage.get("variant"),
-                "vignette": _vignette(kg, disease, stage, syndrome, stages),
-                "syndrome": syndrome.name if syndrome else None,
-            }
+            def _base(subtask: str) -> Dict[str, Any]:
+                return {
+                    "disease": disease.name,
+                    "stage_id": stage.id,
+                    "stage_name": stage.name,
+                    "variant": stage.get("variant"),
+                    "vignette": _vignette(kg, disease, stage, syndrome, stages, subtask),
+                    "syndrome": syndrome.name if syndrome else None,
+                }
+
+            ordered_stages = sorted(
+                stages, key=lambda st: (str(st.get("variant") or ""), st.get("order") or 0)
+            )
+            is_first = bool(ordered_stages) and ordered_stages[0].id == stage.id
 
             # ---- CP2: stage identification, distractors that really differ ----
             if stage in usable:
@@ -273,10 +389,17 @@ def build(
                 if len(distractors) < 2:
                     dropped["ambiguous_stage_labels"] += 1
                     continue
+                # Cap first-stage items: they are the most easily identified
+                # (only first stages carry entry criteria), and in the previous
+                # build 87% of CP2 golds were first stages, turning the task
+                # into "spot the admission".
+                if is_first and rng.random() > FIRST_STAGE_KEEP_RATE:
+                    dropped["first_stage_rebalanced"] += 1
+                    continue
                 options, answer = _options(gold_label, distractors, rng, n=min(6, len(distractors) + 1))
                 items.append(
                     {
-                        **base,
+                        **_base("CP2"),
                         "id": f"cp2::{stage.id}",
                         "subtask": "CP2_stage_identification",
                         "question": "根据上述病情描述与治疗经过，患者当前处于该临床路径的哪个阶段？",
@@ -290,7 +413,7 @@ def build(
             action_options, action_answer = _multi_options(actions, other_actions, rng)
             items.append(
                 {
-                    **base,
+                    **_base("CP3"),
                     "id": f"cp3::{stage.id}",
                     "subtask": "CP3_stage_actions",
                     "question": (
@@ -314,7 +437,7 @@ def build(
                 options, answer = _multi_options(monitoring, other_monitoring, rng)
                 items.append(
                     {
-                        **base,
+                        **_base("CP5"),
                         "id": f"cp5m::{stage.id}",
                         "subtask": "CP5_monitoring",
                         "question": (
@@ -329,12 +452,14 @@ def build(
             exit_criteria = [str(c) for c in (stage.get("exit_criteria") or [])]
             successors = [t for _e, t in kg.neighbours(stage.id, {EdgeType.NEXT_STAGE.value})]
             if exit_criteria:
-                items.extend(_transition_items(base, stage, exit_criteria, successors))
+                items.extend(_transition_items(_base("CP6"), stage, exit_criteria, successors))
             else:
                 dropped["stage_without_exit_criteria"] += 1
 
         # ---- CP1: pathway eligibility ----
-        items.extend(_eligibility_items(kg, disease, stages, by_disease, rng, base_syndrome=syndrome))
+        items.extend(
+            _eligibility_items(kg, disease, stages, by_disease, rng, base_syndrome=syndrome)
+        )
 
         # ---- CP4: treatment planning, beyond the principle alone ----
         for syn in syndromes[:2]:
@@ -463,7 +588,10 @@ def _eligibility_items(
             "answer": ["A"],
         }
     ]
-    if exclusion:
+    for clause in exclusion:
+        fact = exclusion_to_patient_fact(clause)
+        if not fact:
+            continue
         out.append(
             {
                 "disease": disease.name,
@@ -473,20 +601,67 @@ def _eligibility_items(
                 "vignette": (
                     f"患者拟以{disease.get('tcm_name') or disease.name}收入院。"
                     f"入院评估：" + "；".join(inclusion[:2]) + "。"
-                    f"另注意：该患者{exclusion[0][:60]}。"
+                    f"既往及现症：该患者合并{fact}。"
                 ),
                 "id": f"cp1::{disease.id}::excluded",
                 "subtask": "CP1_pathway_eligibility",
                 "question": f"该患者是否符合「{disease.name}」中医临床路径的入径标准？",
                 "options": dict(options),
                 "answer": ["B"],
+                "excluded_because": fact,
             }
         )
+        break
     return out
 
 
 #: Clause markers that make an entry criterion an *exclusion*.
 _EXCLUSION_WORDS = ("不进入", "不宜", "除外", "禁忌", "不能进入", "排除")
+
+#: Policy language to strip when turning a rule into a patient fact.
+_POLICY_PHRASES = (
+    "不进入本路径", "不能进入本路径", "不进入该路径", "不进入临床路径",
+    "者不进入", "不进入", "不宜进入", "不宜", "予以除外", "除外",
+    "应排除", "排除", "禁忌进入", "属禁忌",
+)
+_LIST_SPLIT_RE = re.compile(r"[、，,；;]")
+
+
+def exclusion_to_patient_fact(criterion: str) -> Optional[str]:
+    """Turn an exclusion rule into a statement about this patient.
+
+    An item that quotes the rule -- "合并严重心功能不全者不进入本路径" -- is
+    answerable by spotting the words 不进入 and needs no pathway knowledge. The
+    item has to state a *fact* ("患者既往有严重心功能不全") and let the model
+    decide whether it violates the entry criteria.
+
+    Returns ``None`` when the clause cannot be reduced to a clean fact, in
+    which case no negative item is generated: a malformed vignette is worse
+    than a missing one.
+    """
+    text = str(criterion or "").strip()
+    if not text:
+        return None
+    for phrase in _POLICY_PHRASES:
+        text = text.replace(phrase, "")
+    text = text.strip(" 。.，,、；;：:的")
+    if not text or len(text) < 3:
+        return None
+    # keep the first listed condition; a five-item list reads as a rule again
+    parts = [p.strip() for p in _LIST_SPLIT_RE.split(text) if len(p.strip()) >= 3]
+    condition = parts[0] if parts else text
+    condition = condition.strip(" 者等的")
+    if len(condition) < 3 or any(w in condition for w in ("本路径", "临床路径")):
+        return None
+    return condition
+
+
+def _treatment_vignette(kg: KGStore, disease: Any, syndrome: Any) -> str:
+    presentation = kg.syndrome_presentation(syndrome.id, disease.id)
+    text = f"患者因{disease.get('tcm_name') or disease.name}入院，辨证为{syndrome.name}。"
+    if presentation["scope"] == "disease_specific" and presentation["sentence"]:
+        text += f"四诊所见：{presentation['sentence'][:160]}"
+    return text
 
 
 def _treatment_items(
@@ -507,10 +682,7 @@ def _treatment_items(
         "stage_id": None,
         "stage_name": None,
         "syndrome": syndrome.name,
-        "vignette": (
-            f"患者因{disease.get('tcm_name') or disease.name}入院，辨证为{syndrome.name}。"
-            + (f"四诊所见：{syndrome.sentence()[:160]}" if syndrome.sentence() else "")
-        ),
+        "vignette": _treatment_vignette(kg, disease, syndrome),
     }
     specs = [
         ("principle", EdgeType.TREATED_BY_PRINCIPLE.value, "本证的治法是？", "CP4_treatment_principle"),

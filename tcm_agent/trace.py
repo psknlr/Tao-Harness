@@ -32,6 +32,17 @@ class LLMStep:
 
 @dataclass
 class ToolStep:
+    """One tool call, tagged with *who* made it.
+
+    ``phase`` separates a call the agent chose to make from one the M4
+    verification pass made on its behalf.  Without it, every tool-selection
+    metric flatters M4: the background verifier calls exactly the right
+    checker for the item, so M4 would score higher on "did the model pick the
+    correct tool?" without the model having picked anything.  Reports must
+    read agent-phase steps for selection quality and the verification-phase
+    steps only as a record of what the harness ran.
+    """
+
     index: int
     tool: str
     arguments: Dict[str, Any]
@@ -41,6 +52,7 @@ class ToolStep:
     n_results: int
     error: Optional[str] = None
     result_chars: int = 0
+    phase: str = "agent"  # "agent" | "verification"
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -56,6 +68,12 @@ class Trace:
     condition: str
     model_key: str
     framework_hash: str
+    #: Everything the framework hash omits: which model, which code revision,
+    #: which case set.  Two traces with the same framework hash but different
+    #: signatures came from different experiments and must never be pooled --
+    #: which the framework hash alone cannot tell you, because it is designed
+    #: to stay equal across models.
+    run_signature: str = ""
     sample: int = 0
     llm_steps: List[LLMStep] = field(default_factory=list)
     tool_steps: List[ToolStep] = field(default_factory=list)
@@ -66,6 +84,20 @@ class Trace:
     error: Optional[str] = None
     wall_ms: float = 0.0
     started_at: str = ""
+    #: Branch arms sharing one agent phase carry the same id, so paired
+    #: analysis can confirm it is comparing twins and not two independent runs.
+    branch_group: str = ""
+    #: M4 only: what the verification pass was actually able to do here --
+    #: ``"deterministic"`` (a rule checker adjudicated the answer),
+    #: ``"audit_only"`` (no checker applied; the prose was audited for
+    #: over-claiming) or ``"not_applicable"`` (nothing to check; the revision
+    #: turn still ran, for parity).  Reporting the M4 gain per stratum is what
+    #: tells a verification effect apart from a bare second-turn effect: a
+    #: gain concentrated in ``not_applicable`` is the latter.
+    verification_stratum: str = ""
+    #: Set when per-case compute parity with the matched control was broken.
+    #: Non-empty here invalidates that arm's contrast for this case.
+    parity_error: str = ""
 
     # ---------------------------------------------------------------- metrics
     @property
@@ -88,23 +120,41 @@ class Trace:
         return len(self.tool_steps)
 
     @property
+    def n_agent_tool_calls(self) -> int:
+        """Calls the model itself chose to make -- the only ones it earns credit for."""
+        return sum(1 for s in self.tool_steps if s.phase == "agent")
+
+    @property
+    def n_verification_tool_calls(self) -> int:
+        """Calls the M4 verification pass made on the model's behalf."""
+        return sum(1 for s in self.tool_steps if s.phase == "verification")
+
+    @property
     def n_invalid_tool_calls(self) -> int:
-        return sum(1 for s in self.tool_steps if not s.ok)
+        return sum(1 for s in self.tool_steps if not s.ok and s.phase == "agent")
 
     @property
     def n_retries(self) -> int:
         return sum(int(s.completion.get("n_retries", 0)) for s in self.llm_steps)
 
-    def tools_used(self) -> List[str]:
+    def tools_used(self, phase: Optional[str] = None) -> List[str]:
         seen: List[str] = []
         for step in self.tool_steps:
+            if phase is not None and step.phase != phase:
+                continue
             if step.tool not in seen:
                 seen.append(step.tool)
         return seen
 
-    def coverage_counts(self) -> Dict[str, int]:
+    def agent_tools_used(self) -> List[str]:
+        """Tools the *model* selected.  Tool-selection metrics must use this."""
+        return self.tools_used(phase="agent")
+
+    def coverage_counts(self, phase: Optional[str] = None) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for step in self.tool_steps:
+            if phase is not None and step.phase != phase:
+                continue
             counts[step.coverage] = counts.get(step.coverage, 0) + 1
         return counts
 
@@ -116,8 +166,12 @@ class Trace:
             "condition": self.condition,
             "model_key": self.model_key,
             "framework_hash": self.framework_hash,
+            "run_signature": self.run_signature,
             "sample": self.sample,
             "started_at": self.started_at,
+            "branch_group": self.branch_group,
+            "verification_stratum": self.verification_stratum,
+            "parity_error": self.parity_error,
             "wall_ms": round(self.wall_ms, 2),
             "static_context_chars": self.static_context_chars,
             "llm_steps": [s.to_dict() for s in self.llm_steps],
@@ -129,12 +183,16 @@ class Trace:
             "metrics": {
                 "n_llm_calls": self.n_llm_calls,
                 "n_tool_calls": self.n_tool_calls,
+                "n_agent_tool_calls": self.n_agent_tool_calls,
+                "n_verification_tool_calls": self.n_verification_tool_calls,
                 "n_invalid_tool_calls": self.n_invalid_tool_calls,
                 "n_retries": self.n_retries,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "tools_used": self.tools_used(),
+                "agent_tools_used": self.agent_tools_used(),
                 "coverage_counts": self.coverage_counts(),
+                "agent_coverage_counts": self.coverage_counts(phase="agent"),
             },
         }
 
@@ -147,6 +205,7 @@ class Trace:
             condition=str(payload.get("condition", "")),
             model_key=str(payload.get("model_key", "")),
             framework_hash=str(payload.get("framework_hash", "")),
+            run_signature=str(payload.get("run_signature", "")),
             sample=int(payload.get("sample", 0)),
             static_context_chars=int(payload.get("static_context_chars", 0)),
             final=payload.get("final"),
@@ -155,6 +214,9 @@ class Trace:
             error=payload.get("error"),
             wall_ms=float(payload.get("wall_ms", 0.0)),
             started_at=str(payload.get("started_at", "")),
+            branch_group=str(payload.get("branch_group", "")),
+            verification_stratum=str(payload.get("verification_stratum", "")),
+            parity_error=str(payload.get("parity_error", "")),
         )
         for step in payload.get("llm_steps", []):
             trace.llm_steps.append(LLMStep(**step))
@@ -170,6 +232,7 @@ class Trace:
                     n_results=int(step.get("n_results", 0)),
                     error=step.get("error"),
                     result_chars=int(step.get("result_chars", 0)),
+                    phase=str(step.get("phase", "agent")),
                 )
             )
         return trace

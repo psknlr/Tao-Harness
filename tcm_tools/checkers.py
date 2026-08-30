@@ -29,7 +29,7 @@ from tcm_kg.normalize import DECOCTION_MARKERS, split_herb_annotation
 from tcm_kg.schema import Domain, EdgeType, NodeType
 
 from ._common import edge_evidence, node_brief, resolve_entity
-from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
+from .base import REGISTRY, Coverage, ToolContext, ToolPhase, ToolResult, ToolSpec
 from .medication import TOXICITY_MARKERS
 from .safety import SAFETY_SCOPE_NOTE
 
@@ -83,6 +83,7 @@ _DOSE_SPEC = ToolSpec(
     },
     domains=_PA_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 
@@ -157,6 +158,7 @@ _DUP_SPEC = ToolSpec(
     },
     domains=_PA_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 
@@ -292,6 +294,7 @@ _RESTRICT_SPEC = ToolSpec(
     },
     domains=_PA_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 
@@ -414,6 +417,7 @@ _COMBO_SPEC = ToolSpec(
     },
     domains=_PA_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 
@@ -508,6 +512,7 @@ _DECOCT_SPEC = ToolSpec(
     },
     domains=_PA_DOMAINS,
     deterministic=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 

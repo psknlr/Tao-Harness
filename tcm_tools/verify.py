@@ -16,7 +16,7 @@ from tcm_kg.normalize import canonical_syndrome, char_ngrams, syndrome_atoms
 from tcm_kg.schema import Domain, EdgeType, NodeType
 
 from ._common import edge_evidence, node_brief, resolve_entity
-from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
+from .base import REGISTRY, Coverage, ToolContext, ToolPhase, ToolResult, ToolSpec
 
 
 class Verdict(str, Enum):
@@ -62,6 +62,7 @@ _VERIFY_SPEC = ToolSpec(
     domains=(Domain.CLINICAL, Domain.SAFETY, Domain.PATHWAY, Domain.FULL),
     deterministic=True,
     verification=True,
+    phase=ToolPhase.VERIFICATION,
 )
 
 
@@ -116,11 +117,14 @@ def verify_tcm_decision(ctx: ToolContext, args: Mapping[str, Any]) -> ToolResult
         }
     )
 
-    checks.append(_check_disease_link(ctx, syndrome, disease_name))
+    disease_check = _check_disease_link(ctx, syndrome, disease_name)
+    checks.append(disease_check)
     if principle:
         checks.append(_check_principle(ctx, syndrome, principle))
     if features:
-        checks.append(_check_feature_overlap(ctx, syndrome, features))
+        checks.append(
+            _check_feature_overlap(ctx, syndrome, features, disease_check.get("_disease_id"))
+        )
 
     verdicts = [c["verdict"] for c in checks]
     if Verdict.CONTRADICTED.value in verdicts:
@@ -179,6 +183,7 @@ def _check_disease_link(ctx: ToolContext, syndrome: Any, disease_name: str) -> D
             "verdict": Verdict.SUPPORTED.value,
             "detail": f"图谱记载 {parent.name} 下存在证候 {syndrome.name}。",
             "provenance": edge_evidence(edge),
+            "_disease_id": parent.id,
         }
     if parents:
         return {
@@ -242,20 +247,30 @@ def _check_principle(ctx: ToolContext, syndrome: Any, principle: str) -> Dict[st
 
 
 def _check_feature_overlap(
-    ctx: ToolContext, syndrome: Any, features: Sequence[str]
+    ctx: ToolContext,
+    syndrome: Any,
+    features: Sequence[str],
+    disease_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Lexical overlap between the case features and the syndrome's own definition.
+    """Lexical overlap between the case features and the syndrome's presentation.
 
     Deterministic and interpretable on purpose: it reports *which* feature
-    strings appear in the protocol's definition sentence, so a reader of the
-    trace can see exactly why a candidate was reinforced.
+    strings appear in the protocol's sentence, so a reader of the trace can see
+    exactly why a candidate was reinforced.
+
+    The sentence is taken **in the anchored disease's context** where one was
+    established. Comparing a knee case against the same syndrome's presentation
+    in a cardiovascular protocol would report near-zero overlap and mark a
+    correct answer unsupported -- the verifier would be penalising the model
+    for the graph's indexing rather than for its reasoning.
     """
-    sentence = syndrome.sentence()
+    presentation = ctx.kg.syndrome_presentation(syndrome.id, disease_id)
+    sentence = presentation["sentence"]
     if not sentence:
         return {
             "check": "feature_overlap",
             "verdict": Verdict.NOT_COVERED.value,
-            "detail": "该证候节点没有保留原文定义句，无法计算特征重合。",
+            "detail": "该证候没有保留原文表现描述，无法计算特征重合。",
         }
     matched = [f for f in features if f and f in sentence]
     definition_tokens = set(char_ngrams(sentence, (2,)))
@@ -270,14 +285,25 @@ def _check_feature_overlap(
         if matched or jaccard >= 0.25
         else Verdict.PARTIAL.value
     )
-    return {
+    out = {
         "check": "feature_overlap",
         "verdict": verdict,
         "detail": (
-            f"病例特征与证候定义句的二元词重合率 {jaccard:.2f}；"
+            f"病例特征与证候表现描述的二元词重合率 {jaccard:.2f}；"
             f"逐字命中 {matched if matched else '无'}。"
         ),
-        "definition_sentence": sentence[:400],
+        "presentation_sentence": sentence[:400],
+        "presentation_scope": presentation["scope"],
         "matched_features": matched,
         "coverage_ratio": round(jaccard, 4),
     }
+    if presentation["scope"] == "global_first_mention":
+        # a low overlap here may mean the sentence is from another disease,
+        # not that the answer is wrong
+        out["caveat"] = (
+            "表现描述来自该证候的全局首次出现文献，可能属于其他疾病语境；"
+            "重合率偏低不足以否定该证候。"
+        )
+        if verdict == Verdict.PARTIAL.value:
+            out["verdict"] = Verdict.NOT_COVERED.value
+    return out
