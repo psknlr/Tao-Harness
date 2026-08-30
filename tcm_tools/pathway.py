@@ -374,21 +374,30 @@ def _recommend(
 _PLAN_SPEC = ToolSpec(
     name="retrieve_treatment_plan",
     description=(
-        "查询证候对应的完整治疗方案：治法（TreatmentPrinciple）、"
+        "查询某疾病路径下某证候的完整治疗方案：治法（TreatmentPrinciple）、"
         "推荐方剂及其组成、中成药、非药物外治疗法，以及各自的原文依据。"
-        "用于临床路径中“本阶段应给予什么治疗”的决策。"
-        "仅在临床路径任务中可用。"
+        "结果分为两层：disease_specific 为当前疾病指南明确记载的推荐，"
+        "cross_disease_general 为该证候在其他疾病下的记载（中医有异病同治，"
+        "不等同于错误，但不能作为本路径的推荐依据）。"
+        "用于临床路径中“本阶段应给予什么治疗”的决策。仅在临床路径任务中可用。"
     ),
     parameters={
         "type": "object",
         "properties": {
             "syndrome": {"type": "string", "description": "证候名或实体 id。"},
+            "disease": {
+                "type": "string",
+                "description": (
+                    "当前疾病名。必填：同一证候在不同疾病的路径中推荐的治法方药可能不同，"
+                    "本工具据此区分“本病路径明确推荐”与“该证候在其他疾病下的用法”。"
+                ),
+            },
             "include_composition": {
                 "type": "boolean",
                 "description": "是否返回方剂的饮片组成，默认 true。",
             },
         },
-        "required": ["syndrome"],
+        "required": ["syndrome", "disease"],
     },
     domains=_PATHWAY_DOMAINS,
 )
@@ -398,6 +407,7 @@ _PLAN_SPEC = ToolSpec(
 def retrieve_treatment_plan(ctx: ToolContext, args: Mapping[str, Any]) -> ToolResult:
     kg = ctx.kg
     name = str(args.get("syndrome", "")).strip()
+    disease_name = str(args.get("disease", "")).strip()
     include_composition = bool(args.get("include_composition", True))
 
     node = kg.node(name)
@@ -414,47 +424,95 @@ def retrieve_treatment_plan(ctx: ToolContext, args: Mapping[str, Any]) -> ToolRe
         )
 
     syndrome = matches[0]
-    principles = [
-        node_brief(kg, t, with_sentence=False)
-        for _e, t in kg.neighbours(syndrome.id, {EdgeType.TREATED_BY_PRINCIPLE.value})
-    ]
-    formulas: List[Dict[str, Any]] = []
-    for edge, formula in kg.neighbours(syndrome.id, {EdgeType.USES_FORMULA.value}):
-        entry = node_brief(kg, formula, with_sentence=False)
-        if include_composition:
-            entry["composition"] = [
-                herb.name
-                for _e, herb in kg.neighbours(formula.id, {EdgeType.CONTAINS_HERB.value})
-            ][:40]
-        entry["provenance"] = edge_evidence(edge, max_items=1)
-        formulas.append(entry)
 
-    payload = {
+    # Resolve the disease so the plan can be conditioned on it. Read as a bare
+    # binary relation, 补中益气汤 is "the formula for 脾胃虚弱证" whether the
+    # pathway is 弱视, 吉兰巴雷综合征 or 糖尿病性胃轻瘫 -- three guidelines, one
+    # answer, and no way for the agent to tell which one it is executing.
+    disease = None
+    if disease_name:
+        node = kg.node(disease_name)
+        if node is not None and node.type in (NodeType.DISEASE.value, NodeType.DISEASE_SUBTYPE.value):
+            disease = node
+        else:
+            candidates = resolve_entity(
+                kg,
+                disease_name,
+                [NodeType.DISEASE.value, NodeType.DISEASE_SUBTYPE.value],
+                retriever=ctx.retriever,
+                domain=ctx.domain,
+            )
+            disease = candidates[0] if candidates else None
+
+    plan = kg.treatments_of(syndrome.id, disease_id=disease.id if disease else None)
+
+    def _render(rows: Sequence[Mapping[str, Any]], relation: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if row["relation"] != relation:
+                continue
+            target = kg.nodes.get(row["id"])
+            entry = node_brief(kg, target, with_sentence=False) if target else dict(row)
+            if include_composition and relation == EdgeType.USES_FORMULA.value and target:
+                entry["composition"] = [
+                    herb.name
+                    for _e, herb in kg.neighbours(target.id, {EdgeType.CONTAINS_HERB.value})
+                ][:40]
+            if row.get("evidence"):
+                entry["provenance"] = row["evidence"]
+            out.append(entry)
+        return out
+
+    def _block(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        return {
+            key: _render(rows, relation)[:10]
+            for relation, key in kg.TREATMENT_EDGES
+        }
+
+    specific = _block(plan["disease_specific"])
+    general = _block(plan["cross_disease_general"])
+    payload: Dict[str, Any] = {
         "syndrome": node_brief(kg, syndrome),
-        "treatment_principles": principles,
-        "formulas": formulas[:6],
-        "patent_medicines": [
-            node_brief(kg, t, with_sentence=False)
-            for _e, t in kg.neighbours(syndrome.id, {EdgeType.USES_PATENT_MEDICINE.value})
-        ][:10],
-        "external_therapies": [
-            node_brief(kg, t, with_sentence=False)
-            for _e, t in kg.neighbours(syndrome.id, {EdgeType.USES_EXTERNAL_THERAPY.value})
-        ][:10],
+        "disease": disease.name if disease else None,
+        "scope": plan["scope"],
+        # The pathway's own recommendation, and everything else, kept apart.
+        "disease_specific": specific,
+        "cross_disease_general": general,
         "direct_herbs": [
             node_brief(kg, t, with_sentence=False)
             for _e, t in kg.neighbours(syndrome.id, {EdgeType.USES_HERB_DIRECT.value})
         ][:10],
     }
     payload["documents"] = documents_block(kg, [syndrome.id])
-    covered = any(
-        payload[key]
-        for key in ("treatment_principles", "formulas", "patent_medicines", "external_therapies")
-    )
+
+    caveats: List[str] = []
+    if disease_name and disease is None:
+        caveats.append(
+            f"图谱未收录疾病 {disease_name!r}，以下治疗方案未按疾病条件化，"
+            f"不能确认属于该病的路径推荐。"
+        )
+    if plan.get("caveat"):
+        caveats.append(plan["caveat"])
+
+    has_specific = any(specific.values())
+    has_general = any(general.values())
+    if has_specific:
+        coverage = Coverage.SUPPORTED
+    elif has_general:
+        # The syndrome has treatments, but none this disease's guideline
+        # attests: real information, and a weaker claim than SUPPORTED.
+        coverage = Coverage.PARTIAL
+        caveats.append(
+            "本病指南未见针对该证候的治疗记载；下列方案来自该证候在其他疾病下的记录。"
+        )
+    else:
+        coverage = Coverage.EMPTY
+        caveats.append("该证候在图谱中没有关联任何治疗方案。")
+
     return ToolResult(
         tool=_PLAN_SPEC.name,
         ok=True,
-        coverage=Coverage.SUPPORTED if covered else Coverage.EMPTY,
+        coverage=coverage,
         data=payload,
-        caveats=[] if covered else ["该证候在图谱中没有关联任何治疗方案。"],
+        caveats=caveats,
     )

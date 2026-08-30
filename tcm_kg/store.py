@@ -536,6 +536,101 @@ class KGStore:
             )
         return out
 
+    #: The four Syndrome->Treatment relations, in the order a plan reads.
+    TREATMENT_EDGES: Tuple[Tuple[str, str], ...] = (
+        (EdgeType.TREATED_BY_PRINCIPLE.value, "treatment_principles"),
+        (EdgeType.USES_FORMULA.value, "formulas"),
+        (EdgeType.USES_PATENT_MEDICINE.value, "patent_medicines"),
+        (EdgeType.USES_EXTERNAL_THERAPY.value, "external_therapies"),
+    )
+
+    def disease_syndrome_docs(self, syndrome_id: str, disease_id: str) -> Set[str]:
+        """Documents that attest this syndrome *within this disease's* guideline."""
+        docs: Set[str] = set()
+        for edge in self.in_edges(
+            syndrome_id,
+            {EdgeType.HAS_SYNDROME.value, EdgeType.SUBTYPE_HAS_SYNDROME.value},
+        ):
+            if edge.source == disease_id:
+                docs.update(edge.source_docs)
+        return docs
+
+    def treatments_of(
+        self,
+        syndrome_id: str,
+        edge_types: Optional[Iterable[str]] = None,
+        *,
+        disease_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Treatments for a syndrome, split by whether *this disease* attests them.
+
+        ``Syndrome -> Treatment`` is stored as a global binary relation, but the
+        clinical fact is ternary: this disease's guideline, for this syndrome,
+        recommends this treatment.  Read globally, 补中益气汤 is "the formula for
+        脾胃虚弱证" whether the pathway at hand is 弱视, 吉兰巴雷综合征 or
+        糖尿病性胃轻瘫 -- three different guidelines, one answer.
+
+        Measured on this graph, the treatment edge shares no source document
+        with the current ``Disease -> Syndrome`` edge for **54% of the CP4
+        gold treatments**. That is not proof the treatment is wrong: 异病同治
+        (one syndrome, one treatment, many diseases) is a real principle and
+        the graph's document boundaries are not clinical boundaries. It does
+        mean the system cannot show that *this pathway* recommends it, which
+        is a different and weaker claim than the one a pathway agent should
+        make.
+
+        So both are returned, labelled:
+
+        ``disease_specific``
+            the treatment edge and the Disease->Syndrome edge share a document
+        ``cross_disease_general``
+            attested for the syndrome, but not in this disease's guideline
+
+        With no ``disease_id`` everything lands in ``cross_disease_general``
+        and ``scope`` says ``unscoped``: a caller that did not say which
+        disease it is treating has not earned the stronger label.
+        """
+        wanted = (
+            {str(e) for e in edge_types}
+            if edge_types is not None
+            else {e for e, _key in self.TREATMENT_EDGES}
+        )
+        context_docs = (
+            self.disease_syndrome_docs(syndrome_id, disease_id) if disease_id else set()
+        )
+        specific: List[Dict[str, Any]] = []
+        general: List[Dict[str, Any]] = []
+        for edge in self.out_edges(syndrome_id, wanted):
+            target = self.nodes.get(edge.target)
+            if target is None:
+                continue
+            row = {
+                "id": target.id,
+                "name": target.name,
+                "type": target.type,
+                "relation": edge.type,
+                "source_docs": list(edge.source_docs[:4]),
+                "evidence": edge.evidence_sentences()[:1],
+            }
+            shared = context_docs.intersection(edge.source_docs)
+            if shared:
+                row["shared_docs"] = sorted(shared)[:4]
+                specific.append(row)
+            else:
+                general.append(row)
+        return {
+            "disease": self.nodes[disease_id].name if disease_id in self.nodes else None,
+            "scope": "disease_conditioned" if disease_id else "unscoped",
+            "disease_specific": specific,
+            "cross_disease_general": general,
+            "caveat": (
+                "cross_disease_general 中的治法/方药在本证候下有出处，但未见于当前疾病的"
+                "指南文档；中医存在异病同治，故不等同于错误，但不能作为本路径的推荐依据。"
+            )
+            if general
+            else None,
+        }
+
     def preparation_markers(self, herb_id: str) -> Dict[str, List[str]]:
         """Preparation requirements attested for a herb, with their evidence.
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -137,6 +138,10 @@ class Dataset:
     items: List[Dict[str, Any]]
     mapping: FieldMapping
     path: Optional[Path] = None
+    #: Rows whose id collided with an earlier row and had to be suffixed.
+    #: Non-zero means the source file shipped duplicate keys; it is recorded in
+    #: the run manifest so a reader can see the harness imposed uniqueness.
+    n_renamed_ids: int = 0
 
     def __len__(self) -> int:
         return len(self.items)
@@ -566,8 +571,6 @@ def load_cp(path: str | Path) -> Dataset:
         item["_has_gold"] = bool(item["answer_letters"])
         item["_raw"] = dict(record)
         items.append(item)
-    from collections import Counter
-
     counts = Counter(i.get("subtask") for i in items)
     mapping.notes.append(f"subtasks: {dict(sorted(counts.items()))}")
     mapping.notes.append(
@@ -580,11 +583,64 @@ def load_cp(path: str | Path) -> Dataset:
 LOADERS = {"sdt": load_sdt, "pa": load_pa, "tcmsd": load_tcmsd, "cp": load_cp}
 
 
+class DatasetIntegrityError(ValueError):
+    """A loaded dataset violates an invariant the harness depends on."""
+
+
+def enforce_unique_case_ids(dataset: Dataset) -> int:
+    """Give every item a key of its own, and say when that had to be imposed.
+
+    ``case_id`` is the primary key of three separate mechanisms -- the gold
+    lookup in scoring, the ``(case_id, condition, sample)`` resume key, and
+    ``index_items`` for paired analysis -- and each is a dict, so a repeated
+    id means last-write-wins in all three.
+
+    A TCM-CP build once shipped 825 rows sharing 331 identifiers, and the
+    effect was not cosmetic: a model answering 弱视 was scored against
+    糖尿病性胃轻瘫's answer key, where the same treatment sits at a different
+    letter. Resuming a run silently collapsed the duplicates, so whether a run
+    had been interrupted changed its score, and none of it was visible in any
+    output.
+
+    Datasets this repository *generates* must never reach here with a
+    duplicate -- ``scripts/build_tcm_cp.py`` refuses to write a set that has
+    one. But released corpora are not ours to fix: TCM-SD's dev split ships
+    178 repeated ``user_id`` values over 181 rows. Refusing to load it would
+    make a real corpus unusable over a defect in its own distribution, so a
+    repeat is suffixed ``#2``, ``#3`` ... in file order instead. Deterministic,
+    so the key is stable across runs; and counted, so the manifest records that
+    it happened rather than the harness pretending the file was clean.
+
+    Returns the number of rows that had to be renamed.
+    """
+    seen: Counter = Counter()
+    renamed = 0
+    for item in dataset.items:
+        case_id = str(item.get("id") or "").strip()
+        if not case_id:
+            case_id = f"{dataset.name}-row"
+        seen[case_id] += 1
+        if seen[case_id] > 1:
+            item["id"] = f"{case_id}#{seen[case_id]}"
+            item.setdefault("_original_id", case_id)
+            renamed += 1
+        else:
+            item["id"] = case_id
+    if renamed:
+        dataset.mapping.notes.append(
+            f"{renamed} row(s) shared a case id with an earlier row and were "
+            f"suffixed to keep the key unique (source file defect)"
+        )
+    return renamed
+
+
 def load_dataset(path: str | Path, kind: str, **kwargs: Any) -> Dataset:
     key = str(kind).lower()
     if key not in LOADERS:
         raise ValueError(f"unknown dataset kind {kind!r}; known: {sorted(LOADERS)}")
-    return LOADERS[key](path, **kwargs)
+    dataset = LOADERS[key](path, **kwargs)
+    dataset.n_renamed_ids = enforce_unique_case_ids(dataset)
+    return dataset
 
 
 def inspect_dataset(path: str | Path, kind: str, **kwargs: Any) -> str:

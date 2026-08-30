@@ -4,13 +4,24 @@ import unittest
 
 import tcm_tools  # noqa: F401  (registers the tool surface)
 from tcm_kg.schema import Domain
-from tcm_tools.base import REGISTRY, Coverage, ToolBudget, ToolContext
+from tcm_tools.base import ToolPhase, REGISTRY, Coverage, ToolBudget, ToolContext
 
 from ._fixtures import graph, retriever
 
 
-def ctx(domain, budget=None):
-    return ToolContext(graph(), retriever(), domain, budget or ToolBudget())
+def ctx(domain, budget=None, phase=ToolPhase.AGENT):
+    return ToolContext(graph(), retriever(), domain, budget or ToolBudget(), phase=phase)
+
+
+def verify_ctx(domain, budget=None):
+    """A context on the verifier's side of the phase boundary.
+
+    The checkers and ``verify_tcm_decision`` are reachable only from here --
+    ``ToolRegistry.call`` refuses them from an agent context -- so a unit test
+    of a checker has to say which side it is standing on, exactly as the
+    runtime does.
+    """
+    return ctx(domain, budget, phase=ToolPhase.VERIFICATION)
 
 
 class RegistryTests(unittest.TestCase):
@@ -69,7 +80,7 @@ class DomainIsolationTests(unittest.TestCase):
 class CoverageSemanticsTests(unittest.TestCase):
     def test_dose_is_reported_as_not_covered_not_as_no_problem(self):
         result = REGISTRY.call(
-            "check_dose", ctx(Domain.SAFETY), {"items": [{"name": "附子", "dose": "30g"}]}
+            "check_dose", verify_ctx(Domain.SAFETY), {"items": [{"name": "附子", "dose": "30g"}]}
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.coverage, Coverage.NOT_COVERED)
@@ -82,7 +93,7 @@ class CoverageSemanticsTests(unittest.TestCase):
         # 半夏 and 附子 are a real 十八反 pair, and they co-occur in graph
         # formulas: exactly why co-occurrence must not be read as safety
         result = REGISTRY.call(
-            "check_combination", ctx(Domain.SAFETY), {"items": ["半夏", "附子"]}
+            "check_combination", verify_ctx(Domain.SAFETY), {"items": ["半夏", "附子"]}
         )
         self.assertEqual(result.coverage, Coverage.NOT_COVERED)
         pair = result.data["pairs"][0]
@@ -105,7 +116,7 @@ class DeterministicCheckerTests(unittest.TestCase):
     def test_decoction_requirement_is_grounded_and_attributed(self):
         result = REGISTRY.call(
             "check_decoction_requirement",
-            ctx(Domain.SAFETY),
+            verify_ctx(Domain.SAFETY),
             {"items": ["石膏", "大黄"], "claimed_requirement": "先煎"},
         )
         self.assertEqual(result.coverage, Coverage.SUPPORTED)
@@ -115,7 +126,7 @@ class DeterministicCheckerTests(unittest.TestCase):
 
     def test_duplicate_medication_detects_alias_repetition(self):
         result = REGISTRY.call(
-            "check_duplicate_medication", ctx(Domain.SAFETY), {"items": ["瓜蒌", "全瓜蒌"]}
+            "check_duplicate_medication", verify_ctx(Domain.SAFETY), {"items": ["瓜蒌", "全瓜蒌"]}
         )
         self.assertEqual(len(result.data["alias_duplicates"]), 1)
         self.assertEqual(
@@ -125,20 +136,20 @@ class DeterministicCheckerTests(unittest.TestCase):
     def test_verifier_contradicts_a_mismatched_disease_anchor(self):
         good = REGISTRY.call(
             "verify_tcm_decision",
-            ctx(Domain.CLINICAL),
+            verify_ctx(Domain.CLINICAL),
             {"syndrome": "心虚胆怯证", "disease": "心悸（心律失常-室性早搏）"},
         )
         self.assertEqual(good.data["overall"], "supported")
         bad = REGISTRY.call(
             "verify_tcm_decision",
-            ctx(Domain.CLINICAL),
+            verify_ctx(Domain.CLINICAL),
             {"syndrome": "心虚胆怯证", "disease": "消渴病肾病（糖尿病肾病）"},
         )
         self.assertEqual(bad.data["overall"], "contradicted")
 
     def test_verifier_is_silent_rather_than_negative_off_graph(self):
         result = REGISTRY.call(
-            "verify_tcm_decision", ctx(Domain.CLINICAL), {"syndrome": "杜撰不存在证"}
+            "verify_tcm_decision", verify_ctx(Domain.CLINICAL), {"syndrome": "杜撰不存在证"}
         )
         self.assertEqual(result.data["overall"], "not_in_graph")
 

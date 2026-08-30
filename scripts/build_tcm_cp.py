@@ -50,9 +50,10 @@ import json
 import random
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -83,6 +84,35 @@ def _stages_by_disease(kg: KGStore) -> Dict[str, List[Any]]:
     return out
 
 
+def _variant_of(stage: Any) -> str:
+    return str(stage.get("variant") or "").strip()
+
+
+def preceding_stages(stages: Sequence[Any], stage: Any) -> List[Any]:
+    """The stages this patient has actually been through, before ``stage``.
+
+    Only stages of the **same pathway variant**. Several diseases run parallel
+    variants -- 股肿病 has an acute course and a chronic one, 中风病 an acute
+    phase and a recovery phase -- and sorting the whole disease by
+    ``(variant, order)`` put every stage of the other variant in front of the
+    first stage of this one. A 中风病 recovery-phase patient was then described
+    as having completed the five acute-phase stages, which is a different
+    patient. A variant is an alternative course, not an earlier one, and
+    nothing in the graph says the acute course ends where the recovery course
+    begins.
+
+    Within a variant the ``order`` field is the pathway's own sequence, so the
+    prefix is exactly the treatment already given.
+    """
+    variant = _variant_of(stage)
+    same = sorted(
+        (s for s in stages if _variant_of(s) == variant),
+        key=lambda s: (s.get("order") or 0, str(s.id)),
+    )
+    index = next((i for i, s in enumerate(same) if s.id == stage.id), 0)
+    return same[:index]
+
+
 def _stage_signature(stage: Any, stages: Sequence[Any] = ()) -> frozenset:
     """What a CP2 vignette exposes about a stage, without naming the answer.
 
@@ -100,16 +130,16 @@ def _stage_signature(stage: Any, stages: Sequence[Any] = ()) -> frozenset:
         str(c).strip() for c in (stage.get("entry_criteria") or [])
     ]
     if stages:
-        ordered = sorted(
-            stages, key=lambda st: (str(st.get("variant") or ""), st.get("order") or 0)
-        )
-        index = next((i for i, st in enumerate(ordered) if st.id == stage.id), 0)
         prior = [
             f"done::{a}"
-            for earlier in ordered[:index]
+            for earlier in preceding_stages(stages, stage)
             for a in (earlier.get("day_actions") or [])
         ]
         base.extend(dict.fromkeys(prior))
+        # Two stages at the same position in different variants can otherwise
+        # share a signature entirely; the variant is part of what the vignette
+        # exposes, so it belongs in the signature.
+        base.append(f"variant::{_variant_of(stage)}")
     return frozenset(base)
 
 
@@ -170,9 +200,8 @@ def _history_line(
     stage of the admission fits. It states what has already happened, never
     what is due now -- that is what the item asks for.
     """
-    ordered = sorted(stages, key=lambda s: (str(s.get("variant") or ""), s.get("order") or 0))
-    index = next((i for i, s in enumerate(ordered) if s.id == stage.id), 0)
-    if index == 0:
+    earlier_stages = preceding_stages(stages, stage)
+    if not earlier_stages:
         # No "今日入院": naming the admission day makes "第1天" readable off the
         # question. State the clinical fact -- no pathway treatment has been
         # given yet -- and let the model infer the stage from it.
@@ -182,7 +211,7 @@ def _history_line(
     blocked = {b for b in (forbidden or set()) if b}
 
     done: List[str] = []
-    for earlier in ordered[:index]:
+    for earlier in earlier_stages:
         done.extend(_without_leaks([str(a) for a in (earlier.get("day_actions") or [])], blocked))
     unique = list(dict.fromkeys(done))[:5]
     line = "至本次查房，已完成的诊疗包括：" + "、".join(unique) if unique else "已按路径开始治疗"
@@ -267,20 +296,63 @@ def _vignette(
     return "".join(parts)
 
 
+#: Below this length a normalised string is too generic to treat as an answer
+#: echo: "检查" appears in half the corpus and blocking it would empty the
+#: vignettes without hiding anything a model could exploit.
+MIN_ECHO_LEN = 4
+
+
+def canon(text: str) -> str:
+    """Punctuation- and width-insensitive form, for comparing two strings.
+
+    Half- and full-width punctuation are the same mark to a reader and a
+    different byte to ``in``. Comparing raw substrings let
+    ``询问病史，检查乳房，中医舌脉诊`` sit in a vignette next to a gold answer
+    written with ``；`` -- the same sentence, and the leak check saw two.
+    """
+    text = unicodedata.normalize("NFKC", str(text))
+    return re.sub(r"[\s\W_]+", "", text)
+
+
 def _without_leaks(values: Sequence[str], blocked: Set[str]) -> List[str]:
     """Drop entries that would reveal a withheld answer.
 
-    Substring in both directions: a gold item hides inside a longer line
-    (``中医证候判断`` within ``完成皮损PRSS评分及中医证候判断``) as readily as a
-    longer gold item contains a shorter line.
+    Substring in both directions, on the canonical form: a gold item hides
+    inside a longer line (``中医证候判断`` within ``完成皮损PRSS评分及中医证候判断``)
+    as readily as a longer gold item contains a shorter line, and punctuation
+    differences hide it from a raw comparison entirely.
     """
-    if not blocked:
-        return [v.strip() for v in values if v.strip()]
-    return [
-        v.strip()
-        for v in values
-        if v.strip() and not any(b in v or v in b for b in blocked)
-    ]
+    canon_blocked = {c for c in (canon(b) for b in blocked) if len(c) >= MIN_ECHO_LEN}
+    out: List[str] = []
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        target = canon(value)
+        if any(b in target or target in b for b in canon_blocked):
+            continue
+        out.append(value)
+    return out
+
+
+def _distinct(texts: Iterable[str]) -> List[str]:
+    """De-duplicate on the canonical form, keeping the first spelling.
+
+    The graph holds near-duplicate nodes -- ``镇惊定志，养心安神`` and
+    ``镇惊定志，养心安神。`` are two TreatmentPrinciple nodes. Offered as two
+    options with one keyed correct, the item is unanswerable: a model that
+    picks the other spelling of the right answer is marked wrong.
+    """
+    seen: Set[str] = set()
+    out: List[str] = []
+    for text in texts:
+        text = str(text).strip()
+        key = canon(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
 
 
 def _progress_line(stages: Sequence[Any], stage: Any) -> str:
@@ -289,35 +361,44 @@ def _progress_line(stages: Sequence[Any], stage: Any) -> str:
     Used by CP5, which asks what the pathway requires monitoring: naming any
     monitoring item here would hand over the answer.
     """
-    ordered = sorted(stages, key=lambda s: (str(s.get("variant") or ""), s.get("order") or 0))
-    index = next((i for i, s in enumerate(ordered) if s.id == stage.id), 0)
-    if index == 0:
+    # Position within this patient's own variant: a recovery-phase patient at
+    # their first stage has not "completed the acute phase", and describing
+    # them mid-course would be a different patient.
+    variant = _variant_of(stage)
+    same = [s for s in stages if _variant_of(s) == variant]
+    before = len(preceding_stages(stages, stage))
+    if before == 0:
         return "患者尚未开始本路径的治疗，现按路径规定安排本阶段诊疗。"
-    if index >= len(ordered) - 1:
+    if before >= len(same) - 1:
         return "经前期治疗后病情稳定，现进入本路径的收尾阶段。"
     return "经前期治疗后症状有所缓解，病情平稳，现按路径进入下一诊疗节点。"
 
 
 def _options(correct: str, pool: Sequence[str], rng: random.Random, n: int = N_OPTIONS) -> Tuple[Dict[str, str], List[str]]:
-    distractors = [p for p in dict.fromkeys(pool) if p != correct]
+    # Comparison is on the canonical form, so a distractor that differs from
+    # the gold only by a trailing 。 is excluded rather than offered as a
+    # second correct answer.
+    blocked = canon(correct)
+    distractors = [p for p in _distinct(pool) if canon(p) != blocked]
     rng.shuffle(distractors)
     chosen = [correct] + distractors[: n - 1]
     rng.shuffle(chosen)
     options = {chr(ord("A") + i): text for i, text in enumerate(chosen)}
-    answer = [k for k, v in options.items() if v == correct]
+    answer = [k for k, v in options.items() if canon(v) == blocked]
     return options, answer
 
 
 def _multi_options(
     correct: Sequence[str], pool: Sequence[str], rng: random.Random, n: int = 8
 ) -> Tuple[Dict[str, str], List[str]]:
-    correct = list(dict.fromkeys(correct))[: n // 2]
-    distractors = [p for p in dict.fromkeys(pool) if p not in correct]
+    correct = _distinct(correct)[: n // 2]
+    blocked = {canon(c) for c in correct}
+    distractors = [p for p in _distinct(pool) if canon(p) not in blocked]
     rng.shuffle(distractors)
     chosen = correct + distractors[: max(0, n - len(correct))]
     rng.shuffle(chosen)
     options = {chr(ord("A") + i): text for i, text in enumerate(chosen)}
-    answer = sorted(k for k, v in options.items() if v in correct)
+    answer = sorted(k for k, v in options.items() if canon(v) in blocked)
     return options, answer
 
 
@@ -373,10 +454,12 @@ def build(
                     "syndrome": syndrome.name if syndrome else None,
                 }
 
-            ordered_stages = sorted(
-                stages, key=lambda st: (str(st.get("variant") or ""), st.get("order") or 0)
-            )
-            is_first = bool(ordered_stages) and ordered_stages[0].id == stage.id
+            # "First" means first of this stage's own variant. Under a
+            # whole-disease ordering the opening stage of every variant after
+            # the first counted as a mid-pathway stage, so it kept its "no
+            # pathway treatment yet" history line while escaping the
+            # first-stage cap that line exists to balance.
+            is_first = not preceding_stages(stages, stage)
 
             # ---- CP2: stage identification, distractors that really differ ----
             if stage in usable:
@@ -656,11 +739,19 @@ def exclusion_to_patient_fact(criterion: str) -> Optional[str]:
     return condition
 
 
-def _treatment_vignette(kg: KGStore, disease: Any, syndrome: Any) -> str:
+def _treatment_vignette(
+    kg: KGStore, disease: Any, syndrome: Any, blocked: Set[str]
+) -> str:
     presentation = kg.syndrome_presentation(syndrome.id, disease.id)
     text = f"患者因{disease.get('tcm_name') or disease.name}入院，辨证为{syndrome.name}。"
-    if presentation["scope"] == "disease_specific" and presentation["sentence"]:
-        text += f"四诊所见：{presentation['sentence'][:160]}"
+    sentence = presentation["sentence"] if presentation["scope"] == "disease_specific" else ""
+    # The "presentation" sentence is not always a 四诊 finding. For 急性腰扭伤
+    # / 气滞血瘀证 the graph's sentence is 活血化瘀，行气止痛 -- the treatment
+    # principle, which is the answer. Every treatment attested for this
+    # syndrome is withheld, not just the one this item asks for: a principle
+    # line can hand over the formula as readily as the principle.
+    if sentence and _without_leaks([sentence], blocked):
+        text += f"四诊所见：{sentence[:160]}"
     return text
 
 
@@ -677,45 +768,152 @@ def _treatment_items(
     formula, patent-medicine and external-therapy edges -- the bulk of the
     treatment sub-graph -- untested.
     """
+    # Withhold every treatment this syndrome has in any relation, so no CP4
+    # vignette can print any part of any CP4 answer.
+    all_treatments = kg.treatments_of(syndrome.id, disease_id=disease.id)
+    blocked = {
+        row["name"]
+        for scope in ("disease_specific", "cross_disease_general")
+        for row in all_treatments[scope]
+    }
     base = {
         "disease": disease.name,
         "stage_id": None,
         "stage_name": None,
         "syndrome": syndrome.name,
-        "vignette": _treatment_vignette(kg, disease, syndrome),
+        "vignette": _treatment_vignette(kg, disease, syndrome, blocked),
     }
     specs = [
-        ("principle", EdgeType.TREATED_BY_PRINCIPLE.value, "本证的治法是？", "CP4_treatment_principle"),
-        ("formula", EdgeType.USES_FORMULA.value, "本证推荐使用的方剂是？", "CP4_formula"),
-        ("patent", EdgeType.USES_PATENT_MEDICINE.value, "本证可选用的中成药是？", "CP4_patent_medicine"),
-        ("external", EdgeType.USES_EXTERNAL_THERAPY.value, "本证可采用的非药物外治疗法是？", "CP4_external_therapy"),
+        ("principle", EdgeType.TREATED_BY_PRINCIPLE.value, "本证在本病路径中的治法是？", "CP4_treatment_principle"),
+        ("formula", EdgeType.USES_FORMULA.value, "本证在本病路径中推荐使用的方剂是？", "CP4_formula"),
+        ("patent", EdgeType.USES_PATENT_MEDICINE.value, "本证在本病路径中可选用的中成药是？", "CP4_patent_medicine"),
+        ("external", EdgeType.USES_EXTERNAL_THERAPY.value, "本证在本病路径中可采用的非药物外治疗法是？", "CP4_external_therapy"),
     ]
     out: List[Dict[str, Any]] = []
     for suffix, edge_type, question, subtask in specs:
-        correct = [t.name for _e, t in kg.neighbours(syndrome.id, {edge_type})]
+        # Ask the graph for this syndrome's treatments *in this disease*. Read
+        # globally, 补中益气汤 is "the formula for 脾胃虚弱证" whether the
+        # pathway is 弱视, 吉兰巴雷综合征 or 糖尿病性胃轻瘫 -- and the first
+        # global edge became the gold for all three.
+        plan = kg.treatments_of(syndrome.id, {edge_type}, disease_id=disease.id)
+        grounded = [r["name"] for r in plan["disease_specific"]]
+        general = [r["name"] for r in plan["cross_disease_general"]]
+        correct = grounded or general
         if not correct:
             continue
+        # 异病同治 is real, so a treatment attested only outside this disease's
+        # guideline is not necessarily wrong -- but the item is weaker evidence
+        # and the report must be able to separate the two strata.
+        provenance = "disease_specific" if grounded else "cross_disease_general"
+        blocked = {canon(c) for c in grounded + general}
         pool = [
             t.name
             for other in siblings
             if other.id != syndrome.id
             for _e, t in kg.neighbours(other.id, {edge_type})
-            if t.name not in correct
+            if canon(t.name) not in blocked
         ]
-        if len(pool) < 3:
+        if len(_distinct(pool)) < 3:
             continue
         options, answer = _options(correct[0], pool, rng)
         out.append(
             {
                 **base,
-                "id": f"cp4{suffix}::{syndrome.id}",
+                # The disease belongs in the identifier. Without it every
+                # disease sharing a syndrome collided on one id: 331 keys over
+                # 825 rows, and because gold, resume and paired analysis all
+                # key on case_id, a model was scored against another disease's
+                # answer key -- with a different correct letter.
+                "id": f"cp4{suffix}::{disease.id}::{syndrome.id}",
                 "subtask": subtask,
                 "question": question,
                 "options": options,
                 "answer": answer,
+                "treatment_provenance": provenance,
             }
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# validation
+# --------------------------------------------------------------------------- #
+
+#: Invariants that make an item scoreable at all. A violation is not a quality
+#: concern to note in a report -- it silently corrupts scoring, so the build
+#: fails rather than writing the file.
+def validate(items: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]:
+    """Check every invariant the scorer, the runner and the analysis assume.
+
+    Written after a build shipped 825 rows sharing 331 identifiers, because
+    ``gold``, the resume key and ``index_items`` all key on ``case_id``. The
+    consequence was not an untidy file: a model answering one disease's item
+    was scored against another disease's answer key, with a different correct
+    letter, and whether a run had been resumed changed the result. No amount
+    of care in the generators substitutes for asserting the invariant, so the
+    build now asserts it.
+
+    Returns ``{check: [failing detail, ...]}`` -- empty when the set is sound.
+    """
+    failures: Dict[str, List[str]] = defaultdict(list)
+
+    seen: Dict[str, int] = Counter(str(i.get("id") or "") for i in items)
+    for case_id, n in sorted(seen.items()):
+        if not case_id:
+            failures["blank_id"].append("(empty)")
+        elif n > 1:
+            failures["duplicate_id"].append(f"{case_id} x{n}")
+
+    for item in items:
+        case_id = str(item.get("id") or "?")
+        options = item.get("options") or {}
+        answer = list(item.get("answer") or [])
+
+        if not options:
+            failures["no_options"].append(case_id)
+            continue
+        if not answer:
+            failures["no_gold"].append(case_id)
+            continue
+        missing = [a for a in answer if a not in options]
+        if missing:
+            failures["gold_not_in_options"].append(f"{case_id}: {missing}")
+
+        # Two options carrying the same answer make the item unanswerable: a
+        # model picking the other spelling of the right answer is marked wrong.
+        texts = Counter(canon(v) for v in options.values())
+        repeated = [t for t, n in texts.items() if n > 1 and t]
+        if repeated:
+            failures["duplicate_option_text"].append(case_id)
+
+        if len(options) - len(answer) < 2:
+            failures["too_few_distractors"].append(case_id)
+
+        # The answer must not be readable off the question.
+        gold_texts = {canon(options[a]) for a in answer if a in options}
+        haystack = canon(
+            " ".join(
+                str(item.get(field) or "")
+                for field in ("vignette", "question", "history", "progress")
+            )
+        )
+        for gold in gold_texts:
+            if len(gold) >= MIN_ECHO_LEN and gold in haystack:
+                failures["answer_echoed_in_question"].append(case_id)
+                break
+
+    return {k: v for k, v in failures.items() if v}
+
+
+def format_validation(failures: Mapping[str, Sequence[str]]) -> str:
+    lines = []
+    for check, details in sorted(failures.items()):
+        lines.append(f"  {check}: {len(details)}")
+        for detail in list(details)[:5]:
+            lines.append(f"      {detail}")
+        if len(details) > 5:
+            lines.append(f"      ... and {len(details) - 5} more")
+    return "\n".join(lines)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -728,6 +926,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     kg = load_kg(args.kg)
     items, report = build(kg, seed=args.seed, limit=args.limit)
+
+    failures = validate(items)
+    ids = [str(i.get("id") or "") for i in items]
+    report["n_unique_ids"] = len(set(ids))
+    report["duplicate_ids"] = len(ids) - len(set(ids))
+    report["validation"] = {k: len(v) for k, v in failures.items()}
+    report["treatment_provenance"] = dict(
+        sorted(Counter(i["treatment_provenance"] for i in items if "treatment_provenance" in i).items())
+    )
+    if failures:
+        print("REFUSING to write: the generated set violates its invariants.", file=sys.stderr)
+        print(format_validation(failures), file=sys.stderr)
+        return 2
+
     target = Path(args.out)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -739,6 +951,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for subtask, n in report["by_subtask"].items():
         print(f"  {subtask:30s} {n}")
     print(f"  diseases covered: {report['n_diseases']}")
+    print(f"  unique case ids:  {report['n_unique_ids']} (duplicates: {report['duplicate_ids']})")
+    if report["treatment_provenance"]:
+        print("  CP4 treatment provenance:")
+        for scope, n in report["treatment_provenance"].items():
+            print(f"    {scope:34s} {n}")
     print("  dropped as unusable:")
     for reason, n in report["dropped"].items():
         print(f"    {reason:34s} {n}")

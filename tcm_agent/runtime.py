@@ -429,7 +429,11 @@ class AgentRuntime:
         except Exception as exc:  # one bad case must not lose the branch group
             shared.error = f"{type(exc).__name__}: {exc}"
             result, ctx = None, ToolContext(
-                self.kg, self.retriever, self.task.domain, self.config.tool_budget
+                self.kg,
+                self.retriever,
+                self.task.domain,
+                self.config.tool_budget,
+                phase=ToolPhase.AGENT,
             )
         shared.wall_ms = (time.perf_counter() - started) * 1000
 
@@ -466,7 +470,16 @@ class AgentRuntime:
         self, item: Mapping[str, Any], condition: str, trace: Trace, sample: int
     ) -> Tuple[Optional[Dict[str, Any]], ToolContext]:
         """The tool-using reasoning loop, up to and including the first answer."""
-        ctx = ToolContext(self.kg, self.retriever, self.task.domain, self.config.tool_budget)
+        # Agent phase: the registry refuses a verification-phase tool here even
+        # if the model names one, so M3 is unverified by construction rather
+        # than by the tool list happening not to mention the checkers.
+        ctx = ToolContext(
+            self.kg,
+            self.retriever,
+            self.task.domain,
+            self.config.tool_budget,
+            phase=ToolPhase.AGENT,
+        )
         system = self.task.system_prompt(condition) + "\n" + self._tool_protocol()
         messages: List[Message] = [
             Message("system", system),
@@ -656,6 +669,7 @@ class AgentRuntime:
             self.retriever,
             self.task.domain,
             ToolBudget(max_calls=max(4, 2 * len(plans)), max_calls_per_tool=max(4, len(plans))),
+            phase=ToolPhase.VERIFICATION,
         )
         checks: List[Dict[str, Any]] = []
         for plan in plans:

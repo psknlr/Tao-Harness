@@ -206,12 +206,19 @@ class ToolContext:
         retriever: KGRetriever,
         domain: Domain | str,
         budget: Optional[ToolBudget] = None,
+        phase: ToolPhase = ToolPhase.AGENT,
     ):
         self.kg = kg
         self.retriever = retriever
         self.domain: Domain = Domain(domain) if isinstance(domain, str) else domain
         self.policy: DomainPolicy = policy_for(self.domain)
         self.budget = budget or ToolBudget()
+        #: Which side of the agent/verifier boundary this context sits on.
+        #: Enforced in ``ToolRegistry.call``: withholding a tool from the
+        #: prompt is not isolation, it is obscurity -- a model that names
+        #: ``check_dose`` anyway would otherwise execute it, and M3 would be
+        #: an optionally self-checking arm after all.
+        self.phase: ToolPhase = phase
         self.calls: List[ToolCallRecord] = []
         self._per_tool: Dict[str, int] = {}
 
@@ -330,6 +337,18 @@ class ToolRegistry:
         if ctx.domain not in spec.domains:
             return _fail(
                 f"tool {name!r} is not available in domain {ctx.domain.value!r}"
+            )
+        # Phase is a real boundary, checked here rather than only omitted from
+        # the prompt. The agent never sees the PA checkers or the verifier in
+        # its tool list, but a model can produce a name it was never shown --
+        # from its own priors, or from an earlier turn of a long context -- and
+        # before this check it was executed. The M3C->M4 contrast claims the
+        # verification evidence is the only difference between the arms; that
+        # only holds if an M3 agent cannot obtain it by asking.
+        if spec.phase is not ToolPhase.BOTH and spec.phase is not ctx.phase:
+            return _fail(
+                f"tool {name!r} belongs to the {spec.phase.value} phase and cannot "
+                f"be called from the {ctx.phase.value} phase"
             )
         breach = ctx.check_budget(name)
         if breach:

@@ -296,6 +296,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         extra={
             "case_ids": case_ids,
             "case_set_sha256": case_set,
+            "n_unique_case_ids": len(set(case_ids)),
+            # non-zero means the source file shipped duplicate keys and the
+            # loader had to impose uniqueness; a reader should know
+            "n_renamed_case_ids": dataset.n_renamed_ids,
             "run_signatures": {k: _signature(k) for k in config.models if k in specs},
         },
         allow_conflict=bool(getattr(args, "new_run", False)),
