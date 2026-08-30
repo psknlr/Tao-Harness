@@ -64,6 +64,16 @@ COMPUTE_MATCHED: Mapping[str, str] = {"M2C": "M3", "M3C": "M4"}
 BRANCHABLE: Tuple[str, ...] = ("M3", "M3C", "M4")
 _BRANCHABLE = BRANCHABLE
 
+#: Arms that must be generated in the same invocation as ``BRANCHABLE``.
+#: M2C does not share M3's trajectory -- different prompt, different knowledge
+#: condition -- but it has to spend the same number of model calls *on this
+#: case*, which it can only know once M3 has run. Generating it separately left
+#: the two matched on the mean and unmatched on every individual pair.
+CO_GENERATED: Tuple[str, ...] = ("M2C",)
+
+#: Everything one ``run_branch_group`` call can produce.
+GROUPED: Tuple[str, ...] = BRANCHABLE + CO_GENERATED
+
 
 def _stratum(report: Mapping[str, Any]) -> str:
     """How much the verification pass could actually say about this item."""
@@ -111,6 +121,7 @@ def _copy_trace(source: Trace, condition: str) -> Trace:
         model_key=source.model_key,
         framework_hash=source.framework_hash,
         run_signature=source.run_signature,
+        design_signature=source.design_signature,
         sample=source.sample,
         started_at=source.started_at,
     )
@@ -203,6 +214,10 @@ class FrameworkConfig:
     #: scaffold and must stay equal across models, while the signature also
     #: pins the model and the code and so differs between them.
     run_signature: str = ""
+    #: The design fingerprint (apparatus + conditions + samples + sampling).
+    #: Like ``run_signature`` it is set by the runner and stamped on traces,
+    #: and like it, it stays out of ``framework_hash``.
+    design_signature: str = ""
 
     def framework_hash(self) -> str:
         payload = json.dumps(
@@ -228,6 +243,7 @@ class FrameworkConfig:
         return {
             "framework_hash": self.framework_hash(),
             "run_signature": self.run_signature,
+            "design_signature": self.design_signature,
             "task": self.task,
             "domain": self.domain,
             "kg_hash": self.kg_hash[:16],
@@ -276,6 +292,7 @@ class AgentRuntime:
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
             run_signature=self.config.run_signature,
+            design_signature=self.config.design_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )
@@ -309,7 +326,12 @@ class AgentRuntime:
 
     # ------------------------------------------------- M2C: compute control
     def _run_iterative_control(
-        self, item: Mapping[str, Any], trace: Trace, sample: int
+        self,
+        item: Mapping[str, Any],
+        trace: Trace,
+        sample: int,
+        *,
+        target_calls: Optional[int] = None,
     ) -> None:
         """M2C: M2's knowledge, M3's thinking budget, no adaptive tools.
 
@@ -325,6 +347,15 @@ class AgentRuntime:
         KG context block M2 receives**, and is given the turn budget M3 gets,
         with no tool access. Each turn it is prompted onward with no new
         information, so no further evidence enters while the compute matches.
+
+        ``target_calls`` pins it to the number of model calls its **M3 twin
+        spent on this same case**. Without it the model decided for itself when
+        to answer, so one case could give M2C two calls and M3 six while the
+        averages agreed to within a few percent -- and a mean is not a match.
+        Under a per-case pin the arm cannot answer early (it is told to keep
+        reasoning) and cannot run long (the last turn demands an answer), so
+        ``M2C→M3`` holds test-time compute fixed case by case, which is the
+        only version of that claim a paired test supports.
         """
         system = (
             self.task.system_prompt("M2")
@@ -343,8 +374,22 @@ class AgentRuntime:
         budget = self.config.tool_budget.max_calls
         result: Optional[Dict[str, Any]] = None
         format_failures = 0
+        # Format retries are model calls too, so the pin counts calls made, not
+        # loop iterations -- otherwise a control that stumbled on format would
+        # overspend its twin and break the very parity it exists to hold.
+        limit = target_calls if target_calls and target_calls > 0 else None
+        max_turns = self.config.max_agent_turns if limit is None else limit
 
-        for turn in range(self.config.max_agent_turns):
+        for turn in range(max_turns):
+            final_turn = limit is not None and trace.n_llm_calls >= limit - 1
+            if final_turn:
+                messages.append(
+                    Message(
+                        "user",
+                        "本轮为最后一轮，请立即给出最终答案，"
+                        '格式为 {"action": "answer", "result": {...}}。',
+                    )
+                )
             outcome = self._ask(messages, trace, phase="reason", sample=sample)
             if outcome.value is None:
                 format_failures += 1
@@ -361,7 +406,26 @@ class AgentRuntime:
             trace.llm_steps[-1].action = action or "unparsed"
             if action == "answer" or "result" in outcome.value:
                 payload = outcome.value.get("result")
-                result = payload if isinstance(payload, Mapping) else outcome.value
+                answer = payload if isinstance(payload, Mapping) else outcome.value
+                if limit is not None and trace.n_llm_calls < limit:
+                    # Answering early would leave this case cheaper than its
+                    # twin. Keep the answer as a fallback in case the model
+                    # never produces another parseable one, and spend the rest
+                    # of the budget reconsidering -- which is exactly what the
+                    # arm it matches is doing with its extra turns.
+                    result = dict(answer)
+                    messages.append(
+                        Message("assistant", json.dumps(outcome.value, ensure_ascii=False))
+                    )
+                    messages.append(
+                        Message(
+                            "user",
+                            "请再复核一次上述结论，可以修改也可以维持，"
+                            "然后再次以相同格式输出最终答案。",
+                        )
+                    )
+                    continue
+                result = answer
                 break
             if action == "think" and budget > 0:
                 budget -= 1
@@ -379,6 +443,11 @@ class AgentRuntime:
 
         if result is None and trace.error is None:
             trace.error = "control arm exhausted its turn budget without answering"
+        if limit is not None and trace.n_llm_calls != limit:
+            trace.parity_error = (
+                f"compute parity broken: M2C used {trace.n_llm_calls} LLM calls, "
+                f"M3 used {limit}"
+            )
         if result is not None:
             trace.final = self.task.normalise_result(result, item)
             trace.final_raw = json.dumps(result, ensure_ascii=False)
@@ -408,8 +477,12 @@ class AgentRuntime:
         study rather than the muddiest.
         """
         wanted = [c for c in conditions if c in _BRANCHABLE]
+        also = [c for c in conditions if c in CO_GENERATED]
         if not wanted:
-            return {}
+            # M2C alone cannot be pinned: there is no M3 to match. Run it
+            # unpinned and let it say so, rather than silently claiming a
+            # compute match that was never established.
+            return {c: self.run(item, c, sample=sample) for c in also}
 
         shared = Trace(
             run_id=self.run_id,
@@ -419,6 +492,7 @@ class AgentRuntime:
             model_key=self.model.name,
             framework_hash=self.config.framework_hash(),
             run_signature=self.config.run_signature,
+            design_signature=self.config.design_signature,
             sample=sample,
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         )
@@ -451,6 +525,32 @@ class AgentRuntime:
                 branch.final = self.task.normalise_result(branch_result, item)
                 branch.final_raw = json.dumps(branch_result, ensure_ascii=False)
             out[condition] = branch
+
+        # M2C last, pinned to what M3 actually spent on this case.
+        for condition in also:
+            control = Trace(
+                run_id=self.run_id,
+                case_id=shared.case_id,
+                dataset=shared.dataset,
+                condition=condition,
+                model_key=shared.model_key,
+                framework_hash=shared.framework_hash,
+                run_signature=shared.run_signature,
+                design_signature=shared.design_signature,
+                sample=sample,
+                started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+            )
+            control.branch_group = shared.branch_group
+            started_control = time.perf_counter()
+            try:
+                self._run_iterative_control(
+                    item, control, sample, target_calls=shared.n_llm_calls
+                )
+            except Exception as exc:
+                control.error = f"{type(exc).__name__}: {exc}"
+            control.wall_ms = (time.perf_counter() - started_control) * 1000
+            out[condition] = control
+
         _check_compute_parity(out)
         return out
 

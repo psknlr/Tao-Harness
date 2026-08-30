@@ -29,7 +29,7 @@ from .scorers import (
     aggregate,
 )
 from .stats import (
-    stratified_macro_bootstrap,
+    hierarchical_macro_bootstrap,
     PairedResult,
     cluster_paired_bootstrap,
     holm_bonferroni,
@@ -125,6 +125,10 @@ def paired_clusters(
     ]
 
 
+#: Arm pairs that a single invocation produces together.
+_SHARED_TRAJECTORY = frozenset({("M3", "M3C"), ("M3", "M4"), ("M3C", "M4"), ("M2C", "M3")})
+
+
 def _usable_pairs(
     index: Mapping[Tuple[str, str], Mapping[str, ScoredItem]],
     model: str,
@@ -146,11 +150,22 @@ def _usable_pairs(
     """
     a = index.get((model, left), {})
     b = index.get((model, right), {})
+    #: Contrasts whose arms are generated together and must come from the same
+    #: invocation. A resume that regenerated only one of them would otherwise
+    #: pair a fresh trajectory against a stale one, and the contrast -- whose
+    #: whole claim is that one thing differs between the arms -- would silently
+    #: become a comparison of two independent runs.
+    same_group = (left, right) in _SHARED_TRAJECTORY
     out: List[Tuple[str, ScoredItem, ScoredItem]] = []
     for case_id in sorted(set(a) & set(b)):
         li, ri = a[case_id], b[case_id]
         if li.trace_metrics.get("parity_error") or ri.trace_metrics.get("parity_error"):
             continue
+        if same_group:
+            left_group = li.trace_metrics.get("branch_group")
+            right_group = ri.trace_metrics.get("branch_group")
+            if not left_group or left_group != right_group:
+                continue
         if stratum is not None:
             observed = ri.trace_metrics.get("verification_stratum") or li.trace_metrics.get(
                 "verification_stratum"
@@ -167,18 +182,25 @@ def _usable_pairs(
 def dropped_for_parity(
     items: Sequence[ScoredItem], left: str, right: str
 ) -> Dict[str, int]:
-    """How many pairs each model lost to a compute-parity break."""
+    """How many pairs each model lost, and why: parity break or split group."""
     index = index_items(items)
+    same_group = (left, right) in _SHARED_TRAJECTORY
     out: Dict[str, int] = {}
     for model in sorted({i.model_key for i in items}):
         a = index.get((model, left), {})
         b = index.get((model, right), {})
-        out[model] = sum(
-            1
-            for case_id in set(a) & set(b)
-            if a[case_id].trace_metrics.get("parity_error")
-            or b[case_id].trace_metrics.get("parity_error")
-        )
+        dropped = 0
+        for case_id in set(a) & set(b):
+            li, ri = a[case_id], b[case_id]
+            if li.trace_metrics.get("parity_error") or ri.trace_metrics.get("parity_error"):
+                dropped += 1
+            elif same_group and (
+                not li.trace_metrics.get("branch_group")
+                or li.trace_metrics.get("branch_group")
+                != ri.trace_metrics.get("branch_group")
+            ):
+                dropped += 1
+        out[model] = dropped
     return out
 
 
@@ -424,11 +446,13 @@ def cp_macro_contrast_table(
 ) -> Tuple[str, Dict[str, PairedResult]]:
     """Condition contrasts on the CP macro-average.
 
-    Built with ``stratified_macro_bootstrap`` so the interval describes the
-    same quantity as the point estimate: resample diseases within each subtask,
-    average within subtask, then weight the six families equally. Using the
-    pooled cluster bootstrap here would give an interval for a different
-    estimand than the one reported above it.
+    Built with ``hierarchical_macro_bootstrap`` so the interval describes the
+    same quantity as the point estimate, at every level: resample diseases
+    within each subtask, average within subtask, average the subtasks of a
+    family, then weight the six families equally. Two levels are not enough --
+    averaging straight from nine subtasks to one number gives CP4, which is one
+    capability probed four ways, four ninths of the weight instead of one
+    sixth.
     """
     scoped = [i for i in items if i.dataset == "cp"]
     index = index_items(scoped)
@@ -444,10 +468,19 @@ def cp_macro_contrast_table(
             strata = [
                 str(li.metrics.get("subtask") or "unknown") for _c, li, _r in pairs
             ]
+            # The families the point estimate weights equally. Passing the nine
+            # subtasks straight in gave CP4 a weight of 4/9 while the table
+            # above gave it 1/6 -- on a CP4-only improvement the table said
+            # Δ=0.167 and the test said Δ=0.444, so the interval and the
+            # p-value described a quantity that appeared nowhere else.
+            fams = [
+                str(li.metrics.get("cp_family") or cp_family(li.metrics.get("subtask", "")))
+                for _c, li, _r in pairs
+            ]
             clusters = [
                 str(li.metrics.get("disease") or case_id) for case_id, li, _r in pairs
             ]
-            result = stratified_macro_bootstrap(xs, ys, strata, clusters)
+            result = hierarchical_macro_bootstrap(xs, ys, strata, fams, clusters)
             key = f"cp-macro|{model}|{left}->{right}"
             results[key] = result
             rows.append(

@@ -104,6 +104,7 @@ IMMUTABLE_MANIFEST_KEYS: Sequence[str] = (
     "task",
     "domain",
     "framework_hash",
+    "design_signature",
     "kg_content_sha256",
     "dataset_sha256",
     "dataset_results_sha256",
@@ -141,6 +142,49 @@ def run_signature(
         "model": model_fingerprint,
         "case_set": case_set,
         "code": dict(sorted((code or code_fingerprints()).items())),
+    }
+    import json as _json
+
+    return hashlib.sha256(
+        _json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def design_signature(
+    *,
+    run_signature: str,
+    conditions: Sequence[str],
+    samples: int,
+    limit: Optional[int] = None,
+    stratify: Optional[str] = None,
+) -> str:
+    """What the experiment *is*, on top of the apparatus that runs it.
+
+    ``run_signature`` deliberately omits the condition, so the arms of one
+    experiment share it and can be pooled. That leaves a hole one level up: the
+    condition list, the sample count and the sampling rule are not in any
+    fingerprint, so narrowing a config does not change what a recorded trace
+    matches.
+
+    Run seven arms, then edit the config down to ``[M0, M1]``: the M2..M4
+    traces still carry a matching signature, resume keeps them, and the
+    manifest says the experiment has two arms while the trace file holds
+    seven. Drop ``samples`` from 3 to 1 and the extra samples survive as
+    ordinary items -- scoring no longer runs consensus over them, so they are
+    counted individually and one case gets three times the weight of its
+    neighbours.
+
+    Neither is detectable from the apparatus signature, because neither
+    changes the apparatus. This is the fingerprint for the *design*: it selects
+    the output directory's identity, gates resume, and is recorded in the
+    manifest so a report can state which experiment produced it.
+    """
+    payload = {
+        "apparatus": run_signature,
+        "conditions": sorted(str(c) for c in conditions),
+        "samples": int(samples),
+        "limit": limit,
+        "stratify": stratify or "",
     }
     import json as _json
 

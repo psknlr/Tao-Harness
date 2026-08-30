@@ -74,6 +74,10 @@ class Trace:
     #: which the framework hash alone cannot tell you, because it is designed
     #: to stay equal across models.
     run_signature: str = ""
+    #: The apparatus signature plus the experiment's own design -- condition
+    #: list, sample count, sampling rule. Narrowing a config does not change
+    #: the apparatus, so without this a trace from a dropped arm still matched.
+    design_signature: str = ""
     sample: int = 0
     llm_steps: List[LLMStep] = field(default_factory=list)
     tool_steps: List[ToolStep] = field(default_factory=list)
@@ -167,6 +171,7 @@ class Trace:
             "model_key": self.model_key,
             "framework_hash": self.framework_hash,
             "run_signature": self.run_signature,
+            "design_signature": self.design_signature,
             "sample": self.sample,
             "started_at": self.started_at,
             "branch_group": self.branch_group,
@@ -206,6 +211,7 @@ class Trace:
             model_key=str(payload.get("model_key", "")),
             framework_hash=str(payload.get("framework_hash", "")),
             run_signature=str(payload.get("run_signature", "")),
+            design_signature=str(payload.get("design_signature", "")),
             sample=int(payload.get("sample", 0)),
             static_context_chars=int(payload.get("static_context_chars", 0)),
             final=payload.get("final"),
