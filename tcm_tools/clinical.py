@@ -187,12 +187,29 @@ def retrieve_clinical_context(ctx: ToolContext, args: Mapping[str, Any]) -> Tool
     subtypes: List[Dict[str, Any]] = []
     for edge, target in kg.neighbours(disease.id, {EdgeType.HAS_SUBTYPE.value}):
         entry = node_brief(kg, target, with_sentence=False)
-        entry["syndromes"] = kg.syndromes_of(target.id)[:max_syndromes]
+        # syndrome_contexts, not syndromes_of: the latter is entered at a
+        # Disease and looks for HAS_SYNDROME, which a subtype does not have --
+        # so this returned an empty list for all 116 subtypes in the graph that
+        # actually carry syndromes, and the tool showed the subtype's name with
+        # nothing under it.
+        entry["syndromes"] = [
+            {
+                "id": row["syndrome_id"],
+                "name": row["syndrome"],
+                "presentation": row["evidence"],
+                "scope": row["scope"],
+                "source_docs": row["source_docs"],
+            }
+            for row in kg.syndrome_contexts(target.id)
+        ][:max_syndromes]
         subtypes.append(entry)
     payload["subtypes"] = subtypes
 
     # Presentations come from the disease's own edges, not the syndrome's
     # global first mention -- see KGStore.syndrome_presentation.
+    # Disease-level *and* subtype-routed syndromes, each labelled with where it
+    # sits. 25 of the 299 pathway diseases have no direct Disease->Syndrome
+    # edge at all, so a disease-level-only view showed them no syndromes.
     syndromes: List[Dict[str, Any]] = []
     for edge, target in kg.neighbours(disease.id, {EdgeType.HAS_SYNDROME.value}):
         entry = node_brief(kg, target, with_sentence=False)
@@ -369,11 +386,21 @@ def _siblings(ctx: ToolContext, syndrome: Node, diseases: Sequence[Mapping[str, 
     out: List[Dict[str, Any]] = []
     seen = {syndrome.id}
     for entry in diseases[:2]:
-        for sibling in kg.syndromes_of(entry["id"]):
-            if sibling["id"] in seen:
+        for row in kg.syndrome_contexts(entry["id"]):
+            if row["syndrome_id"] in seen:
                 continue
-            seen.add(sibling["id"])
-            out.append(sibling)
+            seen.add(row["syndrome_id"])
+            out.append(
+                {
+                    "id": row["syndrome_id"],
+                    "name": row["syndrome"],
+                    "presentation": row["evidence"],
+                    "scope": row["scope"],
+                    "via": row["via"],
+                    "subtype": row["subtype"],
+                    "source_docs": row["source_docs"],
+                }
+            )
     return out[:10]
 
 

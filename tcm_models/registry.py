@@ -6,12 +6,20 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .base import LLMClient, ModelSpec
-from .providers import EchoClient, GeminiClient, OpenAICompatClient
+from .providers import (
+    EchoClient,
+    GeminiClient,
+    MiniMaxClient,
+    OpenAICompatClient,
+    PoeClient,
+)
 from .replay import CachedClient, GenerationCache
 
 PROVIDERS: Dict[str, Any] = {
     "openai_compat": OpenAICompatClient,
     "gemini": GeminiClient,
+    "minimax": MiniMaxClient,
+    "poe": PoeClient,
     "echo": EchoClient,
 }
 

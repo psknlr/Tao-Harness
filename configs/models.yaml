@@ -55,12 +55,36 @@ models:
     output_usd_per_mtok: 8.00
 
   minimax:
-    provider: openai_compat
+    # Dedicated adapter, not openai_compat: MiniMax returns API errors with
+    # HTTP 200 and a non-zero base_resp.status_code, which the generic client
+    # reads as a successful empty answer -- lowering MiniMax's answered rate
+    # for a reason that is not the model. It may also report only
+    # total_tokens; the adapter records that as-is rather than inventing a
+    # prompt/completion split.
+    provider: minimax
     model_id: MiniMax-Text-01
     base_url: https://api.minimax.chat/v1
     api_key_env: MINIMAX_API_KEY
     input_usd_per_mtok: 0.20
     output_usd_per_mtok: 1.10
+
+  # Poe's OpenAI-compatible gateway. Useful for reaching a model whose
+  # first-party API you cannot get, at a real cost to reproducibility: the
+  # model_id is a Poe *bot*, and a bot can be repointed at a different upstream
+  # snapshot without its name changing, so the manifest cannot pin a snapshot
+  # the way a first-party endpoint can. Prefer a first-party adapter where one
+  # exists, and say in the paper which models came through here.
+  #
+  # Sampling controls are forwarded but not guaranteed: run
+  #   python -m runner.benchmark_runner smoke --models poe
+  # and trust its seed-determinism column over any assumption.
+  poe:
+    provider: poe
+    model_id: GPT-4o          # a Poe bot name, not a snapshot id
+    base_url: https://api.poe.com/v1
+    api_key_env: POE_API_KEY
+    input_usd_per_mtok: 0.0   # Poe bills in compute points, not per token
+    output_usd_per_mtok: 0.0
 
   # Offline model used by the test suite and by `--dry-run`.
   echo:

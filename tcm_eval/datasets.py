@@ -142,6 +142,12 @@ class Dataset:
     #: Non-zero means the source file shipped duplicate keys; it is recorded in
     #: the run manifest so a reader can see the harness imposed uniqueness.
     n_renamed_ids: int = 0
+    #: The gold-answer file the loader actually resolved, which for SDT is
+    #: discovered rather than configured. Only an explicitly configured path
+    #: used to be hashed, so swapping the discovered file after generation
+    #: would let `score` re-grade recorded predictions against different
+    #: answers while every fingerprint still matched.
+    gold_path: Optional[Path] = None
 
     def __len__(self) -> int:
         return len(self.items)
@@ -173,16 +179,19 @@ class Dataset:
             wanted = {str(i) for i in ids}
             items = [i for i in items if str(i.get("id")) in wanted]
         if limit is None:
-            return Dataset(self.name, items, self.mapping, self.path)
+            return Dataset(self.name, items, self.mapping, self.path,
+                       n_renamed_ids=self.n_renamed_ids, gold_path=self.gold_path)
 
         if not stratify:
-            return Dataset(self.name, items[:limit], self.mapping, self.path)
+            return Dataset(self.name, items[:limit], self.mapping, self.path,
+                           n_renamed_ids=self.n_renamed_ids, gold_path=self.gold_path)
 
         buckets: Dict[str, List[Mapping[str, Any]]] = {}
         for item in items:
             buckets.setdefault(str(item.get(stratify) or "unknown"), []).append(item)
         if len(buckets) < 2:
-            return Dataset(self.name, items[:limit], self.mapping, self.path)
+            return Dataset(self.name, items[:limit], self.mapping, self.path,
+                           n_renamed_ids=self.n_renamed_ids, gold_path=self.gold_path)
 
         take = {key: 0 for key in buckets}
         remaining = min(limit, len(items))
@@ -200,7 +209,8 @@ class Dataset:
 
         chosen = {id(i) for key in buckets for i in buckets[key][: take[key]]}
         picked = [i for i in items if id(i) in chosen]  # original order
-        return Dataset(self.name, picked, self.mapping, self.path)
+        return Dataset(self.name, picked, self.mapping, self.path,
+                       n_renamed_ids=self.n_renamed_ids, gold_path=self.gold_path)
 
     @property
     def n_labelled(self) -> int:
@@ -446,7 +456,15 @@ def load_sdt(path: str | Path, *, results_path: Optional[str | Path] = None) -> 
             f"{unlabelled}/{len(items)} items have no gold answer; "
             f"they will be generated but not scored"
         )
-    return Dataset("sdt", items, mapping, target)
+    return Dataset(
+        "sdt",
+        items,
+        mapping,
+        target,
+        # The discovered file, not just a configured one: this is what the
+        # manifest hashes, so replacing it after generation is detectable.
+        gold_path=Path(gold_source) if gold_source and Path(gold_source).exists() else None,
+    )
 
 
 def _explanatory_text(item: Mapping[str, Any]) -> str:

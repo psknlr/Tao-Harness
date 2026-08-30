@@ -568,6 +568,84 @@ class KGStore:
                 out.append(_row(edge, syndrome, subtype))
         return out
 
+    def syndrome_contexts(
+        self, node_id: str, *, include_subtypes: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Every ``(disease, subtype, syndrome)`` context under a node.
+
+        The one place that walks the disease hierarchy, so the four callers
+        that need it -- SDT static context, ``retrieve_clinical_context``,
+        ``retrieve_syndrome_evidence`` and the TCM-CP builder -- cannot drift
+        apart. They previously each did their own traversal and each got it
+        wrong differently.
+
+        Two things this returns that :meth:`syndromes_of` cannot:
+
+        * **It accepts a subtype.** ``syndromes_of`` is entered at a Disease
+          and walks down; called with a ``DiseaseSubtype`` id it looked for
+          ``HAS_SYNDROME`` edges that a subtype does not have, and returned
+          empty for all 116 subtypes in this graph that carry syndromes.
+        * **It does not deduplicate by syndrome.** A syndrome can sit under
+          several subtypes of one disease -- 气滞血瘀证 in both the acute and
+          the recovery phase -- and those are different clinical facts, at
+          different points in a pathway. Collapsing them to one row loses 8
+          contexts here, and loses exactly the distinction a stage-aware agent
+          needs.
+
+        Use :meth:`syndromes_of` when you want the candidate syndrome list;
+        use this when you need to know *where in the disease* each one sits.
+        """
+        node = self.nodes.get(node_id)
+        if node is None:
+            return []
+        out: List[Dict[str, Any]] = []
+
+        def row(edge: Edge, syndrome: Node, disease: Node, subtype: Optional[Node]):
+            sentences = edge.evidence_sentences()
+            return {
+                "syndrome": syndrome.name,
+                "syndrome_id": syndrome.id,
+                "disease": disease.name,
+                "disease_id": disease.id,
+                "subtype": subtype.name if subtype else None,
+                "subtype_id": subtype.id if subtype else None,
+                "via": "subtype" if subtype else "disease",
+                "evidence": sentences[0] if sentences else "",
+                "scope": "disease_specific" if sentences else "global_first_mention",
+                "source_docs": list(edge.source_docs[:4]),
+            }
+
+        if node.type == NodeType.DISEASE_SUBTYPE.value:
+            # Entered at a subtype: its parent disease is the clinical context.
+            parents = [
+                s
+                for edge in self.in_edges(node_id, {EdgeType.HAS_SUBTYPE.value})
+                for s in [self.nodes.get(edge.source)]
+                if s is not None
+            ]
+            parent = parents[0] if parents else node
+            for edge in self.out_edges(node_id, {EdgeType.SUBTYPE_HAS_SYNDROME.value}):
+                syndrome = self.nodes.get(edge.target)
+                if syndrome is not None:
+                    out.append(row(edge, syndrome, parent, node))
+            return out
+
+        for edge in self.out_edges(node_id, {EdgeType.HAS_SYNDROME.value}):
+            syndrome = self.nodes.get(edge.target)
+            if syndrome is not None:
+                out.append(row(edge, syndrome, node, None))
+        if not include_subtypes:
+            return out
+        for sub_edge in self.out_edges(node_id, {EdgeType.HAS_SUBTYPE.value}):
+            subtype = self.nodes.get(sub_edge.target)
+            if subtype is None:
+                continue
+            for edge in self.out_edges(subtype.id, {EdgeType.SUBTYPE_HAS_SYNDROME.value}):
+                syndrome = self.nodes.get(edge.target)
+                if syndrome is not None:
+                    out.append(row(edge, syndrome, node, subtype))
+        return out
+
     #: The four Syndrome->Treatment relations, in the order a plan reads.
     TREATMENT_EDGES: Tuple[Tuple[str, str], ...] = (
         (EdgeType.TREATED_BY_PRINCIPLE.value, "treatment_principles"),
