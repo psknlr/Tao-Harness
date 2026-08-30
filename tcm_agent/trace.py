@@ -245,25 +245,69 @@ class Trace:
 
 
 def write_traces(path, traces: Sequence[Trace]) -> None:
+    """Replace the trace file atomically.
+
+    The runner rewrites the whole file every twenty completions, so a crash,
+    a kill or a full disk during that write leaves a truncated JSONL -- and the
+    run that produced it cost real money across five commercial APIs. Writing to
+    a sibling temp file, flushing, ``fsync``-ing and then ``os.replace``-ing
+    means the file on disk is always either the previous complete generation or
+    the new one, never half of either.
+    """
+    import os
+    import tempfile
     from pathlib import Path
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as handle:
-        for trace in traces:
-            handle.write(json.dumps(trace.to_dict(), ensure_ascii=False) + "\n")
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=str(target.parent),
+        prefix=target.name + ".", suffix=".tmp", delete=False,
+    )
+    tmp = Path(handle.name)
+    try:
+        with handle:
+            for trace in traces:
+                handle.write(json.dumps(trace.to_dict(), ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)  # atomic within a filesystem
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def read_traces(path) -> List[Trace]:
+    """Read a trace file, tolerating a torn final line and nothing else.
+
+    A partial *last* record is what an interrupted append looks like, and
+    discarding it costs one case. A malformed line anywhere else means the file
+    was corrupted rather than truncated, and silently skipping it would drop
+    cases from the middle of a run without saying so -- so that raises.
+    """
     from pathlib import Path
 
     target = Path(path)
     out: List[Trace] = []
     if not target.exists():
         return out
-    with open(target, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                out.append(Trace.from_dict(json.loads(line)))
+    lines = [l for l in target.read_text(encoding="utf-8").splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        try:
+            out.append(Trace.from_dict(json.loads(line)))
+        except (json.JSONDecodeError, TypeError, KeyError) as exc:
+            if i == len(lines) - 1:
+                import sys
+
+                print(
+                    f"WARNING: {target.name} ends in a partial record "
+                    f"(interrupted write); dropping it and keeping {len(out)} traces.",
+                    file=sys.stderr,
+                )
+                break
+            raise ValueError(
+                f"{target}: line {i + 1} of {len(lines)} is malformed ({exc}). "
+                f"A bad line in the middle means the file is corrupted, not "
+                f"truncated; scoring it would silently lose cases."
+            ) from exc
     return out

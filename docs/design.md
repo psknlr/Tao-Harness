@@ -248,11 +248,19 @@ them:
   invocation as its M3 twin and pinned to the calls that twin actually spent:
   it cannot answer early (it is asked to reconsider) or run long (the final
   turn demands an answer).
+
+  **Turn-matched, not compute-matched.** Calls are equal per case; tokens are
+  not. An agent's tool results enter its later prompts, so M3 carries more
+  input tokens than M2C at the same turn count -- measured at up to +23.5% --
+  and M4's verification report is longer than M3C's sham one. Forcing tokens
+  equal would delete the evidence the intervention *consists of*, so the report
+  states the call ratio and the token ratio side by side and the claim is the
+  one that is true.
 - **M3C** — M4's extra revision turn, with no verification evidence in it.
   `M3C→M4` is the effect of the verification *content* rather than of being
   asked to look again.
 
-A compute-matched control only licenses its conclusion if the match held **per
+A turn-matched control only licenses its conclusion if the match held **per
 case**, not on average. M4 used to return early when no deterministic checker
 adjudicated an item, spending one model call fewer than M3C on exactly those
 cases — the mean stayed close while the contrast over that subset was a
@@ -400,7 +408,71 @@ that is not ours to rebuild and is disambiguated deterministically instead.
 The generation cache keys on the model fingerprint, so turning on a vendor
 reasoning mode no longer serves responses generated without it.
 
-## 10. Reading TCM-CP: the macro-average
+## 10. Contamination: the one confound pairing cannot remove
+
+The whole design rests on a claim a paired comparison cannot establish.
+
+Pre-training contamination is a **shared** confound. If a frontier model
+memorised a classical medical record, every arm of that model memorised it
+equally, so the paired `M1 → M2` difference cancels it. That is a real
+strength of the design and it is why the deltas are more trustworthy than any
+absolute score.
+
+Graph contamination is **not shared**. Only M2, M3 and M4 can read the graph.
+So a case whose answer sits in the graph's evidence text hands exactly those
+arms the answer key while the others reason — and the difference lands in the
+contrast the study reports as the knowledge-graph effect. No amount of pairing
+removes it, because the leak *is* the intervention.
+
+`benchmark_runner contaminate` audits the text a KG arm can actually reach —
+7,257 node definition sentences, 32,403 edge evidence sentences and
+`DocumentSource` metadata, 16,052 distinct passages — at four levels:
+
+| level | what it catches |
+|---|---|
+| exact | the gold answer appears verbatim in graph text |
+| n-gram Jaccard | a rewritten record: character 5-grams, no segmenter needed |
+| containment | a graph sentence *inside* a longer case, which Jaccard understates |
+| provenance | the case cites a source the graph holds |
+
+Everything is deterministic and dependency-free. There is deliberately **no
+embedding level**: an embedding model would be a second uncontrolled variable
+inside an audit whose entire purpose is to be checkable by someone else.
+
+Measured on the released benchmarks:
+
+| benchmark | cases | clean | gold answers found in the graph |
+|---|---|---|---|
+| SDT | 50 | **100.0%** | 0 |
+| PA | 328 | **99.4%** | 0 |
+| CP | 500 | 0.0% | 136 |
+
+**The detector was validated before those numbers were believed.** A null
+result from an unvalidated detector is worth nothing. TCM-CP is contaminated by
+construction — its gold comes from this graph — and the audit says so at 100%,
+which is what makes the SDT and PA readings mean anything. Planted positives
+are caught, and six realistic rewrite modes with them: punctuation swapped,
+clauses reordered, embedded in a longer case, 30% of clauses dropped, half
+kept. Unrelated text scores zero.
+
+The known limit, stated rather than papered over: a character-shuffled passage
+is missed. No lexical method survives that, and no rewritten medical record
+looks like it.
+
+`score` attaches each case's stratum and the report recomputes `M1→M2` and
+`M2C→M3` on the clean subset beside the full one. **A gain that survives on the
+clean subset cannot be read as retrieving the answer from the graph.** Where no
+audit has been run the report says so, because silence there looks like a clean
+result.
+
+Leave-source-out KG — withholding a case's own source document while that case
+runs — is deliberately not implemented. With zero `likely` cases in SDT and PA
+there is nothing for it to withhold, and it would add per-case graph mutation
+to a harness whose value now lies in being frozen. The threshold that would
+justify building it: any `likely` case in an effectiveness benchmark, or a
+clean-subset delta that differs materially from the full-set delta.
+
+## 11. Reading TCM-CP: the macro-average
 
 TCM-CP's nine subtasks run from 306 items (CP6, transition decisions) to 988
 (CP3 and CP5). A pooled accuracy is therefore 53% stage lookup and monitoring
@@ -423,7 +495,7 @@ p-value described a quantity that appeared nowhere in the report, under a
 comment asserting they matched. The test that should have caught it asserted
 the *estimator's name*, which was correct while the number was wrong.
 
-**CP4 treatment is disease-conditioned.** `Syndrome → Treatment` is stored as a
+**CP4 primary is disease-specific only.** `Syndrome → Treatment` is stored as a
 global binary relation, but the clinical fact is ternary: *this disease's*
 guideline, for this syndrome, recommends this treatment. Read globally,
 补中益气汤 is "the formula for 脾胃虚弱证" whether the pathway is 弱视,
@@ -435,16 +507,31 @@ That is not proof of clinical error — **异病同治** is a real principle and
 graph's document boundaries are not clinical boundaries — but the system could
 not show that *this pathway* recommends it, which is a weaker claim than a
 pathway agent should make. `kg.treatments_of(syndrome, disease)` splits
-`disease_specific` from `cross_disease_general` on shared provenance; CP4
-prefers a grounded gold and records `treatment_provenance` per item, so the
-report can stratify. Ungrounded gold fell to 14.48%, and the remainder is
-labelled rather than hidden.
+`disease_specific` from `cross_disease_general` on shared provenance.
+
+Preferring a grounded gold was not enough. When a disease's guideline recorded
+no treatment of that type at all, the builder still fell back to a
+cross-disease edge — 14.5% of CP4, 21% of the formal sample, and 48% of formal
+CP4-patent items — so "which treatment does this pathway recommend?" was keyed
+from another disease's evidence. That question cannot be answered that way.
+
+CP4 primary is now disease-specific only, and the cross-disease items become
+**CP4G**, asking what they can actually attest: whether a treatment has
+syndrome-level support *across* diseases. That is knowledge transfer under
+异病同治, not pathway execution, so CP4G is excluded from the six-family
+macro-average and reported in its own table. Formal CP4 primary is 200/200
+disease-grounded, from 158/200.
+
+The two-hop subtype fix contributed here too: 224 syndromes reachable only
+through a `DiseaseSubtype` had looked context-free, so their treatments were
+filed as cross-disease — the disease's own guideline reclassified as somebody
+else's.
 
 The sample is drawn stratified by subtask (`dataset.stratify: subtask`) for the
 same reason: a head-slice of 400 gives CP6 twenty-eight items, too thin to
 carry a paired test on precisely the subtask with a patient-safety reading.
 
-## 11. Known limitations
+## 12. Known limitations
 
 1. **Coverage.** 10 of 19 PA rule families are ungroundable here — **166 of
    328 released items (51%)**, including the largest family, A-003 dosage (87
@@ -465,15 +552,15 @@ carry a paired test on precisely the subtask with a patient-safety reading.
    change and the hash will differ.
 5. **No test-set contamination check.** SDT cases are classical published
    medical records and may overlap frontier pre-training data. The
-   compute-matched *deltas* are more trustworthy than any absolute number.
+   turn-matched *deltas* are more trustworthy than any absolute number.
 6. **TCM-CP is circular with respect to the KG arms.** Its gold answers come
    from the graph, so it measures pathway-execution faithfulness, not clinical
    effectiveness. Never pool it with SDT or PA. Its contrasts use a
    **disease-clustered** bootstrap: many items derive from one pathway, and
    treating them as independent understates the interval several-fold.
-7. **TCM-CP drops what it cannot ask fairly.** The build emits 5,544 items
-   from 299 diseases and discards 1,154 candidate stages: 884 with no exit
-   criteria, 222 first stages rebalanced down to a 25% share (a first stage is
+7. **TCM-CP drops what it cannot ask fairly.** The build emits 5,611 items
+   from 299 diseases and discards 1,154 candidate stages: 911 with no exit
+   criteria, 195 first stages rebalanced down to a 25% share (a first stage is
    identifiable from "no prior treatment" alone, which is a position cue and
    not stage reasoning), 46 whose distractors were not distinguishable from the
    gold stage, and 2 with too few distractor actions. That is the ceiling this

@@ -21,6 +21,7 @@ from .scorers import (
     CP_METRICS,
     CP_PRIMARY,
     cp_family,
+    is_primary_cp,
     PA_METRICS,
     PA_PRIMARY,
     SDT_METRICS,
@@ -72,9 +73,9 @@ CONTRASTS = (
     ("M0", "M1", "prompt structure alone"),
     ("M1", "M2", "static KG evidence"),
     ("M2", "M3", "agency + extra compute (confounded)"),
-    ("M2C", "M3", "agentic retrieval over the same KG, compute-matched"),
+    ("M2C", "M3", "agentic retrieval over the same KG, turn-matched"),
     ("M3", "M4", "verification + extra revision (confounded)"),
-    ("M3C", "M4", "verification content, compute-matched"),
+    ("M3C", "M4", "verification content, turn-matched"),
     ("M0", "M3", "whole scaffold (not a KG-only effect)"),
 )
 
@@ -141,7 +142,7 @@ def _usable_pairs(
     """Case ids both conditions scored, minus the ones that are not comparable.
 
     A case whose branches broke compute parity is dropped rather than scored.
-    The compute-matched contrasts exist precisely to hold test-time compute
+    The turn-matched contrasts exist precisely to hold test-time turns
     fixed; including a pair where it was not fixed reintroduces the confound
     the contrast was built to remove, and does it invisibly.  ``stratum``
     additionally restricts to cases where the M4 verification pass reached a
@@ -402,7 +403,11 @@ def cp_subtask_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> s
     macro-average -- mean of family means, each of the six capabilities
     weighted equally -- is the endpoint the contrasts below test.
     """
-    scoped = [i for i in items if i.dataset == "cp"]
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
     if not scoped:
         return ""
     grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
@@ -454,7 +459,14 @@ def cp_macro_contrast_table(
     capability probed four ways, four ninths of the weight instead of one
     sixth.
     """
-    scoped = [i for i in items if i.dataset == "cp"]
+    # CP4G is deliberately absent: it asks about cross-disease knowledge
+    # transfer, not pathway execution, and averaging it into the endpoint would
+    # answer neither question.
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
     index = index_items(scoped)
     results: Dict[str, PairedResult] = {}
     rows: List[List[Any]] = []
@@ -566,6 +578,38 @@ def verification_stratum_table(
     )
 
 
+def cp_secondary_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
+    """Subtasks reported beside the CP endpoint but never inside it.
+
+    CP4G holds the items whose gold this disease's own guideline cannot attest.
+    Under 异病同治 the treatment may still be right, so the items are real --
+    but "which treatment does this pathway recommend?" is not what they can
+    answer, and pooling them into CP4 made the pathway question answerable
+    from another disease's evidence. Reported here, as the different question
+    it is: does the model know a treatment has syndrome-level support across
+    diseases?
+    """
+    scoped = [
+        i
+        for i in items
+        if i.dataset == "cp" and not is_primary_cp(str(i.metrics.get("subtask") or ""))
+    ]
+    if not scoped:
+        return ""
+    grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for item in scoped:
+        value = item.metrics.get(metric)
+        if isinstance(value, (int, float)):
+            grid[
+                (item.model_key, item.condition, str(item.metrics.get("subtask") or "?"))
+            ].append(float(value))
+    rows = [
+        [model, CONDITION_LABELS.get(condition, condition), subtask, len(v), sum(v) / len(v)]
+        for (model, condition, subtask), v in sorted(grid.items())
+    ]
+    return _md_table(["model", "condition", "subtask", "n", metric], rows)
+
+
 def cp4_provenance_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
     """CP4 split by whether this disease's guideline attests the gold treatment.
 
@@ -598,10 +642,110 @@ def cp4_provenance_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) 
     return _md_table(["model", "condition", "gold provenance", "n", metric], rows)
 
 
-def compute_parity_table(items: Sequence[ScoredItem]) -> str:
+#: The contrasts a graph leak would inflate. M0->M1 changes no knowledge, and
+#: M3C->M4 changes only the verification report, so neither can be explained by
+#: what the graph contains.
+KG_CONTRASTS: Tuple[Tuple[str, str, str], ...] = (
+    ("M1", "M2", "static KG evidence"),
+    ("M2C", "M3", "agentic retrieval over the same KG"),
+)
+
+
+def contamination_table(
+    items: Sequence[ScoredItem], dataset: str, metric: str
+) -> Tuple[str, str]:
+    """The KG contrasts recomputed on the uncontaminated subset.
+
+    This is the analysis the audit exists for. Pre-training contamination is a
+    *shared* confound -- every arm of a model memorised the same things, so the
+    paired difference cancels it. Graph contamination is not shared: only M2,
+    M3 and M4 can read the graph, so a case whose answer sits in the graph's
+    evidence text hands those arms the answer key and lands the difference in
+    exactly the contrast reported as the knowledge-graph effect.
+
+    Restricting to ``clean`` cases removes that reading. A gain that survives
+    here is not retrieval of the answer.
+
+    Returns ``(table, note)``; the note says what is missing when no audit has
+    been run, because silence would look like a clean result.
+    """
+    scoped = [i for i in items if i.dataset == dataset]
+    if not scoped:
+        return "", ""
+    strata = [
+        str(i.metrics.get("contamination_stratum") or "") for i in scoped
+    ]
+    if not any(strata):
+        return "", (
+            f"> **No contamination audit for {dataset.upper()}.** Run "
+            f"`benchmark_runner contaminate` before generation: without it, a "
+            f"KG gain cannot be separated from the graph containing the answer, "
+            f"and a paired design does not rule that out — only M2/M3/M4 can "
+            f"read the graph, so the leak lands in the KG contrast itself."
+        )
+
+    # Count *cases*, not scored items: every case appears once per arm, so
+    # counting items multiplied every stratum by the number of conditions and
+    # reported a 50-case benchmark as 350.
+    per_case: Dict[str, str] = {}
+    for item in scoped:
+        per_case.setdefault(
+            item.case_id, str(item.metrics.get("contamination_stratum") or "unaudited")
+        )
+    counts: Dict[str, int] = defaultdict(int)
+    for stratum in per_case.values():
+        counts[stratum] += 1
+    clean = [
+        i for i in scoped if i.metrics.get("contamination_stratum") == "clean"
+    ]
+    index_all = index_items(scoped)
+    index_clean = index_items(clean)
+
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for left, right, label in KG_CONTRASTS:
+            xs, ys = paired_vectors(index_all, model, left, right, metric)
+            cxs, cys = paired_vectors(index_clean, model, left, right, metric)
+            if not xs:
+                continue
+            full = (sum(ys) - sum(xs)) / len(xs)
+            clean_delta = (
+                (sum(cys) - sum(cxs)) / len(cxs) if cxs else float("nan")
+            )
+            rows.append(
+                [
+                    model,
+                    f"{left}→{right}",
+                    label,
+                    len(xs),
+                    full,
+                    len(cxs),
+                    clean_delta if clean_delta == clean_delta else None,
+                    (clean_delta - full) if clean_delta == clean_delta else None,
+                ]
+            )
+    summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+    note = (
+        f"Cases by contamination stratum: {summary}. `clean` means the case's "
+        f"narrative does not overlap any graph passage and its gold answer does "
+        f"not appear in the graph."
+    )
+    if not rows:
+        return "", note
+    return (
+        _md_table(
+            ["model", "contrast", "what it isolates", "n (all)", f"Δ {metric} (all)",
+             "n (clean)", f"Δ {metric} (clean)", "shift"],
+            rows,
+        ),
+        note,
+    )
+
+
+def turn_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
-    A compute-matched control only licenses its conclusion if the match held in
+    A turn-matched control only licenses its conclusion if the match held in
     practice. If M2C used half as many model calls as M3, then M2C→M3 is still
     partly a compute contrast and must be reported as such. This table is the
     evidence for -- or against -- the matching claim, and belongs in the paper
@@ -630,6 +774,18 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                 control_tokens = _mean(control, "total_tokens")
                 arm_tokens = _mean(arm, "total_tokens")
                 ratio = control_calls / arm_calls if arm_calls else None
+                # Calls match exactly by construction; tokens do not and should
+                # not. An agent's tool results enter its later prompts, so M3
+                # carries more input tokens than M2C at the same turn count --
+                # measured at up to +23.5%. Forcing those equal would delete the
+                # evidence the intervention consists of. The ratio is reported
+                # so the claim stays "turn-matched", which is true, rather than
+                # "compute-matched", which is not.
+                token_ratio = (
+                    control_tokens / arm_tokens
+                    if control_tokens and arm_tokens
+                    else None
+                )
                 # Means can match while individual pairs do not, so the
                 # per-case count is the binding check; the ratio is only a
                 # readable summary beside it.
@@ -650,6 +806,7 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
                         ratio,
                         control_tokens,
                         arm_tokens,
+                        token_ratio,
                         broken,
                         verdict,
                     ]
@@ -659,8 +816,8 @@ def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     return _md_table(
         [
             "dataset", "model", "pair", "control calls", "arm calls",
-            "call ratio", "control tokens", "arm tokens",
-            "per-case breaks (dropped)", "parity",
+            "call ratio", "control tokens", "arm tokens", "token ratio",
+            "per-case breaks (dropped)", "turn parity",
         ],
         rows,
     )
@@ -934,6 +1091,23 @@ def build_report(
                 parts.append("")
                 parts.append(subtasks)
                 parts.append("")
+                secondary = cp_secondary_table(items, primary)
+                if secondary:
+                    parts.append("#### Reported separately: cross-disease generalisation")
+                    parts.append("")
+                    parts.append(
+                        "These are the items whose gold this disease's own guideline "
+                        "does not attest. Under **异病同治** the treatment may still be "
+                        "correct, so they are not discarded — but *which treatment does "
+                        "this pathway recommend* is not a question another disease's "
+                        "evidence can answer, so they are **excluded from the CP "
+                        "macro-average above** and reported here as the different "
+                        "question they ask: does the model know a treatment has "
+                        "syndrome-level support across diseases?"
+                    )
+                    parts.append("")
+                    parts.append(secondary)
+                    parts.append("")
                 provenance = cp4_provenance_table(items, primary)
                 if provenance:
                     parts.append("#### CP4 by treatment provenance")
@@ -1001,6 +1175,23 @@ def build_report(
             parts.append("")
             parts.append(strata)
             parts.append("")
+        contam_table, contam_note = contamination_table(items, dataset, primary)
+        if contam_note:
+            parts.append("### Contamination sensitivity")
+            parts.append("")
+            parts.append(contam_note)
+            parts.append("")
+            if contam_table:
+                parts.append(
+                    "Pre-training contamination is shared across a model's arms and "
+                    "cancels in the paired difference. Graph contamination does not: "
+                    "only M2/M3/M4 read the graph, so a leaked answer inflates the KG "
+                    "contrast itself. **A gain that survives on the `clean` subset "
+                    "cannot be read as retrieving the answer from the graph.**"
+                )
+                parts.append("")
+                parts.append(contam_table)
+                parts.append("")
         comp_table, comp_stats = compensation_table(items, dataset, primary)
         parts.append("### Does the framework compensate weaker models?")
         parts.append("")
@@ -1025,20 +1216,25 @@ def build_report(
         parts.append(leakage)
         parts.append("")
 
-    parity = compute_parity_table(items)
+    parity = turn_parity_table(items)
     if parity:
-        parts.append("## Compute parity of the control arms")
+        parts.append("## Turn parity of the control arms")
         parts.append("")
         parts.append(
             "M2C matches M3's turn budget while keeping M2's static KG context "
             "and withholding the tools -- so M2C→M3 isolates *agentic retrieval*, "
             "not the graph, which both arms have. M3C matches M4's turn count "
-            "without the verification evidence. These contrasts are only "
-            "interpretable if the match actually held, so the realised call and "
-            "token counts are reported here alongside the number of pairs where "
-            "parity broke per case. Any per-case break drops that pair from the "
-            "contrast and marks the row `MISMATCH`; means alone can agree while "
-            "individual pairs do not."
+            "without the verification evidence.\n\n"
+            "**These are turn-matched, not compute-matched.** Model calls are "
+            "equal per case by construction; tokens are not, and should not be. "
+            "An agent's tool results enter its later prompts, so M3 carries more "
+            "input tokens than M2C at the same turn count -- measured at up to "
+            "+23.5% -- and the same holds for M4's verification report against "
+            "M3C's sham one. Forcing those equal would delete the evidence the "
+            "intervention *consists of*. The token ratio is reported so the "
+            "residual difference is visible rather than assumed away.\n\n"
+            "Any per-case break drops that pair from the contrast and marks the "
+            "row `MISMATCH`; means alone can agree while individual pairs do not."
         )
         parts.append("")
         parts.append(parity)

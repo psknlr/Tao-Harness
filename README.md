@@ -313,7 +313,35 @@ changes it. The retrieval index caches on it too; keying on node *count*, as an
 earlier version did, meant a thousand edited relations silently reused a stale
 index.
 
-### 7. Dataset identity
+### 7. Contamination: the confound pairing cannot remove
+
+Pre-training contamination is **shared** — every arm of a model memorised the
+same records, so the paired difference cancels it. Graph contamination is not:
+only M2/M3/M4 read the graph, so a case whose answer sits in the graph's
+evidence text hands those arms the answer key, and the difference lands in the
+contrast reported as the KG effect.
+
+`benchmark_runner contaminate` audits the 16,052 passages a KG arm can reach at
+four levels — verbatim gold, character 5-gram Jaccard, containment, cited
+source — deterministically and with no embedding model, because an audit whose
+purpose is to be checkable should not contain an uncontrolled variable.
+
+| benchmark | cases | clean | gold in graph |
+|---|---|---|---|
+| SDT | 50 | **100.0%** | 0 |
+| PA | 328 | **99.4%** | 0 |
+| CP | 500 | 0.0% | 136 |
+
+**The detector was validated before those numbers were trusted.** TCM-CP is
+contaminated by construction and the audit says so at 100% — that is what makes
+the SDT and PA readings mean something. Planted copies and six realistic
+rewrite modes are caught; unrelated text scores zero; a character-shuffled
+passage is missed and that limit is stated rather than hidden.
+
+`score` attaches the stratum and the report recomputes the KG contrasts on the
+clean subset. **A gain that survives there is not retrieval of the answer.**
+
+### 8. Dataset identity
 
 `case_id` is the primary key of the gold lookup, the resume key and the paired
 analysis — three dicts, so a repeat means last-write-wins in all three. A
@@ -330,7 +358,7 @@ and records what it had to rename — which found TCM-SD's released dev split
 shipping 178 repeated `user_id`s, a third-party file disambiguated
 deterministically rather than refused.
 
-### 8. The run signature
+### 9. The run signature
 
 The framework hash has to stay **equal** across models — that is what makes
 "every arm saw the same scaffold" a checkable claim. The same blindness means
@@ -416,8 +444,19 @@ Each control changes exactly one thing from the arm it is matched to:
   with no tool access. So `M2C→M3` isolates adaptive retrieval alone. (An
   earlier version built M2C with no graph evidence at all, which moved four
   variables together and could not isolate agency.)
+  The match is **per case**: M2C is generated alongside its M3 twin and pinned
+  to the calls that twin actually spent, because a mean can match while no
+  individual pair does.
 - **M3C** takes M4's extra revision turn with no verification evidence in it,
   so `M3C→M4` isolates the verification content.
+
+Both are **turn-matched, not compute-matched**. Model calls are equal per case
+by construction; tokens are not, and should not be — an agent's tool results
+enter its later prompts, so M3 carries up to 23.5% more tokens than M2C at the
+same turn count, and M4's verification report is longer than M3C's sham one.
+Forcing tokens equal would delete the evidence the intervention *consists of*,
+so the report gives the call ratio and the token ratio side by side and the
+claim stays the one that is true.
 
 **M3, M3C and M4 share one agent phase.** The reasoning loop runs once per
 case and the branches fork after the first answer, so M3C and M4 differ *only*
@@ -459,8 +498,8 @@ The interpretable contrasts are:
 ```
 Δ_structure     = M1  − M0     prompt scaffold only
 Δ_retrieval     = M2  − M1     static KG evidence
-Δ_agency        = M3  − M2C    adaptive retrieval, KG and compute held constant
-Δ_verification  = M4  − M3C    verification content, trajectory and compute held constant
+Δ_agency        = M3  − M2C    adaptive retrieval, KG and turns held constant
+Δ_verification  = M4  − M3C    verification content, trajectory and turns held constant
 ```
 
 `M0→M3` is reported too, but labelled the **whole-scaffold effect** — it

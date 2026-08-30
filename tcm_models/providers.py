@@ -108,6 +108,15 @@ class GeminiClient(LLMClient):
                 "maxOutputTokens": decode.max_tokens,
             },
         }
+        if decode.seed is not None:
+            # The OpenAI-compatible client has always sent the seed; this one
+            # did not, so with samples > 1 the two providers were drawing
+            # samples under different rules -- one seeded per sample index, one
+            # at the backend's discretion. That is a per-provider confound
+            # inside self-consistency, not a self-consistency result. Whether
+            # the endpoint honours it is verified by `benchmark_runner smoke`
+            # rather than assumed here.
+            payload["generationConfig"]["seed"] = decode.seed
         if system_parts:
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
         if decode.stop:

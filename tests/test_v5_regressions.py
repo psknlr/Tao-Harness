@@ -546,15 +546,43 @@ class TestSuiteRunsOnACleanCheckout(unittest.TestCase):
     #: How many lines around a reference are searched for one of those.
     WINDOW = 8
 
-    def test_no_test_reads_an_unguarded_ungitted_data_path(self):
+    @staticmethod
+    def tracked_files() -> set:
+        """Files the repository ships, without requiring a git checkout.
+
+        A source archive -- GitHub "Download ZIP", a Zenodo deposit, a journal
+        supplementary bundle -- carries no ``.git``, so shelling out to
+        ``git ls-files`` made this test fail for exactly the reader most likely
+        to run the suite cold, and on a defect that is not in the harness.
+        Falls back to walking the tree minus the directories .gitignore
+        excludes, which is the same set for this purpose.
+        """
         import subprocess
 
-        tracked = set(
-            subprocess.run(
-                ["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True
-            ).stdout.split()
-        )
+        if (REPO / ".git").exists():
+            try:
+                return set(
+                    subprocess.run(
+                        ["git", "ls-files"],
+                        cwd=REPO,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout.split()
+                )
+            except (OSError, subprocess.CalledProcessError):
+                pass
+        skip = {".git", "runs", "__pycache__", ".index", "node_modules", ".venv", "data"}
+        return {
+            str(path.relative_to(REPO))
+            for path in REPO.rglob("*")
+            if path.is_file() and not any(part in skip for part in path.parts)
+        }
+
+    def test_no_test_reads_an_unguarded_ungitted_data_path(self):
         import tokenize
+
+        tracked = self.tracked_files()
 
         triple = ('"' * 3, "'" * 3)
         offenders = []
