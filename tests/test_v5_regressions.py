@@ -8,6 +8,7 @@ import importlib.util
 import json
 import unittest
 from pathlib import Path
+from typing import Any, Dict, List
 
 import tcm_tools  # noqa: F401  (registers the tool surface)
 from tcm_agent import AgentRuntime, FrameworkConfig, build_task
@@ -61,16 +62,32 @@ def builder():
     return module
 
 
+_BUILT: List[Dict[str, Any]] = []
+
+
+def built_items() -> List[Dict[str, Any]]:
+    """The benchmark as the builder produces it, from the committed graph.
+
+    Deliberately *not* ``data/cp/TCM-CP.json``: that file is generated and
+    gitignored, so a test reading it passes on a machine where someone has run
+    the builder and fails on a clean checkout -- which is what CI is. Building
+    here also means these tests check the builder rather than whatever happens
+    to be on disk.
+    """
+    if not _BUILT:
+        from tcm_kg import load_kg
+
+        items, _report = builder().build(load_kg(), seed=20260829)
+        _BUILT.extend(items)
+    return _BUILT
+
+
 class V5_1_CaseIdentity(unittest.TestCase):
     """case_id is the primary key of scoring, resume and paired analysis."""
 
     def test_cp4_ids_include_the_disease(self):
         """One syndrome serves many diseases; the id has to say which."""
-        b = builder()
-        from tcm_kg import load_kg
-
-        items, _report = b.build(load_kg(), seed=20260829)
-        cp4 = [i for i in items if i["subtask"].startswith("CP4")]
+        cp4 = [i for i in built_items() if i["subtask"].startswith("CP4")]
         self.assertTrue(cp4)
         ids = [i["id"] for i in cp4]
         self.assertEqual(len(ids), len(set(ids)), "CP4 ids still collide")
@@ -78,11 +95,7 @@ class V5_1_CaseIdentity(unittest.TestCase):
             self.assertIn("::Disease::", item["id"])
 
     def test_the_whole_build_has_unique_ids(self):
-        b = builder()
-        from tcm_kg import load_kg
-
-        items, _ = b.build(load_kg(), seed=20260829)
-        ids = [i["id"] for i in items]
+        ids = [i["id"] for i in built_items()]
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_the_builder_refuses_a_set_with_a_duplicate_id(self):
@@ -239,11 +252,7 @@ class V5_3_DiseaseConditionedTreatment(unittest.TestCase):
         self.assertEqual(plan["disease_specific"], [])
 
     def test_cp4_prefers_a_disease_grounded_gold_and_labels_the_rest(self):
-        b = builder()
-        from tcm_kg import load_kg
-
-        items, _ = b.build(load_kg(), seed=20260829)
-        cp4 = [i for i in items if i["subtask"].startswith("CP4")]
+        cp4 = [i for i in built_items() if i["subtask"].startswith("CP4")]
         provenance = {i["treatment_provenance"] for i in cp4}
         self.assertTrue(provenance <= {"disease_specific", "cross_disease_general"})
         grounded = sum(1 for i in cp4 if i["treatment_provenance"] == "disease_specific")
@@ -291,9 +300,8 @@ class V5_3_DiseaseConditionedTreatment(unittest.TestCase):
         task = build_task("cp", kg, r)
         tool_keys = {key for _relation, key in kg.TREATMENT_EDGES}
 
-        items = json.loads((REPO / "data" / "cp" / "TCM-CP.json").read_text(encoding="utf-8"))
         seen: set = set()
-        for item in items:
+        for item in built_items():
             if not item["subtask"].startswith("CP4"):
                 continue
             treatment = task.static_context(item).get("treatment")
@@ -348,8 +356,7 @@ class V5_4_MacroEstimand(unittest.TestCase):
             )
 
     def test_every_cp_subtask_the_builder_emits_has_a_family(self):
-        items = json.loads((REPO / "data" / "cp" / "TCM-CP.json").read_text(encoding="utf-8"))
-        for subtask in {i["subtask"] for i in items}:
+        for subtask in {i["subtask"] for i in built_items()}:
             self.assertNotEqual(
                 cp_family(subtask), "other", f"{subtask} is outside CP_FAMILIES"
             )
@@ -513,6 +520,75 @@ class V5_9_ConsensusProvenance(unittest.TestCase):
 
         merged = _consensus_traces([sample(0), sample(1, "broken"), sample(2)])[0]
         self.assertIn("broken", merged.parity_error)
+
+
+class TestSuiteRunsOnACleanCheckout(unittest.TestCase):
+    """No test may depend on a file the repository does not ship.
+
+    This has now been the cause of two CI failures. The benchmark datasets are
+    gitignored, so a test that reads one passes on a machine where someone has
+    already downloaded or generated it and fails on a clean checkout -- which
+    is what CI is, and what a reviewer has. The suite is meant to prove the
+    harness is sound without the data; a test that quietly needs it breaks that
+    promise and does not announce itself.
+
+    Tests that genuinely need a released corpus must skip themselves (see the
+    ``skipTest`` calls elsewhere), not read the path and hope.
+    """
+
+    #: Generated or downloaded data, from .gitignore.
+    FORBIDDEN = ("data/cp/", "data/sdt/", "data/pa/", "data/tcmsd/")
+
+    #: A reference is fine when the surrounding code copes with the file being
+    #: absent -- by skipping, by catching, or by checking first.
+    GUARDS = ("skipTest", "FileNotFoundError", "exists()", "try:")
+
+    #: How many lines around a reference are searched for one of those.
+    WINDOW = 8
+
+    def test_no_test_reads_an_unguarded_ungitted_data_path(self):
+        import subprocess
+
+        tracked = set(
+            subprocess.run(
+                ["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True
+            ).stdout.split()
+        )
+        import tokenize
+
+        triple = ('"' * 3, "'" * 3)
+        offenders = []
+        for path in sorted((REPO / "tests").rglob("*.py")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            # Only real string literals count -- a docstring explaining this
+            # very rule is not a file read, and neither is a comment.
+            with open(path, "rb") as handle:
+                literals = [
+                    (tok.start[0], tok.string)
+                    for tok in tokenize.tokenize(handle.readline)
+                    if tok.type == tokenize.STRING
+                ]
+            for lineno, literal in literals:
+                if literal.startswith(triple):
+                    continue  # a docstring, not a path
+                prefix = next((p for p in self.FORBIDDEN if p in literal), None)
+                if prefix is None:
+                    continue
+                # naming a file the repository actually ships is fine
+                if any(t.startswith(prefix) and t in literal for t in tracked):
+                    continue
+                window = "\n".join(
+                    lines[max(0, lineno - 1 - self.WINDOW) : lineno + self.WINDOW]
+                )
+                if any(guard in window for guard in self.GUARDS):
+                    continue
+                offenders.append(f"{path.name}:{lineno}: {literal[:80]}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these tests read a gitignored data file with no fallback, so they "
+            "pass here and fail on a clean checkout",
+        )
 
 
 if __name__ == "__main__":
