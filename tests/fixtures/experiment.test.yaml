@@ -11,7 +11,7 @@ dataset:
 task: sdt
 domain: clinical_reasoning
 models: [echo]
-conditions: [M0, M1, M2, M3, M4]
+conditions: [M0, M1, M2, M2C, M3, M3C, M4]
 samples: 1
 decode: {temperature: 0.0, max_tokens: 512, seed: 7}
 retrieval: {top_k: 4, graph_hops: 1}

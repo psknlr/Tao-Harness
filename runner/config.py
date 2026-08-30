@@ -36,6 +36,11 @@ class ExperimentConfig:
     framework: FrameworkConfig
     output_dir: Path
     concurrency: int
+    #: Field to balance a limited sample across.  Set for TCM-CP, whose nine
+    #: subtasks differ threefold in size: a plain head-slice leaves CP6 -- the
+    #: transition decision, the only subtask with a patient-safety reading --
+    #: too thin to test per-subtask.
+    dataset_stratify: Optional[str] = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def loader_kwargs(self) -> Dict[str, Any]:
@@ -49,6 +54,8 @@ class ExperimentConfig:
             "task": self.task,
             "domain": self.domain.value,
             "dataset": str(self.dataset_path),
+            "dataset_limit": self.dataset_limit,
+            "dataset_stratify": self.dataset_stratify,
             "models": self.models,
             "conditions": self.conditions,
             "samples": self.samples,
@@ -115,6 +122,7 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         dataset_path=_resolve(dataset.get("path") or ""),
         dataset_kind=str(dataset.get("kind") or "sdt"),
         dataset_limit=dataset.get("limit"),
+        dataset_stratify=dataset.get("stratify"),
         dataset_results_path=(
             _resolve(dataset["results_path"]) if dataset.get("results_path") else None
         ),

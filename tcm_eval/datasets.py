@@ -144,14 +144,58 @@ class Dataset:
     def __iter__(self):
         return iter(self.items)
 
-    def subset(self, limit: Optional[int] = None, ids: Optional[Iterable[str]] = None) -> "Dataset":
+    def subset(
+        self,
+        limit: Optional[int] = None,
+        ids: Optional[Iterable[str]] = None,
+        *,
+        stratify: Optional[str] = None,
+    ) -> "Dataset":
+        """A slice of the dataset, optionally balanced across a field.
+
+        ``stratify`` matters for TCM-CP. Its subtasks range from 306 to 988
+        items, so a plain head-slice hands the small ones a sample too thin to
+        test -- and the small one is CP6, the transition decision, which is the
+        subtask with a patient-safety reading and the one a per-subtask report
+        most needs powered. Even allocation gives each stratum ``limit // k``
+        items, and redistributes whatever a short stratum could not use to the
+        strata that still have items left. Order within a stratum is
+        preserved, so the selection stays deterministic and keeps the build's
+        disease interleaving.
+        """
         items = self.items
         if ids is not None:
             wanted = {str(i) for i in ids}
             items = [i for i in items if str(i.get("id")) in wanted]
-        if limit is not None:
-            items = items[:limit]
-        return Dataset(self.name, items, self.mapping, self.path)
+        if limit is None:
+            return Dataset(self.name, items, self.mapping, self.path)
+
+        if not stratify:
+            return Dataset(self.name, items[:limit], self.mapping, self.path)
+
+        buckets: Dict[str, List[Mapping[str, Any]]] = {}
+        for item in items:
+            buckets.setdefault(str(item.get(stratify) or "unknown"), []).append(item)
+        if len(buckets) < 2:
+            return Dataset(self.name, items[:limit], self.mapping, self.path)
+
+        take = {key: 0 for key in buckets}
+        remaining = min(limit, len(items))
+        while remaining > 0:
+            open_keys = [k for k in sorted(buckets) if take[k] < len(buckets[k])]
+            if not open_keys:
+                break
+            share = max(1, remaining // len(open_keys))
+            for key in open_keys:
+                if remaining <= 0:
+                    break
+                grant = min(share, len(buckets[key]) - take[key], remaining)
+                take[key] += grant
+                remaining -= grant
+
+        chosen = {id(i) for key in buckets for i in buckets[key][: take[key]]}
+        picked = [i for i in items if id(i) in chosen]  # original order
+        return Dataset(self.name, picked, self.mapping, self.path)
 
     @property
     def n_labelled(self) -> int:

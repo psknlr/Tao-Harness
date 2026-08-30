@@ -146,9 +146,11 @@ enumerate candidates.
 ### 2. No query language
 
 Exposing `run_cypher` would make Cypher-writing skill a per-model confound in
-what is meant to be a knowledge comparison. Every model sees the same 13 tools
-with byte-identical descriptions, and a test asserts no tool description
-mentions a query language.
+what is meant to be a knowledge comparison. Every model sees the same tool list
+for its access domain, with byte-identical descriptions — 4 on SDT, 7 on PA,
+10 on the pathway task — and a test asserts no tool description mentions a
+query language. The registry holds 16, but the 6 verification-phase tools are
+the M4 pass's, not the agent's.
 
 ### 2b. Statistics chosen from the data
 
@@ -311,10 +313,40 @@ changes it. The retrieval index caches on it too; keying on node *count*, as an
 earlier version did, meant a thousand edited relations silently reused a stale
 index.
 
-`score` **refuses** to pool traces whose hashes differ. Every run also writes a
-`manifest.json` with the graph hash, dataset hash, git commit, Python version,
-model snapshots and timestamp — written before generation starts, so an
-interrupted run still records what it was doing.
+### 7. The run signature
+
+The framework hash has to stay **equal** across models — that is what makes
+"every arm saw the same scaffold" a checkable claim. The same blindness means
+traces from two model snapshots, or from before and after a tool rewrite, carry
+one hash and pool silently. So every trace also carries a `run_signature`
+covering what the framework hash omits:
+
+```
+run_signature = sha256(framework_hash ‖ kg ‖ dataset ‖ model_fingerprint
+                       ‖ case_set ‖ tool/scorer/retrieval/runtime source)
+```
+
+Condition is deliberately excluded: conditions are the independent variable and
+have to stay poolable. Because it lives on the trace, the check survives a
+missing or stale manifest.
+
+- **Resume** matches on the signature. Resuming on the framework hash kept
+  exactly the traces a resume exists to regenerate.
+- **`run` never overwrites** a manifest describing a different experiment — it
+  was the only record of what the traces beside it came from. `--new-run`
+  archives it instead.
+- **`score` fails closed.** Mixed framework hashes, mixed run signatures,
+  traces that do not match the manifest, a changed KG or dataset, or changed
+  tool/retrieval/runtime code all stop the run. A changed *scorer* stays a
+  note — re-scoring recorded traces with a fixed scorer is the whole point of
+  separating generation from scoring. `--allow-drift` overrides, and the drift
+  is written into `scored_manifest` and printed as a banner at the top of the
+  report, so a forced number cannot later pass as a clean one.
+
+Every run writes its `manifest.json` before generation starts, so an
+interrupted run still records what it was doing. The report reproduces one
+provenance block **per dataset**: keeping only the first config's block made a
+three-dataset report attest that the PA and CP numbers came from the SDT run.
 
 ---
 
@@ -344,9 +376,9 @@ across 300 cases × 5 models × 5 conditions.
 | **M0** Base LLM | – | – | – | – | 1 |
 | **M1** Structured | ✓ | – | – | – | 1 |
 | **M2** KG-RAG | ✓ | static, deterministic | – | – | 1 |
-| **M2C** Iterative control | ✓ | **same static KG as M2** | – | – | = M3 |
+| **M2C** Iterative control | ✓ | **same static KG as M2** | – | – | = M3 (per case) |
 | **M3** KG-Agent | ✓ | agentic | ✓ | – | multi |
-| **M3C** Sham-revision control | ✓ | agentic | ✓ | **no evidence** | = M4 |
+| **M3C** Sham-revision control | ✓ | agentic | ✓ | **no evidence** | = M4 (per case) |
 | **M4** KG-Agent + Verify | ✓ | agentic | ✓ | ✓ | multi |
 
 **The controls exist because M3 and M4 spend more test-time compute than the
@@ -372,10 +404,31 @@ question and option list: told only that option C is unsupported, a model with
 no view of the alternatives cannot choose among them, and that is an amnesia
 effect rather than a verification effect.
 
-**Agents cannot call the verifier themselves.** `verify_tcm_decision` is
-withheld from the agent tool list, so M3 is genuinely unverified rather than
-optionally self-verifying, and `M3→M4` contrasts absent with present rather
-than optional with mandatory.
+**Agents cannot call the verifier themselves.** Every tool carries a `phase`
+(`agent`, `verification`, `both`), and the whole verification surface —
+`verify_tcm_decision` *and* the five deterministic PA checkers — is
+verification-phase. Withholding only `verify_tcm_decision` left `check_dose`
+and its four siblings callable by the agent, so M3 was an optionally
+self-checking arm and `M3→M4` contrasted optional with mandatory verification
+rather than absent with present.
+
+**Tool calls record who made them.** A `ToolStep` carries its phase, so
+`tool_selection_accuracy`, `coverage_honesty` and `pathogenesis_probe_rate` see
+only the calls the model chose. The M4 verifier calls the right checker for the
+item by construction; counting those would have credited M4 with tool-use skill
+for a choice it never made. The behaviour table reports `agent calls` and
+`verifier calls` in separate columns.
+
+**M4 always takes its revision turn**, including on the items no deterministic
+checker adjudicates — it emits an explicit `not_applicable` report instead of
+returning early. Returning early spent one model call fewer than M3C on exactly
+those cases, so the mean stayed close while the contrast over that subset was a
+second-turn effect. Parity is now checked *per case*; a break flags both arms,
+drops the pair from the contrast and is counted in the parity table. Because
+the M4 arm now holds two treatments under one label, the report splits the
+`M3C→M4` gain by verification stratum (`deterministic` / `audit_only` /
+`not_applicable`) — a gain concentrated in the last is a second-turn effect and
+is reported as one.
 
 The interpretable contrasts are:
 
@@ -389,7 +442,8 @@ The interpretable contrasts are:
 `M0→M3` is reported too, but labelled the **whole-scaffold effect** — it
 contains prompt structure, retrieval and agency together and is not a KG-only
 result. A compute-parity table reports realised calls and tokens per control
-pair, so the matching claim is evidenced rather than asserted.
+pair *and the number of per-case parity breaks*, so the matching claim is
+evidenced rather than asserted — means can agree while individual pairs do not.
 
 ---
 
@@ -515,14 +569,34 @@ medicine/external therapy (CP4), monitoring (CP5) and transition decisions
   of its own pathway — clinical pathway stages within one disease share their
   monitoring text almost verbatim. Items are now emitted only when every
   distractor differs observably from the gold stage, and vignettes carry a
-  treatment-history line locating the patient in time. The build reports what
-  it dropped and why.
+  treatment-history line locating the patient in time. First stages are
+  additionally capped at a 25% share, because "no prior treatment" identifies a
+  first stage without any stage reasoning at all. The build reports what it
+  dropped and why: 884 stages with no exit criteria, 222 first stages
+  rebalanced, 46 not discriminable, 2 short of distractors.
+- **Every subtask is checked for answer leakage**, in both directions — no
+  emitted field may contain the gold string and no gold string may contain an
+  emitted field. All nine subtasks are at 0%. The check found two real leaks:
+  CP5 at 100% (the monitoring plan was printed in the vignette asking about it)
+  and CP3 at 59.8%, which no review had flagged and which only a general
+  per-field guard caught rather than a task-specific fix.
 - **CP6 includes `insufficient_evidence`.** A pathway agent forced to always
   choose an action will choose one when the record supports none, which in a
   discharge decision is the dangerous direction. `unsafe_transition` counts any
   answer that moves a patient onward when the criteria are unmet *or*
   unassessed — including a mixed answer that contains both a safe and an
   unsafe option.
+
+**The prespecified CP endpoint is the macro-average**, not pooled accuracy.
+The nine subtasks run from 306 items (CP6) to 988 (CP3, CP5), so a pooled
+number is 53% stage lookup and monitoring and 5.5% transition decision — a
+model that reads stages well and moves patients on badly would read as a good
+pathway executor. The report gives per-subtask rows plus the mean of the six
+capability means, and tests it with a stratified macro bootstrap (resample
+diseases within subtask, average within subtask, weight families equally) so
+the interval describes the same quantity as the point estimate. The sample is
+drawn stratified by subtask for the same reason: a head-slice of 400 leaves CP6
+with 28 items.
 
 TCM-CP is built from the graph's own pathway layer (`scripts/build_tcm_cp.py`),
 because no published TCM pathway benchmark exists. Its gold answers therefore
@@ -543,8 +617,9 @@ would have let an SDT agent invert syndrome→formula and read off the answer.
 
 ```
 tcm_kg/       ontology · store · normalisation · hybrid retrieval
-tcm_tools/    16 tools (8 knowledge + 5 checkers + 3 pathway), domain-gated
-tcm_agent/    frozen runtime, M0–M4, tasks, prompts (versioned text), traces
+tcm_tools/    16 tools (8 knowledge + 5 checkers + 3 pathway), domain- and
+              phase-gated: 6 belong to the M4 verification pass, not the agent
+tcm_agent/    frozen runtime, M0–M4 + controls, tasks, prompts, phase-tagged traces
 tcm_models/   provider adapters, generation cache, keyless replay
 tcm_eval/     datasets · scorers · judge · trace metrics · statistics · report
 runner/       CLI: run · score · judge · report · compare · inspect · coverage
@@ -552,7 +627,7 @@ scripts/      KG coverage audit, TCM-CP benchmark builder
 configs/      models.yaml + one experiment file per benchmark
 kg/           tcm_knowledge_graph.json.gz (the committed artefact)
 vendor/       the benchmark's own evaluate.py, vendored unmodified
-docs/         kg_coverage.md (generated)
+docs/         design.md · kg_coverage.md (generated)
 ```
 
 Datasets are not committed — see `data/*/README.md` for where to put them.

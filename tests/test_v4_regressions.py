@@ -14,7 +14,11 @@ from tcm_kg.schema import Domain
 from tcm_models import build_client, spec_from_config
 from tcm_tools.base import REGISTRY, ToolPhase
 
+from pathlib import Path
+
 from ._fixtures import graph, retriever
+
+REPO = Path(__file__).resolve().parent.parent
 
 SDT_ITEM = {
     "id": "t",
@@ -481,6 +485,167 @@ class V4_5_ReportProvenance(unittest.TestCase):
         )
         self.assertIn("agent calls", report)
         self.assertIn("verifier calls", report)
+
+
+class V4_6_ClinicalPathwayReporting(unittest.TestCase):
+    """A pooled CP accuracy is not a pathway-execution score."""
+
+    SIZES = {
+        "CP1_pathway_eligibility": 20, "CP2_stage_identification": 40,
+        "CP3_stage_actions": 40, "CP4_treatment_principle": 12,
+        "CP4_formula": 12, "CP4_patent_medicine": 12,
+        "CP4_external_therapy": 12, "CP5_monitoring": 40,
+        "CP6_transition_decision": 8,
+    }
+
+    def _items(self, skill):
+        from tcm_eval.scorers import ScoredItem, cp_family
+
+        out = []
+        for subtask, n in self.SIZES.items():
+            family = cp_family(subtask)
+            for i in range(n):
+                # deterministic: the first `skill * n` items in each subtask hit
+                hit = 1.0 if i < round(skill[family] * n) else 0.0
+                for condition in ("M3C", "M4"):
+                    out.append(
+                        ScoredItem(
+                            f"{subtask}::{i}", "cp", condition, "m", 0,
+                            {"exact": hit, "subtask": subtask, "cp_family": family,
+                             "disease": f"D{i % 5}"},
+                            {"parity_error": ""},
+                        )
+                    )
+        return out
+
+    def test_every_subtask_maps_to_exactly_one_family(self):
+        from tcm_eval.scorers import CP_FAMILIES, cp_family
+
+        seen = [s for subtasks in CP_FAMILIES.values() for s in subtasks]
+        self.assertEqual(len(seen), len(set(seen)), "a subtask is in two families")
+        self.assertEqual(cp_family("CP4_formula"), "CP4")
+        self.assertEqual(cp_family("CP6_transition_decision"), "CP6")
+        self.assertEqual(cp_family("something_new"), "other")
+
+    def test_the_scorer_tags_the_family_on_every_item(self):
+        from tcm_eval.scorers import score_cp
+
+        row = score_cp({"answer": ["A"]}, {"subtask": "CP6_transition_decision",
+                                           "answer": ["A"]})
+        self.assertEqual(row["cp_family"], "CP6")
+
+    def test_the_macro_average_is_not_the_pooled_mean(self):
+        """The whole point: CP6 is 8 of 196 items but one of six capabilities."""
+        from tcm_eval.report import cp_subtask_table
+
+        skill = {"CP1": 0.9, "CP2": 0.9, "CP3": 0.9, "CP4": 0.9, "CP5": 0.9, "CP6": 0.0}
+        items = self._items(skill)
+        pooled = sum(
+            i.metrics["exact"] for i in items if i.condition == "M4"
+        ) / sum(1 for i in items if i.condition == "M4")
+        table = cp_subtask_table(items)
+        macro_line = [
+            l for l in table.splitlines() if "**macro**" in l and "| M4 " in l
+        ][0]
+        macro = float(macro_line.rstrip("|").rsplit("|", 1)[1])
+        self.assertAlmostEqual(macro, 0.75, places=2)
+        self.assertGreater(pooled, 0.85)
+        self.assertLess(macro, pooled - 0.10, "the macro did not down-weight the big subtasks")
+
+    def test_the_table_names_every_subtask_and_a_macro_row(self):
+        from tcm_eval.report import cp_subtask_table
+
+        table = cp_subtask_table(
+            self._items({f"CP{i}": 0.5 for i in range(1, 7)})
+        )
+        for subtask in self.SIZES:
+            self.assertIn(subtask, table)
+        self.assertIn("**macro**", table)
+
+    def test_the_macro_contrast_uses_a_matching_estimator(self):
+        from tcm_eval.report import cp_macro_contrast_table
+
+        table, results = cp_macro_contrast_table(
+            self._items({f"CP{i}": 0.5 for i in range(1, 7)})
+        )
+        self.assertTrue(results)
+        for result in results.values():
+            self.assertTrue(
+                result.test.startswith("stratified_macro_bootstrap"),
+                f"macro contrast used {result.test}",
+            )
+
+    def test_a_stratified_sample_gives_the_small_subtasks_room(self):
+        from tcm_eval.datasets import Dataset, FieldMapping
+
+        items = (
+            [{"id": f"a{i}", "subtask": "CP3_stage_actions"} for i in range(90)]
+            + [{"id": f"b{i}", "subtask": "CP6_transition_decision"} for i in range(10)]
+        )
+        data = Dataset("cp", items, FieldMapping())
+        head = data.subset(40)
+        self.assertEqual(
+            sum(1 for i in head.items if i["subtask"] == "CP6_transition_decision"), 0
+        )
+        balanced = data.subset(40, stratify="subtask")
+        counts = {}
+        for item in balanced.items:
+            counts[item["subtask"]] = counts.get(item["subtask"], 0) + 1
+        self.assertEqual(len(balanced.items), 40)
+        self.assertEqual(counts["CP6_transition_decision"], 10, "CP6 was not filled")
+        self.assertEqual(counts["CP3_stage_actions"], 30, "the surplus was not redistributed")
+
+    def test_the_cp_config_stratifies(self):
+        import yaml
+
+        payload = yaml.safe_load(
+            (REPO / "configs" / "experiment.cp.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["dataset"]["stratify"], "subtask")
+
+
+class V4_6_StratifiedMacroBootstrap(unittest.TestCase):
+    def test_the_point_estimate_weights_strata_equally(self):
+        from tcm_eval.stats import stratified_macro_bootstrap
+
+        # stratum "big": 90 items, no effect. stratum "small": 10 items, +1.0.
+        a = [0.0] * 100
+        b = [0.0] * 90 + [1.0] * 10
+        strata = ["big"] * 90 + ["small"] * 10
+        result = stratified_macro_bootstrap(a, b, strata, n_resamples=400)
+        self.assertAlmostEqual(result.delta, 0.5, places=6)  # (0 + 1) / 2
+        self.assertAlmostEqual(sum(b) / len(b), 0.1, places=6)  # the pooled mean
+
+    def test_clustering_within_a_stratum_widens_the_interval(self):
+        from tcm_eval.stats import stratified_macro_bootstrap
+
+        a = [0.0] * 100
+        b = [1.0] * 50 + [0.0] * 50  # perfectly correlated within each cluster
+        strata = ["s"] * 100
+        unclustered = [str(i) for i in range(100)]
+        clustered = [f"c{i // 25}" for i in range(100)]  # 4 clusters
+        narrow = stratified_macro_bootstrap(a, b, strata, unclustered, n_resamples=800)
+        wide = stratified_macro_bootstrap(a, b, strata, clustered, n_resamples=800)
+        self.assertGreater(
+            wide.ci_high - wide.ci_low,
+            (narrow.ci_high - narrow.ci_low) * 1.5,
+            "clustering inside a stratum did not propagate into the interval",
+        )
+
+    def test_misaligned_inputs_are_rejected(self):
+        from tcm_eval.stats import stratified_macro_bootstrap
+
+        with self.assertRaises(ValueError):
+            stratified_macro_bootstrap([0.0], [0.0, 1.0], ["s", "s"])
+        with self.assertRaises(ValueError):
+            stratified_macro_bootstrap([0.0], [0.0], ["s"], ["c1", "c2"])
+
+    def test_an_empty_input_is_a_null_result_not_a_crash(self):
+        from tcm_eval.stats import stratified_macro_bootstrap
+
+        result = stratified_macro_bootstrap([], [], [])
+        self.assertEqual(result.n, 0)
+        self.assertEqual(result.p_value, 1.0)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from .scorers import (
     CP_METRICS,
     CP_PRIMARY,
+    cp_family,
     PA_METRICS,
     PA_PRIMARY,
     SDT_METRICS,
@@ -28,6 +29,7 @@ from .scorers import (
     aggregate,
 )
 from .stats import (
+    stratified_macro_bootstrap,
     PairedResult,
     cluster_paired_bootstrap,
     holm_bonferroni,
@@ -364,6 +366,109 @@ def leakage_table(items: Sequence[ScoredItem]) -> str:
         ],
         rows,
     )
+
+
+def cp_subtask_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) -> str:
+    """Per-subtask CP results, plus the prespecified macro-average.
+
+    A pooled CP accuracy is not a pathway-execution score. The nine subtasks
+    run from 306 items (CP6, transition decisions) to 988 (CP3 and CP5), so
+    over half the pooled number is stage lookup and monitoring, and the
+    safety-relevant transition decision contributes 5.5%. A model that reads
+    stages well and moves patients on badly would read as a good pathway
+    executor. Per-subtask rows show where a model actually fails, and the
+    macro-average -- mean of family means, each of the six capabilities
+    weighted equally -- is the endpoint the contrasts below test.
+    """
+    scoped = [i for i in items if i.dataset == "cp"]
+    if not scoped:
+        return ""
+    grid: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for item in scoped:
+        value = item.metrics.get(metric)
+        if not isinstance(value, (int, float)):
+            continue
+        family = str(item.metrics.get("cp_family") or cp_family(item.metrics.get("subtask", "")))
+        subtask = str(item.metrics.get("subtask") or "unknown")
+        grid[(item.model_key, item.condition, f"{family}\u0000{subtask}")].append(float(value))
+
+    rows: List[List[Any]] = []
+    for model in sorted({m for m, _c, _s in grid}):
+        for condition in [c for c in CONDITION_LABELS if (model, c) in {
+            (m, c) for m, c, _s in grid
+        }]:
+            per_family: Dict[str, List[float]] = defaultdict(list)
+            for (m, c, key), values in sorted(grid.items()):
+                if (m, c) != (model, condition):
+                    continue
+                family, subtask = key.split("\u0000")
+                mean = sum(values) / len(values)
+                per_family[family].append(mean)
+                rows.append([model, condition, family, subtask, len(values), mean])
+            if per_family:
+                macro = sum(
+                    sum(v) / len(v) for v in per_family.values()
+                ) / len(per_family)
+                rows.append(
+                    [model, condition, "**macro**",
+                     f"mean of {len(per_family)} family means", "–", macro]
+                )
+    return _md_table(["model", "condition", "family", "subtask", "n", metric], rows)
+
+
+def cp_macro_contrast_table(
+    items: Sequence[ScoredItem],
+    metric: str = CP_PRIMARY,
+    *,
+    contrasts: Sequence[Tuple[str, str, str]] = CONTRASTS,
+) -> Tuple[str, Dict[str, PairedResult]]:
+    """Condition contrasts on the CP macro-average.
+
+    Built with ``stratified_macro_bootstrap`` so the interval describes the
+    same quantity as the point estimate: resample diseases within each subtask,
+    average within subtask, then weight the six families equally. Using the
+    pooled cluster bootstrap here would give an interval for a different
+    estimand than the one reported above it.
+    """
+    scoped = [i for i in items if i.dataset == "cp"]
+    index = index_items(scoped)
+    results: Dict[str, PairedResult] = {}
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for left, right, label in contrasts:
+            pairs = _usable_pairs(index, model, left, right, metric)
+            if not pairs:
+                continue
+            xs = [float(li.metrics[metric]) for _c, li, _r in pairs]
+            ys = [float(ri.metrics[metric]) for _c, _l, ri in pairs]
+            strata = [
+                str(li.metrics.get("subtask") or "unknown") for _c, li, _r in pairs
+            ]
+            clusters = [
+                str(li.metrics.get("disease") or case_id) for case_id, li, _r in pairs
+            ]
+            result = stratified_macro_bootstrap(xs, ys, strata, clusters)
+            key = f"cp-macro|{model}|{left}->{right}"
+            results[key] = result
+            rows.append(
+                [
+                    model, f"{left}→{right}", label, result.n,
+                    result.mean_a, result.mean_b, result.delta,
+                    f"[{result.ci_low:+.3f}, {result.ci_high:+.3f}]",
+                    result.p_value,
+                ]
+            )
+    if not rows:
+        return "", results
+    corrected = holm_bonferroni({k: v.p_value for k, v in results.items()})
+    for row, key in zip(rows, results):
+        row.append(corrected[key]["p_adjusted"])
+        row.append("✓" if corrected[key]["reject"] else "")
+    headers = [
+        "model", "contrast", "what it isolates", "n items",
+        "macro before", "macro after", "Δ macro", "95% CI", "p", "p (Holm)", "sig",
+    ]
+    return _md_table(headers, rows), results
 
 
 #: Below this many paired cases a stratum is described but not tested: a
@@ -748,12 +853,45 @@ def build_report(
         parts.append("")
         parts.append(main_table(items, dataset, metrics))
         parts.append("")
+        if dataset == "cp":
+            subtasks = cp_subtask_table(items, primary)
+            if subtasks:
+                parts.append("### Per-subtask results")
+                parts.append("")
+                parts.append(
+                    "The pooled row above is not a pathway-execution score: CP3 and "
+                    "CP5 contribute 988 items each while CP6 — the transition "
+                    "decision, the one with a patient-safety reading — contributes "
+                    "306. **The prespecified CP endpoint is the macro-average**, "
+                    "the mean of the six family means, so each capability counts "
+                    "once. Per-subtask rows show where a model actually fails."
+                )
+                parts.append("")
+                parts.append(subtasks)
+                parts.append("")
+                macro_table, macro_results = cp_macro_contrast_table(items, primary)
+                if macro_table:
+                    parts.append("### Contrasts on the macro-average (prespecified endpoint)")
+                    parts.append("")
+                    parts.append(
+                        "Stratified macro bootstrap: diseases are resampled within "
+                        "each subtask, subtask means are taken, then the six "
+                        "families are weighted equally — so the interval describes "
+                        "the same quantity as the point estimate. Holm-corrected "
+                        f"within this table ({len(macro_results)} comparisons)."
+                    )
+                    parts.append("")
+                    parts.append(macro_table)
+                    parts.append("")
         table, results = contrast_table(
             items, dataset, primary, clusters="disease" if dataset == "cp" else None
         )
         tests_used = sorted({r.test for r in results.values()}) or ["–"]
         family = HYPOTHESIS_FAMILIES.get(dataset, f"{dataset} family")
-        parts.append("### Paired condition contrasts")
+        parts.append(
+            "### Paired condition contrasts"
+            + (" (pooled, secondary)" if dataset == "cp" else "")
+        )
         parts.append("")
         parts.append(
             f"Test chosen from the data: {', '.join(tests_used)}. "

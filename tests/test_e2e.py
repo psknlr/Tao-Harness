@@ -51,6 +51,9 @@ PA_ANSWER = json.dumps(
     ensure_ascii=False,
 )
 N_SDT_CASES = 3
+#: M0, M1, M2, M2C, M3, M3C, M4 -- the controls included, because
+#: M2C->M3 and M3C->M4 are the contrasts the study actually reports.
+N_SDT_CONDITIONS = 7
 N_PA_CASES = 4
 
 
@@ -65,7 +68,7 @@ class EndToEndTests(unittest.TestCase):
         code = main(["run", SDT_CONFIG, "--echo-script", SDT_ANSWER])
         self.assertEqual(code, 0)
         traces = read_traces(self.out / "traces.sdt.echo.jsonl")
-        self.assertEqual(len(traces), N_SDT_CASES * 5)
+        self.assertEqual(len(traces), N_SDT_CASES * N_SDT_CONDITIONS)
         self.assertEqual(len({t.framework_hash for t in traces}), 1)
         self.assertTrue(all(t.final is not None for t in traces))
 
@@ -79,7 +82,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(main(["score", SDT_CONFIG]), 0)
         path = self.out / "scores.sdt.jsonl"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(rows), N_SDT_CASES * 5)
+        self.assertEqual(len(rows), N_SDT_CASES * N_SDT_CONDITIONS)
         # 案例001's gold answers are pathogenesis A and syndrome A, which the
         # scripted answer matches exactly; the other two cases it gets wrong
         by_case = {}
@@ -106,7 +109,7 @@ class EndToEndTests(unittest.TestCase):
             main(["run", SDT_CONFIG, "--overwrite", "--replay"]), 0
         )
         traces = read_traces(self.out / "traces.sdt.echo.jsonl")
-        self.assertEqual(len(traces), N_SDT_CASES * 5)
+        self.assertEqual(len(traces), N_SDT_CASES * N_SDT_CONDITIONS)
         self.assertTrue(all(t.final is not None for t in traces), "replay lost answers")
 
     def test_06_compare_is_paired(self):
@@ -188,7 +191,7 @@ class EndToEndTests(unittest.TestCase):
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             self.assertEqual(main(["run", SDT_CONFIG, "--echo-script", SDT_ANSWER]), 0)
             traces = read_traces(path)
-            self.assertEqual(len(traces), N_SDT_CASES * 5, "traces were duplicated")
+            self.assertEqual(len(traces), N_SDT_CASES * N_SDT_CONDITIONS, "traces were duplicated")
             self.assertFalse(
                 any(t.run_signature == "not-this-run" for t in traces),
                 "a trace from a different run survived the resume",

@@ -258,6 +258,100 @@ def cluster_paired_bootstrap(
     )
 
 
+def stratified_macro_bootstrap(
+    a: Sequence[float],
+    b: Sequence[float],
+    strata: Sequence[str],
+    clusters: Optional[Sequence[str]] = None,
+    *,
+    n_resamples: int = 10000,
+    seed: int = 20260829,
+    alpha: float = 0.05,
+) -> PairedResult:
+    """Paired test on a **macro-average**: equal weight per stratum.
+
+    TCM-CP's nine subtasks range from 306 to 988 items, so a pooled accuracy is
+    53% CP2/CP3/CP5 and 5.5% CP6 -- the safety-relevant one. A model that
+    executes stage lookups well and transition decisions badly reads as a good
+    pathway executor. The prespecified endpoint is therefore the mean of the
+    per-subtask means, and the interval has to be built the same way the point
+    estimate is or it describes a different quantity.
+
+    Resampling is done *within* each stratum, and within a stratum by cluster
+    when ``clusters`` is given, so the two dependencies TCM-CP actually has --
+    unequal subtask sizes and many items per disease -- are both carried into
+    the interval. Strata are fixed, not resampled: the six task families are
+    the population, not a sample from one.
+    """
+    if not (len(a) == len(b) == len(strata)):
+        raise ValueError("values and stratum labels must align")
+    if clusters is not None and len(clusters) != len(a):
+        raise ValueError("cluster labels must align with the values")
+    n = len(a)
+    if n == 0:
+        return PairedResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, "stratified_macro_bootstrap")
+
+    # stratum -> cluster -> [paired differences]
+    grouped: Dict[str, Dict[str, List[float]]] = {}
+    means_a: Dict[str, List[float]] = {}
+    means_b: Dict[str, List[float]] = {}
+    for i in range(n):
+        stratum = str(strata[i])
+        cluster = str(clusters[i]) if clusters is not None else str(i)
+        grouped.setdefault(stratum, {}).setdefault(cluster, []).append(
+            float(b[i]) - float(a[i])
+        )
+        means_a.setdefault(stratum, []).append(float(a[i]))
+        means_b.setdefault(stratum, []).append(float(b[i]))
+
+    keys = sorted(grouped)
+
+    def _macro(per_stratum: Mapping[str, List[float]]) -> float:
+        return sum(sum(v) / len(v) for v in per_stratum.values()) / len(per_stratum)
+
+    observed = _macro({k: [d for c in grouped[k].values() for d in c] for k in keys})
+
+    rng = random.Random(seed)
+    deltas: List[float] = []
+    cluster_keys = {k: sorted(grouped[k]) for k in keys}
+    for _ in range(n_resamples):
+        total = 0.0
+        for stratum in keys:
+            names = cluster_keys[stratum]
+            picked_sum, picked_n = 0.0, 0
+            for _ in range(len(names)):
+                diffs = grouped[stratum][names[rng.randrange(len(names))]]
+                picked_sum += sum(diffs)
+                picked_n += len(diffs)
+            total += picked_sum / picked_n if picked_n else 0.0
+        deltas.append(total / len(keys))
+    deltas.sort()
+
+    lo = deltas[max(0, int((alpha / 2) * n_resamples) - 1)]
+    hi = deltas[min(n_resamples - 1, int((1 - alpha / 2) * n_resamples))]
+    centred = [d - observed for d in deltas]
+    extreme = sum(1 for d in centred if abs(d) >= abs(observed))
+    p_value = (extreme + 1) / (n_resamples + 1)
+
+    wins = sum(1 for s in grouped.values() for c in s.values() for d in c if d > 0)
+    losses = sum(1 for s in grouped.values() for c in s.values() for d in c if d < 0)
+    label = f"stratified_macro_bootstrap[{len(keys)}_strata"
+    label += f",{sum(len(v) for v in cluster_keys.values())}_clusters]" if clusters is not None else "]"
+    return PairedResult(
+        n=n,
+        mean_a=_macro(means_a),
+        mean_b=_macro(means_b),
+        delta=observed,
+        ci_low=lo,
+        ci_high=hi,
+        p_value=p_value,
+        test=label,
+        wins=wins,
+        losses=losses,
+        ties=n - wins - losses,
+    )
+
+
 def is_binary(values: Sequence[float], *, tolerance: float = 1e-9) -> bool:
     """Whether every observation is 0 or 1.
 

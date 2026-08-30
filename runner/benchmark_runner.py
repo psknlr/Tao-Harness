@@ -258,7 +258,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"scoring for those fields will be skipped.",
             file=sys.stderr,
         )
-    items = dataset.subset(config.dataset_limit).items
+    items = dataset.subset(
+        config.dataset_limit, stratify=config.dataset_stratify
+    ).items
     if not items:
         print("no items to run", file=sys.stderr)
         return 1
