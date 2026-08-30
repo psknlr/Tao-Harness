@@ -59,7 +59,7 @@ _VERIFY_SPEC = ToolSpec(
         },
         "required": ["syndrome"],
     },
-    domains=(Domain.CLINICAL, Domain.SAFETY, Domain.FULL),
+    domains=(Domain.CLINICAL, Domain.SAFETY, Domain.PATHWAY, Domain.FULL),
     deterministic=True,
     verification=True,
 )

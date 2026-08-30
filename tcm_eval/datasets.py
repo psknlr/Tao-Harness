@@ -494,7 +494,46 @@ def load_syndrome_knowledge(path: str | Path) -> Dict[str, Dict[str, Any]]:
 # dispatch
 # --------------------------------------------------------------------------- #
 
-LOADERS = {"sdt": load_sdt, "pa": load_pa, "tcmsd": load_tcmsd}
+def load_cp(path: str | Path) -> Dataset:
+    """TCM-CP: the KG-derived clinical-pathway benchmark.
+
+    Gold answers come from the same graph the KG arms consult, so this is an
+    instrument-capability benchmark, not an effectiveness one. See
+    ``scripts/build_tcm_cp.py`` and ``data/cp/README.md``; the report labels it
+    accordingly and keeps its contrasts out of the SDT/PA tables.
+    """
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(
+            f"dataset not found: {target}; build it with "
+            f"`python scripts/build_tcm_cp.py --out {target}`"
+        )
+    records = _load_json_records(target)
+    mapping = FieldMapping(
+        bound={k: k for k in ("id", "subtask", "question", "options", "answer", "disease", "stage_id")}
+    )
+    items: List[Dict[str, Any]] = []
+    for index, record in enumerate(records):
+        item = dict(record)
+        item["id"] = str(item.get("id") or f"cp_{index:05d}")
+        item["options"] = parse_options(item.get("options"))
+        item["answer_letters"] = parse_letters(item.get("answer"))
+        item["is_multi"] = len(item["answer_letters"]) > 1
+        item["_has_gold"] = bool(item["answer_letters"])
+        item["_raw"] = dict(record)
+        items.append(item)
+    from collections import Counter
+
+    counts = Counter(i.get("subtask") for i in items)
+    mapping.notes.append(f"subtasks: {dict(sorted(counts.items()))}")
+    mapping.notes.append(
+        "KG-derived benchmark: measures pathway execution faithfulness, "
+        "not clinical effectiveness"
+    )
+    return Dataset("cp", items, mapping, target)
+
+
+LOADERS = {"sdt": load_sdt, "pa": load_pa, "tcmsd": load_tcmsd, "cp": load_cp}
 
 
 def load_dataset(path: str | Path, kind: str, **kwargs: Any) -> Dataset:

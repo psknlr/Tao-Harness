@@ -1,0 +1,39 @@
+name: tests
+
+# The benchmark datasets are not redistributed in this repository, so the suite
+# is built to pass without them: the end-to-end tests run against committed
+# synthetic fixtures in the released schemas, and the tests that need the real
+# files skip themselves. A green run here means the harness is sound, not that
+# the benchmarks were scored.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Verify the graph matches the declared ontology
+        run: python -c "from tcm_kg import load_kg; kg = load_kg(validate=True); print(kg.summary())"
+
+      - name: Show the frozen framework contract
+        run: python -m runner.benchmark_runner inspect | head -40
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -t . -v

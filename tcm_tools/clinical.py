@@ -16,7 +16,7 @@ from tcm_kg.store import Node
 from ._common import doc_brief, documents_block, edge_evidence, node_brief, resolve_entity
 from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
 
-_ALL_DOMAINS = (Domain.CLINICAL, Domain.SAFETY, Domain.FULL)
+_ALL_DOMAINS = (Domain.CLINICAL, Domain.SAFETY, Domain.PATHWAY, Domain.FULL)
 
 
 # --------------------------------------------------------------------------- #

@@ -5,8 +5,21 @@
 # here, so a single edit changes them for every model at once and no model can
 # quietly get a different temperature.
 #
-# Update `model_id` to the exact snapshot you run, and record it in the paper:
-# a marketing name is not a reproducible identifier.
+# ---------------------------------------------------------------------------
+# THE model_id VALUES BELOW ARE PLACEHOLDERS. Replace each with the exact
+# snapshot string your provider returns, before spending anything.
+#
+# They are deliberately not guessed at: a model identifier that does not exist
+# fails at the first request, but one that exists and is not the model you
+# meant produces a full, expensive, quietly wrong experiment. The run manifest
+# records whatever you set here alongside the graph and dataset hashes, so the
+# paper can state exactly which snapshots produced which numbers -- which a
+# marketing name ("the latest Pro model") cannot.
+#
+# Check what you are actually about to call:
+#   python -m runner.benchmark_runner run <config> --limit 2
+# and read the model field in runs/*/manifest.*.json.
+# ---------------------------------------------------------------------------
 
 models:
   deepseek:

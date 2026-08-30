@@ -125,6 +125,12 @@ class Domain(str, Enum):
 
     CLINICAL = "clinical_reasoning"
     SAFETY = "prescription_safety"
+    #: The pathway domain sees the whole clinical picture, treatment included,
+    #: because executing a pathway *is* deciding on treatment. It is a separate
+    #: domain rather than a widening of CLINICAL precisely so that SDT keeps
+    #: its isolation: opening treatment entities to SDT to enable pathway work
+    #: would let an SDT agent invert syndrome->formula and recover the answer.
+    PATHWAY = "clinical_pathway"
     FULL = "full_graph"
 
 
@@ -200,6 +206,22 @@ DOMAIN_POLICIES: Mapping[Domain, DomainPolicy] = {
             "of study and are fully exposed. PathwayStage / Department are "
             "withheld: they carry inpatient workflow detail irrelevant to "
             "prescription audit and only dilute retrieval."
+        ),
+    ),
+    Domain.PATHWAY: DomainPolicy(
+        domain=Domain.PATHWAY,
+        allowed_nodes=frozenset(t.value for t in NodeType),
+        rationale=(
+            "Executing a clinical pathway means moving a patient through "
+            "staged decisions: eligibility, stage identification, the actions "
+            "due at that stage, the treatment those actions imply, the "
+            "monitoring and safety constraints that apply, and whether the "
+            "exit or transition criteria are met. That spans every entity "
+            "type, so the pathway domain withholds nothing. This is sound "
+            "here only because the pathway benchmark is not a "
+            "syndrome-differentiation test: nothing in it is answerable by "
+            "inverting a treatment mapping, and its own results are reported "
+            "as instrument capability rather than as clinical effectiveness."
         ),
     ),
     Domain.FULL: DomainPolicy(

@@ -14,8 +14,11 @@ def ctx(domain, budget=None):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_thirteen_tools_are_registered(self):
-        self.assertEqual(len(REGISTRY.specs_for(Domain.FULL)), 13)
+    def test_the_full_tool_surface_is_registered(self):
+        # 8 knowledge + 5 deterministic checkers + 3 pathway
+        self.assertEqual(len(REGISTRY.specs_for(Domain.FULL)), 16)
+        self.assertEqual(len(REGISTRY.specs_for(Domain.CLINICAL)), 5)
+        self.assertEqual(len(REGISTRY.specs_for(Domain.PATHWAY)), 16)
 
     def test_no_tool_exposes_a_query_language(self):
         # letting a model write Cypher would make query-language skill a

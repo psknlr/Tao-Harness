@@ -27,6 +27,9 @@ class ExperimentConfig:
     dataset_path: Path
     dataset_kind: str
     dataset_limit: Optional[int]
+    #: explicit gold-answer file for SDT splits whose name the released
+    #: convention does not cover; ``None`` falls back to auto-discovery
+    dataset_results_path: Optional[Path]
     models: List[str]
     conditions: List[str]
     samples: int
@@ -34,6 +37,11 @@ class ExperimentConfig:
     output_dir: Path
     concurrency: int
     raw: Mapping[str, Any] = field(default_factory=dict)
+
+    def loader_kwargs(self) -> Dict[str, Any]:
+        if self.dataset_kind == "sdt" and self.dataset_results_path is not None:
+            return {"results_path": self.dataset_results_path}
+        return {}
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -96,6 +104,8 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         max_agent_turns=int(payload.get("max_agent_turns", 16)),
         max_format_retries=int(payload.get("max_format_retries", 2)),
         registry=REGISTRY,
+        task=str(payload.get("task") or dataset.get("kind") or "sdt"),
+        domain=str(payload.get("domain") or Domain.CLINICAL.value),
     )
 
     return ExperimentConfig(
@@ -105,6 +115,9 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         dataset_path=_resolve(dataset.get("path") or ""),
         dataset_kind=str(dataset.get("kind") or "sdt"),
         dataset_limit=dataset.get("limit"),
+        dataset_results_path=(
+            _resolve(dataset["results_path"]) if dataset.get("results_path") else None
+        ),
         models=[str(m) for m in (payload.get("models") or ["echo"])],
         conditions=conditions,
         samples=int(payload.get("samples", 1)),

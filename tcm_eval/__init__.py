@@ -26,19 +26,25 @@ from .official_sdt import (
 )
 from .report import build_report, contrast_table, main_table, pa_rule_table
 from .scorers import (
+    CP_METRICS,
+    CP_PRIMARY,
     PA_METRICS,
     PA_PRIMARY,
     SDT_METRICS,
     SDT_PRIMARY,
     ScoredItem,
     aggregate,
+    consensus_prediction,
     majority_vote,
+    score_cp,
     score_pa,
     score_sdt,
 )
 from .stats import holm_bonferroni, mcnemar, paired_bootstrap, pearson, spearman
 
 __all__ = [
+    "CP_METRICS",
+    "CP_PRIMARY",
     "Dataset",
     "FieldMapping",
     "JudgeScore",
@@ -52,6 +58,7 @@ __all__ = [
     "aggregate_judge",
     "aggregate_trace_metrics",
     "build_report",
+    "consensus_prediction",
     "clinical_info_extraction_eval",
     "contrast_table",
     "coverage_honesty",
@@ -72,6 +79,7 @@ __all__ = [
     "mcnemar",
     "paired_bootstrap",
     "pearson",
+    "score_cp",
     "score_pa",
     "score_sdt",
     "spearman",

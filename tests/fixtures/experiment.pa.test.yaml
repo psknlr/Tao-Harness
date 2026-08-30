@@ -1,8 +1,7 @@
 name: tcm-test-pa
 dataset:
   kind: pa
-  path: data/pa/TCMEval-PA.xlsx
-  limit: 6
+  path: tests/fixtures/pa_mini.json
 task: pa
 domain: prescription_safety
 models: [echo]

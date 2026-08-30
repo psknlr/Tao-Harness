@@ -19,7 +19,10 @@ re-bills a single token, and a run recorded once replays in CI forever.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import hashlib
 import json
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +39,8 @@ from tcm_agent import AgentRuntime, Trace, build_task, read_traces, write_traces
 from tcm_eval import (
     PA_METRICS,
     PA_PRIMARY,
+    CP_METRICS,
+    CP_PRIMARY,
     SDT_METRICS,
     SDT_PRIMARY,
     ScoredItem,
@@ -43,6 +48,7 @@ from tcm_eval import (
     build_report,
     inspect_dataset,
     load_dataset,
+    score_cp,
     score_pa,
     score_sdt,
     trace_metrics,
@@ -69,11 +75,95 @@ def _load_graph(kg_path: Optional[str], config: Optional[ExperimentConfig] = Non
     params = config.framework.retrieval if config else None
     retriever = KGRetriever(kg, params)
     cache_dir = REPO_ROOT / "runs" / ".index"
-    cache_file = cache_dir / f"{retriever.cache_key(str(len(kg.nodes)))}.pkl"
+    # Key the index cache on the graph's *contents*, not its node count: an
+    # edit to a thousand relations leaves the count unchanged and would
+    # otherwise silently reuse a stale index.
+    cache_file = cache_dir / f"{retriever.cache_key(kg.content_hash())}.pkl"
     if not retriever.load(cache_file):
         retriever.warm()
         retriever.save(cache_file)
     return kg, retriever
+
+
+def _file_hash(path: Path) -> str:
+    """SHA-256 of a file's bytes, streamed."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _git_commit() -> str:
+    try:
+        return (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+            or "unknown"
+        )
+    except Exception:
+        return "unknown"
+
+
+def write_manifest(
+    config: ExperimentConfig,
+    kg,
+    specs: Mapping[str, Any],
+    *,
+    n_items: int,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Record everything needed to reproduce or audit this run.
+
+    A framework hash proves two arms shared a scaffold; it does not tell a
+    reader a year later which graph, which dataset file, which code revision or
+    which model snapshots produced a number. The manifest does, and it is
+    written before generation starts so an interrupted run still leaves a
+    record of what it was doing.
+    """
+    manifest: Dict[str, Any] = {
+        "experiment": config.name,
+        "task": config.task,
+        "domain": config.domain.value,
+        "framework_hash": config.framework.framework_hash(),
+        "kg_content_sha256": kg.content_hash(),
+        "dataset_path": str(config.dataset_path),
+        "dataset_sha256": _file_hash(config.dataset_path),
+        "n_items": n_items,
+        "conditions": config.conditions,
+        "samples": config.samples,
+        "git_commit": _git_commit(),
+        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "python": sys.version.split()[0],
+        "models": {
+            key: {
+                "provider": specs[key].provider,
+                "model_id": specs[key].model_id,
+                "base_url": specs[key].base_url,
+            }
+            for key in config.models
+            if key in specs
+        },
+        "framework": config.framework.describe(),
+    }
+    if config.dataset_results_path:
+        manifest["dataset_results_path"] = str(config.dataset_results_path)
+        manifest["dataset_results_sha256"] = _file_hash(config.dataset_results_path)
+    if extra:
+        manifest.update(extra)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    (config.output_dir / f"manifest.{config.task}.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
 
 
 def _trace_path(config: ExperimentConfig, model: str) -> Path:
@@ -98,7 +188,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None:
         config.dataset_limit = args.limit
 
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     print(dataset.mapping.report(), file=sys.stderr)
     if dataset.mapping.missing:
         print(
@@ -113,10 +203,18 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     kg, retriever = _load_graph(args.kg, config)
     specs = load_models(args.models_config)
+    # content fingerprints participate in the framework hash, so they must be
+    # set before it is computed or recorded anywhere
+    config.framework.kg_hash = kg.content_hash()
+    config.framework.dataset_hash = _file_hash(config.dataset_path)
     framework_hash = config.framework.framework_hash()
-    print(f"framework_hash={framework_hash}  n_items={len(items)}", file=sys.stderr)
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = write_manifest(config, kg, specs, n_items=len(items))
+    print(
+        f"framework_hash={framework_hash}  kg={manifest['kg_content_sha256'][:12]}  "
+        f"dataset={manifest['dataset_sha256'][:12]}  n_items={len(items)}",
+        file=sys.stderr,
+    )
     (config.output_dir / "run_config.json").write_text(
         json.dumps(config.describe(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -199,10 +297,57 @@ def cmd_run(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _consensus_traces(traces: Sequence[Trace]) -> List[Trace]:
+    """Collapse the samples of each case into one self-consistent trace.
+
+    Only runs when a case actually has several samples. The combined trace
+    keeps the union of tool steps so behavioural metrics still reflect the work
+    done, and is marked ``sample=-1`` so it cannot be confused with a real one.
+    """
+    from tcm_eval.scorers import consensus_prediction
+
+    groups: Dict[Tuple[str, str, str], List[Trace]] = {}
+    for trace in traces:
+        groups.setdefault((trace.model_key, trace.condition, trace.case_id), []).append(trace)
+
+    out: List[Trace] = []
+    for (_model, _condition, _case), bucket in groups.items():
+        if len(bucket) == 1:
+            out.append(bucket[0])
+            continue
+        bucket.sort(key=lambda t: t.sample)
+        merged = consensus_prediction([t.final for t in bucket])
+        head = bucket[0]
+        combined = Trace(
+            run_id=head.run_id,
+            case_id=head.case_id,
+            dataset=head.dataset,
+            condition=head.condition,
+            model_key=head.model_key,
+            framework_hash=head.framework_hash,
+            sample=-1,
+            started_at=head.started_at,
+        )
+        for trace in bucket:
+            combined.llm_steps.extend(trace.llm_steps)
+            combined.tool_steps.extend(trace.tool_steps)
+            combined.wall_ms += trace.wall_ms
+            combined.static_context_chars = max(
+                combined.static_context_chars, trace.static_context_chars
+            )
+        combined.final = merged
+        combined.parse_strategy = head.parse_strategy
+        combined.error = None if merged else "no sample produced an answer"
+        out.append(combined)
+    return out
+
+
 def _score_traces(
     config: ExperimentConfig, traces: Sequence[Trace], gold: Mapping[str, Mapping[str, Any]], kg
 ) -> List[ScoredItem]:
     scored: List[ScoredItem] = []
+    if config.samples > 1:
+        traces = _consensus_traces(traces)
     for trace in traces:
         reference = gold.get(trace.case_id)
         if reference is None:
@@ -211,6 +356,8 @@ def _score_traces(
             continue  # generated but unscoreable (a split with blank answers)
         if config.task == "sdt":
             metrics = score_sdt(trace.final, reference, kg=kg)
+        elif config.task == "cp":
+            metrics = score_cp(trace.final, reference)
         else:
             metrics = score_pa(trace.final, reference)
             metrics["rule_id"] = reference.get("rule_id")
@@ -234,9 +381,12 @@ def _score_traces(
 
 def cmd_score(args: argparse.Namespace) -> int:
     config = load_experiment(args.config)
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     gold = {str(item["id"]): item for item in dataset.items}
     kg, _ = _load_graph(args.kg, config) if config.task == "sdt" else (None, None)
+    if kg is not None:
+        config.framework.kg_hash = kg.content_hash()
+    config.framework.dataset_hash = _file_hash(config.dataset_path)
 
     all_scored: List[ScoredItem] = []
     trace_summaries: Dict[str, Any] = {}
@@ -273,7 +423,9 @@ def cmd_score(args: argparse.Namespace) -> int:
     )
     print(f"scored {len(all_scored)} traces -> {out_path}", file=sys.stderr)
 
-    metrics = SDT_METRICS if config.task == "sdt" else PA_METRICS
+    metrics = {"sdt": SDT_METRICS, "pa": PA_METRICS, "cp": CP_METRICS}.get(
+        config.task, PA_METRICS
+    )
     from tcm_eval.report import main_table
 
     print(main_table(all_scored, config.task, metrics))
@@ -312,7 +464,7 @@ def cmd_judge(args: argparse.Namespace) -> int:
     if config.task != "sdt":
         print("the judge scores SDT free-text steps only", file=sys.stderr)
         return 1
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     gold = {str(item["id"]): item for item in dataset.items}
 
     specs = load_models(args.models_config)
@@ -417,7 +569,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if config.task != "sdt":
         print("submission files are defined for SDT only", file=sys.stderr)
         return 1
-    dataset = load_dataset(config.dataset_path, config.dataset_kind)
+    dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     order = [item["id"] for item in dataset.items]
 
     trace_file = config.output_dir / f"traces.{config.task}.{args.model}.jsonl"
@@ -544,7 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = sub.add_parser("inspect", help="print the graph, domain and tool contract")
     inspect.add_argument("--dataset", default=None)
-    inspect.add_argument("--dataset-kind", default="sdt", choices=["sdt", "pa", "tcmsd"])
+    inspect.add_argument(
+        "--dataset-kind", default="sdt", choices=["sdt", "pa", "tcmsd", "cp"]
+    )
     inspect.set_defaults(func=cmd_inspect)
 
     coverage = sub.add_parser(

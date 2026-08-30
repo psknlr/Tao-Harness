@@ -17,6 +17,7 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -133,6 +134,7 @@ class KGStore:
         self._doc_index: Dict[str, str] = {}
         self._canonical: Dict[str, str] = {}
         self._cluster: Dict[str, List[str]] = defaultdict(list)
+        self._content_hash: Optional[str] = None
 
         self._load_nodes(nodes)
         self._load_edges(edges)
@@ -489,6 +491,41 @@ class KGStore:
             and policy.may_return(self.nodes[nid].type, verification=verification)
         ]
 
+    def content_hash(self) -> str:
+        """Semantic fingerprint of the graph's contents.
+
+        Computed over every node's identity, type, name and attributes and
+        every edge's endpoints, type and evidence -- not over the file bytes,
+        so the JSON and GraphML exports of one graph hash identically while any
+        change to a node attribute or a relation changes the hash.
+
+        This is what the retrieval cache and the run manifest key on. Keying on
+        node *count*, as an earlier version did, meant that editing a thousand
+        relations or rewriting two thousand node attributes left the count at
+        9,350 and silently reused a stale index -- a reproducibility failure
+        that would surface as inexplicable score drift.
+        """
+        if self._content_hash is None:
+            digest = hashlib.sha256()
+            for node_id in sorted(self.nodes):
+                node = self.nodes[node_id]
+                digest.update(node_id.encode("utf-8"))
+                digest.update(node.type.encode("utf-8"))
+                digest.update(node.name.encode("utf-8"))
+                digest.update(
+                    json.dumps(node.attrs, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                )
+                digest.update(
+                    json.dumps(node.first_mention, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                )
+            for edge in sorted(self.edges, key=lambda e: (e.source, e.type, e.target, e.id)):
+                digest.update(f"{edge.source}|{edge.type}|{edge.target}".encode("utf-8"))
+                digest.update(
+                    json.dumps(edge.evidence, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                )
+            self._content_hash = digest.hexdigest()
+        return self._content_hash
+
     def summary(self) -> Dict[str, Any]:
         return {
             "n_nodes": len(self.nodes),
@@ -497,4 +534,5 @@ class KGStore:
             "edge_types": self.edge_type_counts(),
             "n_documents": len(self._doc_index),
             "n_identity_clusters": sum(1 for v in self._cluster.values() if len(v) > 1),
+            "content_hash": self.content_hash()[:16],
         }

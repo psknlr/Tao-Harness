@@ -15,7 +15,9 @@ domain: clinical_reasoning
 
 models: [deepseek, gemini, glm, gpt, minimax]
 conditions: [M0, M1, M2, M3, M4]
-samples: 1              # >1 enables self-consistency voting
+samples: 1              # >1 enables self-consistency: samples are combined by
+                        # per-option majority vote before scoring (see
+                        # tcm_eval.scorers.consensus_prediction)
 
 # ---- frozen framework contract: identical for every model ----
 decode:

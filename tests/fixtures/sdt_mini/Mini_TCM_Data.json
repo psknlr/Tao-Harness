@@ -1,0 +1,35 @@
+[
+  {
+    "Medical Record ID": "案例001",
+    "Clinical Data": "男性，52岁。初诊：2019年。主诉及病史：心悸不安3月余。诊查：善惊易恐，坐卧不安，多梦易醒，食少纳呆。舌淡红，苔薄白，脉细。",
+    "Clinical Information": "",
+    "Answers of TCM Pathogenesis": "",
+    "Options of TCM Pathogenesis": "A:心胆气虚;B:痰热扰心;C:心血不足;D:水饮凌心;E:心阳不振;F:肝郁气滞;G:瘀阻心脉;H:阴虚火旺;I:脾胃虚弱;J:肾精不足",
+    "Answers of TCM Syndrome": "",
+    "Options of TCM Syndrome": "A:心虚胆怯证;B:痰火扰心证;C:心脾两虚证;D:水饮凌心证;E:心阳不振证;F:肝郁化火证;G:心血瘀阻证;H:阴虚火旺证;I:脾胃虚弱证;J:肾精亏虚证",
+    "Explanatory Summary": "",
+    "Syndrome Differentiation": ""
+  },
+  {
+    "Medical Record ID": "案例002",
+    "Clinical Data": "女性，46岁。初诊：2020年。主诉及病史：胸闷咳喘2周。诊查：咯痰粘稠，心烦失眠，咽干口燥。舌质暗红，苔黄腻，脉滑数。",
+    "Clinical Information": "",
+    "Answers of TCM Pathogenesis": "",
+    "Options of TCM Pathogenesis": "A:痰热壅肺;B:血瘀内阻;C:风寒束表;D:肺气亏虚;E:胃失和降;F:肝阳上亢;G:寒湿困脾;H:热伤肺络;I:气阴两虚;J:水湿泛滥",
+    "Answers of TCM Syndrome": "",
+    "Options of TCM Syndrome": "A:风寒袭肺证;B:痰瘀郁肺证;C:肺气虚证;D:胃气上逆证;E:肝火犯肺证;F:寒湿困脾证;G:气阴两虚证;H:水气凌心证;I:燥邪伤肺证;J:痰湿阻肺证",
+    "Explanatory Summary": "",
+    "Syndrome Differentiation": ""
+  },
+  {
+    "Medical Record ID": "案例003",
+    "Clinical Data": "男性，38岁。初诊：2018年。主诉及病史：鼻流血15天。诊查：口渴鼻干，胸闷气逆，大便干。脉浮大数，舌质红。",
+    "Clinical Information": "",
+    "Answers of TCM Pathogenesis": "",
+    "Options of TCM Pathogenesis": "A:肝郁;B:伤阴耗气;C:湿邪阻滞;D:阴虚阳亢;E:耗伤心神;F:损伤中气;G:扰动神明;H:血热不固;I:水饮内停;J:热伤肺络",
+    "Answers of TCM Syndrome": "",
+    "Options of TCM Syndrome": "A:脾胃不和;B:血热妄行;C:心肾两亏;D:湿热互结;E:邪陷心包;F:暑温动风;G:脾肾阳虚;H:痰蒙心窍;I:热伤阳络;J:痰湿内蕴",
+    "Explanatory Summary": "",
+    "Syndrome Differentiation": ""
+  }
+]

@@ -1,9 +1,13 @@
-# Offline end-to-end fixture: real SDT test split, echo provider, all five arms.
+# Offline end-to-end fixture.
+#
+# Points at committed synthetic fixtures written in the released SDT schema, not
+# at the benchmark files, so the CLI is exercised on every clean checkout --
+# including CI, where the datasets are absent by design.
 name: tcm-test-sdt
 dataset:
   kind: sdt
-  path: data/sdt/Test_TCM_Data_v1.json
-  limit: 4
+  path: tests/fixtures/sdt_mini/Mini_TCM_Data.json
+  results_path: tests/fixtures/sdt_mini/Results/Mini_data_result.txt
 task: sdt
 domain: clinical_reasoning
 models: [echo]

@@ -47,7 +47,8 @@ Every figure below is computed from the delivered graph by `scripts/kg_coverage.
     "USES_PATENT_MEDICINE": 1274
   },
   "n_documents": 632,
-  "n_identity_clusters": 222
+  "n_identity_clusters": 222,
+  "content_hash": "c94e3dd59d776323"
 }
 ```
 

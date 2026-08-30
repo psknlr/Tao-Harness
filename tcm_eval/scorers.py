@@ -24,6 +24,7 @@ misreport one benchmark or the other.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -208,6 +209,71 @@ PA_METRICS = ("answered", "exact", "partial_credit", "jaccard")
 
 
 # --------------------------------------------------------------------------- #
+# TCM-CP (clinical pathway)
+# --------------------------------------------------------------------------- #
+
+#: Transition options carry clinical asymmetry: recommending discharge when
+#: criteria are unmet is a different kind of error from continuing treatment
+#: unnecessarily, and only the first is unsafe.
+_UNSAFE_TRANSITIONS = {("A", "C"), ("A", "B")}  # gold=continue, predicted=exit/advance
+
+
+def score_cp(
+    prediction: Optional[Mapping[str, Any]], gold: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Score one TCM-CP item.
+
+    Reports per-subtask, because the subtasks measure different things and a
+    pooled pathway accuracy would hide which part of pathway execution a model
+    is bad at. Multi-select action items additionally get precision/recall,
+    since naming four of nine required actions is a different failure from
+    naming four wrong ones.
+
+    ``unsafe_transition`` is the endpoint worth watching: a transition item
+    whose gold answer is "continue treatment" and whose prediction is "advance"
+    or "discharge" is a recommendation to move a patient on when the recorded
+    criteria are not met.
+    """
+    subtask = str(gold.get("subtask") or "unknown")
+    gold_letters = set(normalise_options(gold.get("answer")))
+    scores: Dict[str, Any] = {"subtask": subtask, "is_multi": float(len(gold_letters) > 1)}
+
+    if not prediction:
+        scores.update({"answered": 0.0, "exact": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0})
+        if subtask == "CP6_transition_decision":
+            scores["unsafe_transition"] = 0.0
+        return scores
+
+    predicted = set(normalise_options(prediction.get("answer")))
+    overlap = len(predicted & gold_letters)
+    precision = overlap / len(predicted) if predicted else 0.0
+    recall = overlap / len(gold_letters) if gold_letters else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    scores.update(
+        {
+            "answered": 1.0,
+            "exact": float(bool(predicted) and predicted == gold_letters),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "n_predicted": float(len(predicted)),
+        }
+    )
+    scores[f"{subtask}_exact"] = scores["exact"]
+
+    if subtask == "CP6_transition_decision":
+        gold_one = next(iter(sorted(gold_letters)), "")
+        pred_one = next(iter(sorted(predicted)), "")
+        scores["unsafe_transition"] = float((gold_one, pred_one) in _UNSAFE_TRANSITIONS)
+    return scores
+
+
+CP_PRIMARY = "exact"
+CP_METRICS = ("answered", "exact", "f1", "precision", "recall", "unsafe_transition")
+
+
+# --------------------------------------------------------------------------- #
 # Aggregation
 # --------------------------------------------------------------------------- #
 
@@ -277,3 +343,87 @@ def majority_vote(predictions: Sequence[Mapping[str, Any]], field_name: str) -> 
     if not counts:
         return None
     return max(sorted(counts), key=lambda k: counts[k])
+
+
+#: Fields voted per-option (letters) rather than as whole strings.
+_OPTION_FIELDS = ("pathogenesis_answer", "syndrome_answer", "answer")
+
+
+def consensus_prediction(
+    predictions: Sequence[Optional[Mapping[str, Any]]],
+    *,
+    threshold: float = 0.5,
+) -> Optional[Dict[str, Any]]:
+    """Combine ``n`` samples of one case into a single self-consistent answer.
+
+    Multiple-choice fields are voted **per option**: an option is kept when it
+    appears in at least ``threshold`` of the answered samples. Voting on the
+    whole letter-set instead would collapse to the modal set and discard the
+    agreement structure, which matters here because most SDT items have more
+    than one correct option and samples typically agree on the core option
+    while disagreeing on the margin.
+
+    List fields (clinical information) take the union of items appearing in at
+    least ``threshold`` of samples -- task 1 is scored by recall of gold items,
+    so an item several samples agree on is worth keeping. Free text takes the
+    medoid: the sample with the highest mean character-bigram overlap with the
+    others, i.e. the most representative rather than an incoherent splice.
+    """
+    answered = [p for p in predictions if p]
+    if not answered:
+        return None
+    n = len(answered)
+    cutoff = max(1, math.ceil(threshold * n))
+
+    out: Dict[str, Any] = {}
+    for field_name in _OPTION_FIELDS:
+        tally: Dict[str, int] = {}
+        present = False
+        for prediction in answered:
+            if field_name not in prediction:
+                continue
+            present = True
+            for letter in set(normalise_options(prediction.get(field_name))):
+                tally[letter] = tally.get(letter, 0) + 1
+        if not present:
+            continue
+        kept = sorted(letter for letter, count in tally.items() if count >= cutoff)
+        # never return an empty answer when the samples did answer: fall back
+        # to the single most-agreed option
+        if not kept and tally:
+            kept = [max(sorted(tally), key=lambda letter: tally[letter])]
+        out[field_name] = kept
+
+    tally_items: Dict[str, int] = {}
+    saw_list = False
+    for prediction in answered:
+        if "clinical_information" not in prediction:
+            continue
+        saw_list = True
+        for item in set(coerce_list(prediction.get("clinical_information"))):
+            tally_items[item] = tally_items.get(item, 0) + 1
+    if saw_list:
+        out["clinical_information"] = [
+            item for item, count in sorted(tally_items.items()) if count >= cutoff
+        ] or sorted(tally_items, key=lambda i: -tally_items[i])[:5]
+
+    texts = [coerce_str(p.get("explanation")) for p in answered]
+    texts = [t for t in texts if t]
+    if texts:
+        out["explanation"] = _medoid(texts)
+
+    out["_n_samples"] = n
+    out["_vote_threshold"] = threshold
+    return out
+
+
+def _medoid(texts: Sequence[str]) -> str:
+    """The most representative of several free-text answers."""
+    if len(texts) == 1:
+        return texts[0]
+    best, best_score = texts[0], -1.0
+    for candidate in texts:
+        score = sum(char_f1(candidate, other) for other in texts if other is not candidate)
+        if score > best_score:
+            best, best_score = candidate, score
+    return best

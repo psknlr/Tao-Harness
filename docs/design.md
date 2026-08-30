@@ -181,7 +181,72 @@ model most often trips the judge's parser.
 
 ---
 
-## 6. Known limitations
+## 6. Clinical pathway execution
+
+The graph carries 1,440 `PathwayStage` nodes joined by 1,118 `NEXT_STAGE`
+edges, with `day_actions` on 89% of stages and `nursing_items` on 64%. Until
+V2 the agent could reach a stage's criteria but not its actions, and
+`NEXT_STAGE` was never traversed — the pathway layer was static context rather
+than a state machine.
+
+```
+Patient state + follow-up findings
+   │
+   ▼  retrieve_pathway_stage   (entry/exit criteria, day_actions,
+   │                            nursing_items, monitoring, outcomes,
+   │                            previous and next stages)
+Current stage
+   │
+   ▼  retrieve_treatment_plan  (syndrome → 治法 → formula / patent / external)
+Stage-appropriate treatment
+   │
+   ▼  evaluate_pathway_transition   ← deterministic, no model
+   │     exit criteria     × findings
+   │     successor entry criteria × findings
+   │     NEXT_STAGE traversal
+   ▼
+continue | advance | exit | insufficient_evidence
+```
+
+The transition evaluator is deliberately conservative. Criteria are matched at
+the character-bigram level against the supplied findings; partial overlap
+reports `partial`, never `met`, and a finding that negates a criterion marks it
+`contradicted` rather than satisfied. With no findings supplied it returns
+`insufficient_evidence` — it will not recommend discharge from silence. Where
+a stage records no exit criteria (only 12% do) it says so instead of inferring
+that the patient may leave.
+
+`unsafe_transition` is the endpoint worth watching in TCM-CP: gold says
+continue treatment, the model said advance or discharge. Recommending a patient
+onward when the recorded criteria are unmet is not symmetric with the opposite
+error, and pooling both into an accuracy would hide it.
+
+### Why a fourth domain
+
+`clinical_pathway` withholds nothing, because executing a pathway *is* deciding
+on treatment. That is sound here and would not be sound for SDT: nothing in
+TCM-CP is answerable by inverting a syndrome→formula mapping, whereas in SDT
+that inversion hands over the answer. Widening the clinical domain to enable
+pathway work would have destroyed SDT's isolation; a separate domain does not.
+
+## 7. Controlling for test-time compute
+
+M3 spends more model calls than M2, and M4 more than M3. A raw `M2→M3` gain
+therefore measures agency *and* extra thinking together. Two controls separate
+them:
+
+- **M2C** — M3's turn budget, no graph access. Each turn the model is prompted
+  onward with no new information, so no evidence enters while the compute
+  matches. `M2C→M3` is the agentic KG effect.
+- **M3C** — M4's extra revision turn, with no verification evidence in it.
+  `M3C→M4` is the effect of the verification *content* rather than of being
+  asked to look again.
+
+A compute-matched control only licenses its conclusion if the match held in
+practice, so the report includes a parity table of realised calls and tokens
+per pair, flagging any pair outside a 0.8–1.25 call ratio as `MISMATCH`.
+
+## 8. Known limitations
 
 1. **Coverage.** 10 of 19 PA rule families are ungroundable here — **166 of
    328 released items (51%)**, including the largest family, A-003 dosage (87

@@ -19,11 +19,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from tcm_agent.parsing import coerce_str, extract_json_object
+from tcm_agent.parsing import coerce_list, coerce_str, extract_json_object
 from tcm_agent.prompts import load_prompt
 from tcm_models.base import DecodeParams, LLMClient, Message
 
-JUDGE_FIELDS = ("clinical_information", "pathogenesis", "explanation")
+#: What the judge scores. Deliberately *not* the multiple-choice tasks: those
+#: have an official, deterministic scorer, and letting a model re-grade them
+#: would substitute judge opinion for the benchmark's own rules.
+JUDGE_FIELDS = ("clinical_information", "explanation")
 JUDGE_MAX = 4.0
 
 
@@ -48,8 +51,28 @@ class JudgeScore:
         return payload
 
 
+def _letters_to_text(letters: Any, options: Mapping[str, Any]) -> str:
+    """Render option letters as the names they stand for.
+
+    The judge reasons about clinical content, not about letters; handing it
+    ``["H", "J"]`` with no key would make its scores meaningless.
+    """
+    names = [
+        str(options[letter]).strip()
+        for letter in coerce_list(letters)
+        if letter in options
+    ]
+    return "；".join(names)
+
+
 class SDTJudge:
-    """Scores the three free-text SDT steps with a pinned judge model."""
+    """Scores the free-text SDT steps with a pinned judge model.
+
+    Secondary evidence only. Tasks 2 and 3 are scored by the benchmark's own
+    deterministic rules; the judge adds a qualitative read on extraction
+    quality, explanation coherence and hallucination, which the official
+    ROUGE-L cannot express. No headline claim should rest on it.
+    """
 
     def __init__(self, model: LLMClient, *, decode: Optional[DecodeParams] = None):
         self.model = model
@@ -68,16 +91,26 @@ class SDTJudge:
         if not prediction:
             return JudgeScore(case_id, {k: 0.0 for k in JUDGE_FIELDS}, hallucination=None)
 
+        # Both sides are rendered from the *actual* schemas. An earlier version
+        # read `prediction["pathogenesis"]` and `prediction["syndrome"]`, which
+        # the four-task format never produces (they are `*_answer` letter
+        # lists), so the judge silently scored empty strings.
+        options_syndrome = gold.get("syndrome_options") or {}
+        options_pathogenesis = gold.get("pathogenesis_options") or {}
         payload = {
             "标准答案": {
-                "clinical_information": coerce_str(gold.get("clinical_information")),
-                "pathogenesis": coerce_str(gold.get("pathogenesis")),
-                "syndrome": coerce_str(gold.get("syndrome")),
-                "explanation": coerce_str(gold.get("explanation")),
+                "clinical_information": "；".join(gold.get("clinical_information_list") or []),
+                "pathogenesis": _letters_to_text(gold.get("pathogenesis_letters"), options_pathogenesis),
+                "syndrome": _letters_to_text(gold.get("syndrome_letters"), options_syndrome),
+                "explanation": coerce_str(gold.get("explanation_reference")),
             },
             "模型作答": {
-                key: coerce_str(prediction.get(key))
-                for key in ("clinical_information", "pathogenesis", "syndrome", "explanation")
+                "clinical_information": "；".join(coerce_list(prediction.get("clinical_information"))),
+                "pathogenesis": _letters_to_text(
+                    prediction.get("pathogenesis_answer"), options_pathogenesis
+                ),
+                "syndrome": _letters_to_text(prediction.get("syndrome_answer"), options_syndrome),
+                "explanation": coerce_str(prediction.get("explanation")),
             },
             "病例原文": coerce_str(gold.get("clinical_data"))[:2000],
         }

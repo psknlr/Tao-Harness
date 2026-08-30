@@ -33,7 +33,7 @@ from .base import REGISTRY, Coverage, ToolContext, ToolResult, ToolSpec
 from .medication import TOXICITY_MARKERS
 from .safety import SAFETY_SCOPE_NOTE
 
-_PA_DOMAINS = (Domain.SAFETY, Domain.FULL)
+_PA_DOMAINS = (Domain.SAFETY, Domain.PATHWAY, Domain.FULL)
 
 
 def _resolve_drugs(ctx: ToolContext, names: Sequence[str], types: Sequence[str]) -> Tuple[Dict[str, Any], List[str]]:

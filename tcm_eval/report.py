@@ -17,23 +17,62 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .scorers import PA_METRICS, PA_PRIMARY, SDT_METRICS, SDT_PRIMARY, ScoredItem, aggregate
-from .stats import PairedResult, holm_bonferroni, mcnemar, paired_bootstrap, spearman
+from .scorers import (
+    CP_METRICS,
+    CP_PRIMARY,
+    PA_METRICS,
+    PA_PRIMARY,
+    SDT_METRICS,
+    SDT_PRIMARY,
+    ScoredItem,
+    aggregate,
+)
+from .stats import (
+    PairedResult,
+    holm_bonferroni,
+    is_binary,
+    mcnemar,
+    paired_bootstrap,
+    paired_test,
+    spearman,
+    wilcoxon_signed_rank,
+)
+
+#: Multiplicity is controlled within prespecified hypothesis families, not
+#: across the whole experiment. SDT tests an effectiveness claim (does the
+#: graph improve clinical reasoning) and PA a safety claim (does it reduce
+#: rule and knowledge errors); they are separate questions asked of separate
+#: instruments, and pooling them would cost power on both to control an error
+#: rate no reviewer is asking about. The family is named in every table so the
+#: correction and the prose cannot drift apart.
+HYPOTHESIS_FAMILIES: Mapping[str, str] = {
+    "sdt": "SDT effectiveness family",
+    "pa": "PA safety family",
+    "cp": "Clinical-pathway family",
+}
 
 CONDITION_LABELS = {
     "M0": "M0 Base LLM",
     "M1": "M1 Structured",
     "M2": "M2 KG-RAG (static)",
+    "M2C": "M2C Iterative, no KG (control)",
     "M3": "M3 KG-Agent",
+    "M3C": "M3C Sham revision (control)",
     "M4": "M4 KG-Agent + Verify",
 }
 
+#: Each contrast names what it *isolates*, not what it is convenient to call it.
+#: In particular M0→M3 confounds prompt structure, retrieval and agency, so it
+#: is labelled as the whole-scaffold effect rather than a KG-Agent effect; the
+#: interpretable KG and agency terms are M1→M2 and M2C→M3.
 CONTRASTS = (
-    ("M0", "M1", "prompt structure"),
-    ("M1", "M2", "static KG retrieval"),
-    ("M2", "M3", "agentic tool use"),
-    ("M3", "M4", "evidence verification"),
-    ("M0", "M3", "total KG-Agent gain"),
+    ("M0", "M1", "prompt structure alone"),
+    ("M1", "M2", "static KG evidence"),
+    ("M2", "M3", "agency + extra compute (confounded)"),
+    ("M2C", "M3", "agentic KG tool use, compute-matched"),
+    ("M3", "M4", "verification + extra revision (confounded)"),
+    ("M3C", "M4", "verification content, compute-matched"),
+    ("M0", "M3", "whole scaffold (not a KG-only effect)"),
 )
 
 
@@ -108,9 +147,25 @@ def main_table(items: Sequence[ScoredItem], dataset: str, metrics: Sequence[str]
 
 
 def contrast_table(
-    items: Sequence[ScoredItem], dataset: str, metric: str, *, binary: bool = True
+    items: Sequence[ScoredItem],
+    dataset: str,
+    metric: str,
+    *,
+    binary: Optional[bool] = None,
+    contrasts: Sequence[Tuple[str, str, str]] = CONTRASTS,
 ) -> Tuple[str, Dict[str, PairedResult]]:
-    """Paired condition contrasts per model, with multiplicity control."""
+    """Paired condition contrasts per model, with multiplicity control.
+
+    The test is chosen from the data, not asserted by the caller: exact McNemar
+    for genuinely binary outcomes, paired bootstrap for continuous ones, with
+    Wilcoxon reported beside the bootstrap as a distribution-free check.
+    Forcing McNemar onto a continuous score -- as an earlier version of this
+    file did to the SDT composite -- throws away the magnitude of every paired
+    difference and tests a hypothesis the metric does not express.
+
+    ``binary`` remains available to override the detection, but the default of
+    ``None`` (detect) is what the report uses.
+    """
     scoped = [i for i in items if i.dataset == dataset]
     index = index_items(scoped)
     models = sorted({i.model_key for i in scoped})
@@ -118,13 +173,26 @@ def contrast_table(
     results: Dict[str, PairedResult] = {}
     rows: List[List[Any]] = []
     for model in models:
-        for left, right, label in CONTRASTS:
+        for left, right, label in contrasts:
             xs, ys = paired_vectors(index, model, left, right, metric)
             if not xs:
                 continue
-            result = mcnemar(xs, ys) if binary else paired_bootstrap(xs, ys)
+            if binary is None:
+                result = paired_test(xs, ys)
+            else:
+                result = mcnemar(xs, ys) if binary else paired_bootstrap(xs, ys)
             key = f"{dataset}|{model}|{left}->{right}"
             results[key] = result
+            interval = (
+                f"[{result.ci_low:+.3f}, {result.ci_high:+.3f}]"
+                if result.ci_low == result.ci_low
+                else "–"
+            )
+            secondary = (
+                wilcoxon_signed_rank(xs, ys).p_value
+                if result.test.startswith("paired_bootstrap")
+                else None
+            )
             rows.append(
                 [
                     model,
@@ -134,9 +202,10 @@ def contrast_table(
                     result.mean_a,
                     result.mean_b,
                     result.delta,
-                    result.wins,
-                    result.losses,
+                    interval,
+                    result.test,
                     result.p_value,
+                    secondary,
                 ]
             )
 
@@ -153,13 +222,70 @@ def contrast_table(
         "before",
         "after",
         "Δ",
-        "win",
-        "lose",
+        "95% CI",
+        "test",
         "p",
+        "p (Wilcoxon)",
         "p (Holm)",
         "sig",
     ]
     return _md_table(headers, rows), results
+
+
+def compute_parity_table(items: Sequence[ScoredItem]) -> str:
+    """Did each control actually spend what the arm it matches spent?
+
+    A compute-matched control only licenses its conclusion if the match held in
+    practice. If M2C used half as many model calls as M3, then M2C→M3 is still
+    partly a compute contrast and must be reported as such. This table is the
+    evidence for -- or against -- the matching claim, and belongs in the paper
+    beside the contrasts that depend on it.
+    """
+    pairs = [("M2C", "M3"), ("M3C", "M4")]
+    rows: List[List[Any]] = []
+    for control, arm in pairs:
+        for model in sorted({i.model_key for i in items}):
+            for dataset in sorted({i.dataset for i in items}):
+                def _mean(condition: str, key: str) -> Optional[float]:
+                    values = [
+                        float(i.trace_metrics[key])
+                        for i in items
+                        if i.model_key == model
+                        and i.dataset == dataset
+                        and i.condition == condition
+                        and isinstance(i.trace_metrics.get(key), (int, float))
+                    ]
+                    return sum(values) / len(values) if values else None
+
+                control_calls = _mean(control, "n_llm_calls")
+                arm_calls = _mean(arm, "n_llm_calls")
+                if control_calls is None or arm_calls is None:
+                    continue
+                control_tokens = _mean(control, "total_tokens")
+                arm_tokens = _mean(arm, "total_tokens")
+                ratio = control_calls / arm_calls if arm_calls else None
+                rows.append(
+                    [
+                        dataset,
+                        model,
+                        f"{control} vs {arm}",
+                        control_calls,
+                        arm_calls,
+                        ratio,
+                        control_tokens,
+                        arm_tokens,
+                        "ok" if ratio is not None and 0.8 <= ratio <= 1.25 else "MISMATCH",
+                    ]
+                )
+    if not rows:
+        return ""
+    return _md_table(
+        [
+            "dataset", "model", "pair", "control calls", "arm calls",
+            "call ratio", "control tokens", "arm tokens", "parity",
+        ],
+        rows,
+    )
 
 
 def compensation_table(
@@ -367,18 +493,40 @@ def build_report(
 
     datasets = sorted({i.dataset for i in items})
     for dataset in datasets:
-        metrics = SDT_METRICS if dataset == "sdt" else PA_METRICS
-        primary = SDT_PRIMARY if dataset == "sdt" else PA_PRIMARY
+        metrics = {"sdt": SDT_METRICS, "pa": PA_METRICS, "cp": CP_METRICS}.get(
+            dataset, PA_METRICS
+        )
+        primary = {"sdt": SDT_PRIMARY, "pa": PA_PRIMARY, "cp": CP_PRIMARY}.get(
+            dataset, PA_PRIMARY
+        )
         parts.append(f"## {dataset.upper()}")
         parts.append("")
+        if dataset == "cp":
+            parts.append(
+                "> **Instrument-capability benchmark.** TCM-CP's gold answers are "
+                "derived from the same knowledge graph the KG arms consult, so a "
+                "KG advantage here is expected by construction and demonstrates "
+                "faithful pathway execution, not clinical effectiveness. Its "
+                "contrasts must not be pooled with, or reported alongside, the "
+                "SDT and PA effectiveness results."
+            )
+            parts.append("")
         parts.append(f"### Main results (primary metric: `{primary}`)")
         parts.append("")
         parts.append(main_table(items, dataset, metrics))
         parts.append("")
-        table, _ = contrast_table(items, dataset, primary, binary=True)
+        table, results = contrast_table(items, dataset, primary)
+        tests_used = sorted({r.test for r in results.values()}) or ["–"]
+        family = HYPOTHESIS_FAMILIES.get(dataset, f"{dataset} family")
         parts.append("### Paired condition contrasts")
         parts.append("")
-        parts.append("Exact McNemar per model; Holm–Bonferroni across the whole family.")
+        parts.append(
+            f"Test chosen from the data: {', '.join(tests_used)}. "
+            f"Multiplicity controlled by Holm–Bonferroni within the "
+            f"**{family}** ({len(results)} comparisons); the SDT and PA families "
+            f"are corrected separately because they test different, "
+            f"prespecified claims."
+        )
         parts.append("")
         parts.append(table)
         parts.append("")
@@ -389,6 +537,22 @@ def build_report(
         parts.append("")
         parts.append(f"Spearman ρ(base, Δ) = `{comp_stats['spearman_rho_base_vs_delta']}` "
                      f"over {comp_stats['n_models']} models — {comp_stats['interpretation']}.")
+        parts.append("")
+
+    parity = compute_parity_table(items)
+    if parity:
+        parts.append("## Compute parity of the control arms")
+        parts.append("")
+        parts.append(
+            "M2C matches M3's budget without graph access; M3C matches M4's "
+            "without verification evidence. The compute-matched contrasts "
+            "(M2C→M3, M3C→M4) are only interpretable if the match actually "
+            "held, so the realised call and token counts are reported here. A "
+            "`MISMATCH` row means that contrast still carries a compute "
+            "difference and must be described as such."
+        )
+        parts.append("")
+        parts.append(parity)
         parts.append("")
 
     if any(i.dataset == "pa" for i in items):
