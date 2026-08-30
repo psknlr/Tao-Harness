@@ -239,6 +239,15 @@ them:
   hold the same graph evidence, so `M2C→M3` isolates *adaptive retrieval*, not
   graph access. (An earlier version gave M2C no graph at all, which folded the
   KG effect back into a contrast whose whole purpose was to exclude it.)
+
+  The budget match is now **per case**. M2C used to choose for itself when to
+  answer, and it never reached the parity check — that ran only inside
+  `run_branch_group`, which M2C was not part of. One case could give M2C two
+  calls and M3 six while the averages agreed to within a few percent, and a
+  mean is not a match for a paired test. M2C is generated in the same
+  invocation as its M3 twin and pinned to the calls that twin actually spent:
+  it cannot answer early (it is asked to reconsider) or run long (the final
+  turn demands an answer).
 - **M3C** — M4's extra revision turn, with no verification evidence in it.
   `M3C→M4` is the effect of the verification *content* rather than of being
   asked to look again.
@@ -284,15 +293,21 @@ earlier version:
 2. **M3, M3C and M4 share one agent phase.** Running them independently meant
    `M3C → M4` carried trajectory noise on top of the verification difference,
    and inconsistent provider seed support means a seed cannot remove it.
-3. **The verifier is not reachable by the agent.** Otherwise M3 is an
-   optionally-self-verifying arm and `M3 → M4` contrasts optional with
-   mandatory verification — a much weaker claim, easily misread as the stronger
-   one. This means the *whole* verification surface, not just
-   `verify_tcm_decision`: every tool carries a `phase` (`agent`,
+3. **The verifier is not reachable by the agent** — enforced, not merely
+   withheld. Otherwise M3 is an optionally-self-verifying arm and `M3 → M4`
+   contrasts optional with mandatory verification, a much weaker claim easily
+   misread as the stronger one. This means the *whole* verification surface,
+   not just `verify_tcm_decision`: every tool carries a `phase` (`agent`,
    `verification`, `both`), and the five deterministic PA checkers are
-   verification-phase. Hiding only `verify_tcm_decision` left `check_dose` and
-   its four siblings callable by the agent, which is exactly the weaker
-   contrast.
+   verification-phase.
+
+   Keeping them out of the prompt is not enough. A model can produce a name it
+   was never shown — from its own priors, or from an earlier turn of a long
+   context — and `ToolRegistry.call` checked name, domain, budget and required
+   arguments but never phase, so the call went through. `ToolContext` now
+   carries the phase and a cross-phase call is refused at the boundary. A
+   regression test has an M3 agent emit `check_dose` and asserts it is
+   rejected.
 4. **Tool calls record who made them.** A `ToolStep` carries its phase, so
    `tool_selection_accuracy`, `coverage_honesty` and `pathogenesis_probe_rate`
    read only the calls the *model* chose. The M4 verifier calls the correct
@@ -321,6 +336,15 @@ config as it reads today — recomputation at report time produced a *different*
 framework hash from the one the traces were generated under, so the report
 attested to a run that never happened.
 
+**The shared trajectory is an invariant, not an intention.** M3, M3C and M4
+come from one agent phase — but a resume used to regenerate only the *missing*
+arm, so a surviving M3C paired with a fresh-prefix M4 and `M3C→M4`, whose whole
+claim is that the verification report is the only difference, silently became a
+comparison of two independent runs. Nothing checked it: the pairing looked at
+`parity_error` and not at provenance. Any incomplete group is now regenerated
+whole, every arm carries a `branch_group`, and the co-generated contrasts
+require both arms to share it.
+
 **Run signature.** The framework hash has to stay *equal* across models: that
 is what makes "every arm saw the same scaffold" a checkable claim. The same
 blindness means traces from two model snapshots, or from before and after a
@@ -346,6 +370,33 @@ It is used in three places:
   is written into `scored_manifest` and surfaced as a banner at the top of the
   report, so a forced number cannot later be mistaken for a clean one.
 
+**Design signature.** One level up from the apparatus. The run signature omits
+the condition on purpose, so the arms of one experiment can be pooled — which
+leaves `conditions`, `samples`, `limit` and the sampling rule in no fingerprint
+at all. Narrow a seven-arm config to `[M0, M1]` and the M2–M4 traces still
+matched: resume kept them, and the manifest described a two-arm experiment
+beside a seven-arm trace file. Drop `samples` from 3 to 1 and the extra samples
+survived as ordinary items, so scoring stopped running consensus over them and
+one case carried three times its neighbours' weight. Neither is visible to the
+apparatus signature, because neither changes the apparatus. `design_signature`
+covers both levels, is stamped on every trace, and gates resume alongside an
+explicit check that a trace's condition and sample index are ones this run
+declares.
+
+**Dataset identity.** `case_id` is the primary key of three separate
+mechanisms — the gold lookup, the `(case_id, condition, sample)` resume key and
+`index_items` — and all three are dicts. A TCM-CP build shipped 825 rows over
+331 identifiers because CP4 ids named the syndrome and not the disease, so a
+model answering 弱视 was scored against 糖尿病性胃轻瘫's key, where the same
+treatment sits at a different letter, and resuming a run silently collapsed the
+duplicates. The builder now validates the whole set before writing (unique and
+non-blank ids, gold inside the options, at least two distractors, no two
+options carrying the same answer, no answer echoed in the question) and refuses
+on any violation. `load_dataset` imposes unique keys for every benchmark and
+records how many rows it had to rename — which immediately found TCM-SD's
+released dev split shipping 178 repeated `user_id` values, a third-party file
+that is not ours to rebuild and is disambiguated deterministically instead.
+
 The generation cache keys on the model fingerprint, so turning on a vendor
 reasoning mode no longer serves responses generated without it.
 
@@ -358,11 +409,36 @@ patients on badly reads as a good pathway executor.
 
 The **prespecified CP endpoint is the macro-average**: the mean of the six
 capability means (CP4 is one capability probed four ways, averaged first), each
-weighted equally. Its contrasts use a stratified macro bootstrap — resample
-diseases *within* each subtask, take subtask means, then weight the six
-families equally — so the interval describes the same quantity as the point
-estimate rather than a pooled one. The pooled cluster-bootstrap contrast is
-kept as a secondary table.
+weighted equally. Its contrasts use a **hierarchical** macro bootstrap —
+resample diseases within each subtask, average the subtasks of a family, then
+weight the six families equally — so the interval describes the same quantity
+as the point estimate. The pooled cluster-bootstrap contrast is kept as a
+secondary table.
+
+The hierarchy is not a detail. An earlier version passed the nine subtasks
+straight in as strata, which weights CP4 at 4/9 where the table above it
+weights CP4 at 1/6. On a set where only CP4 improves from 0 to 1, the table
+said Δ = 0.167 and the test said Δ = 0.444: the confidence interval and the
+p-value described a quantity that appeared nowhere in the report, under a
+comment asserting they matched. The test that should have caught it asserted
+the *estimator's name*, which was correct while the number was wrong.
+
+**CP4 treatment is disease-conditioned.** `Syndrome → Treatment` is stored as a
+global binary relation, but the clinical fact is ternary: *this disease's*
+guideline, for this syndrome, recommends this treatment. Read globally,
+补中益气汤 is "the formula for 脾胃虚弱证" whether the pathway is 弱视,
+吉兰巴雷综合征 or 糖尿病性胃轻瘫 — and the first global edge became the gold for
+all three. Measured before the fix, 54.45% of CP4 gold treatments shared no
+source document with the current `Disease → Syndrome` edge.
+
+That is not proof of clinical error — **异病同治** is a real principle and the
+graph's document boundaries are not clinical boundaries — but the system could
+not show that *this pathway* recommends it, which is a weaker claim than a
+pathway agent should make. `kg.treatments_of(syndrome, disease)` splits
+`disease_specific` from `cross_disease_general` on shared provenance; CP4
+prefers a grounded gold and records `treatment_provenance` per item, so the
+report can stratify. Ungrounded gold fell to 14.48%, and the remainder is
+labelled rather than hidden.
 
 The sample is drawn stratified by subtask (`dataset.stratify: subtask`) for the
 same reason: a head-slice of 400 gives CP6 twenty-eight items, too thin to
