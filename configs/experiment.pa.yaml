@@ -18,7 +18,14 @@ task: pa
 domain: prescription_safety
 
 models: [deepseek, gemini, glm, gpt, minimax]
-conditions: [M0, M1, M2, M3, M4]
+# M2C and M3C are compute-matched controls, and they are what make the
+# agentic and verification claims interpretable:
+#   M2C = M2's static KG + M3's reasoning budget, no adaptive tools
+#   M3C = M4's extra revision turn, no verification evidence
+# M3 / M3C / M4 share a single agent phase, so M3C -> M4 differs only in the
+# verification report. Dropping the controls makes M2->M3 and M3->M4
+# uninterpretable; do not trim them to save cost.
+conditions: [M0, M1, M2, M2C, M3, M3C, M4]
 samples: 1
 
 decode:

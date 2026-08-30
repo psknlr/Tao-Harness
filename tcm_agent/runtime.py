@@ -53,6 +53,31 @@ CONDITIONS = ("M0", "M1", "M2", "M3", "M4", "M2C", "M3C")
 #: control -> the arm whose test-time compute it matches
 COMPUTE_MATCHED: Mapping[str, str] = {"M2C": "M3", "M3C": "M4"}
 
+#: Arms that share one agent phase and differ only in what follows it.
+BRANCHABLE: Tuple[str, ...] = ("M3", "M3C", "M4")
+_BRANCHABLE = BRANCHABLE
+
+
+def _copy_trace(source: Trace, condition: str) -> Trace:
+    """A trace carrying the shared prefix, ready for its own branch."""
+    branch = Trace(
+        run_id=source.run_id,
+        case_id=source.case_id,
+        dataset=source.dataset,
+        condition=condition,
+        model_key=source.model_key,
+        framework_hash=source.framework_hash,
+        sample=source.sample,
+        started_at=source.started_at,
+    )
+    branch.llm_steps = list(source.llm_steps)
+    branch.tool_steps = list(source.tool_steps)
+    branch.static_context_chars = source.static_context_chars
+    branch.parse_strategy = source.parse_strategy
+    branch.error = source.error
+    branch.wall_ms = source.wall_ms
+    return branch
+
 #: Topics the knowledge graph does not encode.  Used by the PA verification
 #: pass to catch a model citing graph support it cannot have had.
 #: Ordered worst-first: one contradiction outweighs any number of passes.
@@ -233,28 +258,34 @@ class AgentRuntime:
     def _run_iterative_control(
         self, item: Mapping[str, Any], trace: Trace, sample: int
     ) -> None:
-        """M2C: as many model turns as M3 gets, but no knowledge graph.
+        """M2C: M2's knowledge, M3's thinking budget, no adaptive tools.
 
-        The point is to hold test-time compute constant while removing the only
-        thing M3 adds -- graph access. If M2C matches M3, the agentic gain was
-        thinking time rather than knowledge, and the honest contrast to report
-        is M2C→M3 rather than M2→M3.
+        This control exists so that ``M2C→M3`` isolates *one* thing: whether
+        letting the model choose its own queries beats a fixed retrieval, at
+        equal compute. It therefore has to match M2 on knowledge and M3 on
+        turns.
 
-        The model is told it may think for several turns; each turn it is
-        prompted onward with no new information, so no evidence enters. Turns
-        are capped at the tool budget M3 would have had, so the two arms cost
-        the same number of calls.
+        An earlier version built it from the M1 prompt with no graph evidence
+        at all, which meant ``M2C→M3`` moved four variables together -- KG or
+        no KG, static or adaptive retrieval, tools or no tools, one turn or
+        many -- and could not isolate agency. It now receives **the same static
+        KG context block M2 receives**, and is given the turn budget M3 gets,
+        with no tool access. Each turn it is prompted onward with no new
+        information, so no further evidence enters while the compute matches.
         """
         system = (
-            self.task.system_prompt("M1")
+            self.task.system_prompt("M2")
             + "\n"
             + load_prompt("control_iterative").replace(
                 "{max_calls}", str(self.config.tool_budget.max_calls)
             )
         )
+        context = self.task.static_context(item)
+        rendered = self.task.render_context(context)
+        trace.static_context_chars = len(rendered)
         messages: List[Message] = [
             Message("system", system),
-            Message("user", self.task.user_message(item)),
+            Message("user", f"{self.task.user_message(item)}\n\n{rendered}"),
         ]
         budget = self.config.tool_budget.max_calls
         result: Optional[Dict[str, Any]] = None
@@ -300,9 +331,85 @@ class AgentRuntime:
             trace.final_raw = json.dumps(result, ensure_ascii=False)
 
     # ------------------------------------------------------------ M3 / M4
+    def run_branch_group(
+        self,
+        item: Mapping[str, Any],
+        conditions: Sequence[str],
+        *,
+        sample: int = 0,
+    ) -> Dict[str, Trace]:
+        """Run the agent phase **once** and fork it into the verification arms.
+
+        M3, M3C and M4 share an identical agent phase -- same prompt, same
+        tools, same budget -- and differ only in what happens afterwards:
+        nothing, a sham revision, or a real verification plus revision. Running
+        them as three independent invocations meant each got its own
+        trajectory, so ``M3C→M4`` carried whatever the model happened to do
+        differently in the agent phase on top of the verification difference.
+        Provider seed support is inconsistent, so that is not something a seed
+        can be relied on to remove.
+
+        Here the shared prefix is computed once and copied into each branch, so
+        the *only* difference between M3C and M4 is the verification evidence
+        in the revision turn. That makes M3C→M4 the cleanest contrast in the
+        study rather than the muddiest.
+        """
+        wanted = [c for c in conditions if c in _BRANCHABLE]
+        if not wanted:
+            return {}
+
+        shared = Trace(
+            run_id=self.run_id,
+            case_id=str(item.get("id") or item.get("case_id") or ""),
+            dataset=self.task.name,
+            condition="M3",
+            model_key=self.model.name,
+            framework_hash=self.config.framework_hash(),
+            sample=sample,
+            started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        )
+        started = time.perf_counter()
+        try:
+            result, ctx = self._agent_phase(item, "M3", shared, sample)
+        except Exception as exc:  # one bad case must not lose the branch group
+            shared.error = f"{type(exc).__name__}: {exc}"
+            result, ctx = None, ToolContext(
+                self.kg, self.retriever, self.task.domain, self.config.tool_budget
+            )
+        shared.wall_ms = (time.perf_counter() - started) * 1000
+
+        out: Dict[str, Trace] = {}
+        for condition in wanted:
+            branch = _copy_trace(shared, condition)
+            branch_result = dict(result) if result else None
+            if branch_result is not None and condition in {"M4", "M3C"}:
+                branch_started = time.perf_counter()
+                branch_result = self._verify_and_revise(
+                    item, branch_result, ctx, branch, sample, sham=(condition == "M3C")
+                )
+                branch.wall_ms += (time.perf_counter() - branch_started) * 1000
+            if branch_result is not None:
+                branch.final = self.task.normalise_result(branch_result, item)
+                branch.final_raw = json.dumps(branch_result, ensure_ascii=False)
+            out[condition] = branch
+        return out
+
     def _run_agent(
         self, item: Mapping[str, Any], condition: str, trace: Trace, sample: int
     ) -> None:
+        result, ctx = self._agent_phase(item, condition, trace, sample)
+        if result is not None and condition in {"M4", "M3C"}:
+            result = self._verify_and_revise(
+                item, result, ctx, trace, sample, sham=(condition == "M3C")
+            )
+        if result is not None:
+            trace.final = self.task.normalise_result(result, item)
+            trace.final_raw = json.dumps(result, ensure_ascii=False)
+
+    def _agent_phase(
+        self, item: Mapping[str, Any], condition: str, trace: Trace, sample: int
+    ) -> Tuple[Optional[Dict[str, Any]], ToolContext]:
+        """The tool-using reasoning loop, up to and including the first answer."""
         ctx = ToolContext(self.kg, self.retriever, self.task.domain, self.config.tool_budget)
         system = self.task.system_prompt(condition) + "\n" + self._tool_protocol()
         messages: List[Message] = [
@@ -369,15 +476,7 @@ class AgentRuntime:
 
         if result is None and trace.error is None:
             trace.error = "agent exhausted its turn budget without answering"
-
-        if result is not None and condition in {"M4", "M3C"}:
-            result = self._verify_and_revise(
-                item, result, ctx, trace, sample, sham=(condition == "M3C")
-            )
-
-        if result is not None:
-            trace.final = self.task.normalise_result(result, item)
-            trace.final_raw = json.dumps(result, ensure_ascii=False)
+        return (dict(result) if result else None), ctx
 
     # ----------------------------------------------------------- verification
     def _verify_and_revise(
@@ -404,17 +503,31 @@ class AgentRuntime:
             if report is None:
                 return dict(result)
 
+        # Both branches re-receive the full original case, question and option
+        # list. Without them a revision turn is asked to change its answer
+        # while unable to see what the alternatives say: told only that option
+        # C is unsupported, a model has no basis to choose A over B or D. That
+        # is not a verification effect, it is an amnesia effect -- and it
+        # differs between the arms only by accident. Re-supplying the item in
+        # both branches keeps the verification report the single difference.
+        original = self.task.user_message(item)
         if sham:
             messages = [
                 Message("system", load_prompt("control_sham_revision")),
-                Message("user", "【你的结论】\n" + json.dumps(result, ensure_ascii=False)),
+                Message(
+                    "user",
+                    original
+                    + "\n\n【你的结论】\n"
+                    + json.dumps(result, ensure_ascii=False),
+                ),
             ]
         else:
             messages = [
                 Message("system", load_prompt("verifier")),
                 Message(
                     "user",
-                    "【你的结论】\n"
+                    original
+                    + "\n\n【你的结论】\n"
                     + json.dumps(result, ensure_ascii=False)
                     + "\n\n【校验结果】\n"
                     + json.dumps(report, ensure_ascii=False),
@@ -583,7 +696,20 @@ class AgentRuntime:
         )
 
     def _tool_protocol(self) -> str:
-        specs = self.config.registry.specs_for(self.task.domain)
+        """The tool list an agent sees.
+
+        Verification-only tools are withheld. If the agent could call
+        ``verify_tcm_decision`` itself, M3 would already be an
+        optionally-self-verifying arm and M3→M4 would contrast *optional* with
+        *mandatory* verification rather than absent with present -- a much
+        weaker claim, and one easy to misread. The verifier remains reachable
+        only from the M4 verification pass, which the agent does not control.
+        """
+        specs = [
+            spec
+            for spec in self.config.registry.specs_for(self.task.domain)
+            if not spec.verification
+        ]
         tool_list = "\n".join(spec.prompt_block() for spec in specs)
         return (
             load_prompt("tool_protocol")

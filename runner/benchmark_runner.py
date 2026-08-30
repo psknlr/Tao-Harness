@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import tcm_tools  # noqa: F401  (registers the tool surface)
 from tcm_agent import AgentRuntime, Trace, build_task, read_traces, write_traces
+from tcm_agent.runtime import BRANCHABLE
 from tcm_eval import (
     PA_METRICS,
     PA_PRIMARY,
@@ -54,8 +55,9 @@ from tcm_eval import (
     trace_metrics,
 )
 from tcm_eval.judge import SDTJudge, aggregate_judge
-from tcm_eval.metrics import tool_selection_accuracy
+from tcm_eval.metrics import pathogenesis_probe_rate, tool_selection_accuracy
 from tcm_eval.official_sdt import write_submission
+from tcm_eval.provenance import case_set_hash, code_fingerprints, compare_fingerprints
 from tcm_eval.stats import mcnemar, paired_bootstrap
 from tcm_kg import load_kg
 from tcm_kg.index import KGRetriever
@@ -148,11 +150,14 @@ def write_manifest(
                 "provider": specs[key].provider,
                 "model_id": specs[key].model_id,
                 "base_url": specs[key].base_url,
+                "extra_body": dict(specs[key].extra_body),
+                "fingerprint_sha256": specs[key].fingerprint(),
             }
             for key in config.models
             if key in specs
         },
         "framework": config.framework.describe(),
+        **code_fingerprints(),
     }
     if config.dataset_results_path:
         manifest["dataset_results_path"] = str(config.dataset_results_path)
@@ -209,7 +214,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     config.framework.dataset_hash = _file_hash(config.dataset_path)
     framework_hash = config.framework.framework_hash()
 
-    manifest = write_manifest(config, kg, specs, n_items=len(items))
+    case_ids = [str(item["id"]) for item in items]
+    manifest = write_manifest(
+        config,
+        kg,
+        specs,
+        n_items=len(items),
+        extra={"case_ids": case_ids, "case_set_sha256": case_set_hash(case_ids)},
+    )
     print(
         f"framework_hash={framework_hash}  kg={manifest['kg_content_sha256'][:12]}  "
         f"dataset={manifest['dataset_sha256'][:12]}  n_items={len(items)}",
@@ -241,30 +253,48 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         task = build_task(config.task, kg, retriever, config.framework.context_budget)
 
-        jobs: List[Tuple[Mapping[str, Any], str, int]] = [
-            (item, condition, sample)
-            for item in items
-            for condition in config.conditions
-            for sample in range(config.samples)
-            if (str(item["id"]), condition, sample) not in existing
-        ]
-        print(f"{model_key}: {len(jobs)} traces to generate", file=sys.stderr)
+        # M3/M3C/M4 share one agent phase and are generated together, so the
+        # only difference between them is what happens after the first answer.
+        branch_conditions = [c for c in config.conditions if c in BRANCHABLE]
+        solo_conditions = [c for c in config.conditions if c not in BRANCHABLE]
+
+        jobs: List[Tuple[Mapping[str, Any], Tuple[str, ...], int]] = []
+        for item in items:
+            for sample in range(config.samples):
+                for condition in solo_conditions:
+                    if (str(item["id"]), condition, sample) not in existing:
+                        jobs.append((item, (condition,), sample))
+                missing = tuple(
+                    c
+                    for c in branch_conditions
+                    if (str(item["id"]), c, sample) not in existing
+                )
+                if missing:
+                    jobs.append((item, missing, sample))
+        n_traces = sum(len(group) for _i, group, _s in jobs)
+        print(
+            f"{model_key}: {n_traces} traces to generate "
+            f"({len(jobs)} invocations; {len(branch_conditions)} branch arms share a trajectory)",
+            file=sys.stderr,
+        )
 
         traces: List[Trace] = list(existing.values())
         started = time.time()
 
-        def _one(job: Tuple[Mapping[str, Any], str, int]) -> Trace:
-            item, condition, sample = job
+        def _one(job: Tuple[Mapping[str, Any], Tuple[str, ...], int]) -> List[Trace]:
+            item, group, sample = job
             runtime = AgentRuntime(
                 kg, retriever, task, client, config.framework, run_id=config.name
             )
-            return runtime.run(item, condition, sample=sample)
+            if len(group) == 1 and group[0] not in BRANCHABLE:
+                return [runtime.run(item, group[0], sample=sample)]
+            return list(runtime.run_branch_group(item, group, sample=sample).values())
 
         if config.concurrency > 1 and len(jobs) > 1:
             with ThreadPoolExecutor(max_workers=config.concurrency) as pool:
                 futures = {pool.submit(_one, job): job for job in jobs}
                 for done, future in enumerate(as_completed(futures), 1):
-                    traces.append(future.result())
+                    traces.extend(future.result())
                     if done % 20 == 0 or done == len(jobs):
                         print(
                             f"  {model_key}: {done}/{len(jobs)} "
@@ -274,7 +304,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         write_traces(trace_file, traces)
         else:
             for done, job in enumerate(jobs, 1):
-                traces.append(_one(job))
+                traces.extend(_one(job))
                 if done % 20 == 0 or done == len(jobs):
                     print(f"  {model_key}: {done}/{len(jobs)}", file=sys.stderr)
                     write_traces(trace_file, traces)
@@ -343,7 +373,11 @@ def _consensus_traces(traces: Sequence[Trace]) -> List[Trace]:
 
 
 def _score_traces(
-    config: ExperimentConfig, traces: Sequence[Trace], gold: Mapping[str, Mapping[str, Any]], kg
+    config: ExperimentConfig,
+    traces: Sequence[Trace],
+    gold: Mapping[str, Mapping[str, Any]],
+    kg,
+    pricing: Optional[Mapping[str, Sequence[float]]] = None,
 ) -> List[ScoredItem]:
     scored: List[ScoredItem] = []
     if config.samples > 1:
@@ -356,8 +390,12 @@ def _score_traces(
             continue  # generated but unscoreable (a split with blank answers)
         if config.task == "sdt":
             metrics = score_sdt(trace.final, reference, kg=kg)
+            probe = pathogenesis_probe_rate(trace, reference.get("pathogenesis_options"))
+            if probe is not None:
+                metrics["pathogenesis_probe_rate"] = probe
         elif config.task == "cp":
             metrics = score_cp(trace.final, reference)
+            metrics["disease"] = reference.get("disease")  # cluster label
         else:
             metrics = score_pa(trace.final, reference)
             metrics["rule_id"] = reference.get("rule_id")
@@ -373,20 +411,79 @@ def _score_traces(
                 model_key=trace.model_key,
                 sample=trace.sample,
                 metrics=metrics,
-                trace_metrics=trace_metrics(trace),
+                trace_metrics={
+                    **trace_metrics(
+                        trace, cost_per_mtok=(pricing or {}).get(trace.model_key, (0.0, 0.0))
+                    ),
+                    **(
+                        {"pathogenesis_probe_rate": metrics["pathogenesis_probe_rate"]}
+                        if "pathogenesis_probe_rate" in metrics
+                        else {}
+                    ),
+                },
             )
         )
     return scored
+
+
+def _load_manifest(config: ExperimentConfig) -> Optional[Dict[str, Any]]:
+    path = config.output_dir / f"manifest.{config.task}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def cmd_score(args: argparse.Namespace) -> int:
     config = load_experiment(args.config)
     dataset = load_dataset(config.dataset_path, config.dataset_kind, **config.loader_kwargs())
     gold = {str(item["id"]): item for item in dataset.items}
+
+    # The frozen manifest -- not the config as it reads today -- defines what
+    # the run actually was. Scoring against the current config would let a
+    # later edit (a smaller `limit`, a repointed model, a changed dataset)
+    # silently reinterpret traces produced under different conditions.
+    manifest = _load_manifest(config)
+    if manifest is None:
+        print(
+            f"WARNING: no frozen manifest in {config.output_dir}; scoring against "
+            f"the config as it reads now, which may not describe the run.",
+            file=sys.stderr,
+        )
+    else:
+        drift = compare_fingerprints(manifest, code_fingerprints())
+        if drift:
+            print(
+                "NOTE: code has changed since generation — "
+                + "; ".join(drift)
+                + ". Re-scoring recorded traces with fixed scorers is expected; "
+                "re-scoring with changed tools or runtime is not comparable.",
+                file=sys.stderr,
+            )
+        frozen_cases = manifest.get("case_ids")
+        if frozen_cases:
+            expected = case_set_hash([str(c) for c in frozen_cases])
+            if expected != manifest.get("case_set_sha256"):
+                print("WARNING: manifest case list does not match its own hash.", file=sys.stderr)
+            gold = {cid: gold[cid] for cid in map(str, frozen_cases) if cid in gold}
+            print(
+                f"scoring the {len(gold)} cases frozen in the manifest "
+                f"(case_set {str(manifest.get('case_set_sha256'))[:12]})",
+                file=sys.stderr,
+            )
     kg, _ = _load_graph(args.kg, config) if config.task == "sdt" else (None, None)
     if kg is not None:
         config.framework.kg_hash = kg.content_hash()
     config.framework.dataset_hash = _file_hash(config.dataset_path)
+
+    # Real pricing, so cost_usd is a number rather than a structural zero.
+    specs = load_models(args.models_config)
+    pricing = {
+        key: (spec.input_usd_per_mtok, spec.output_usd_per_mtok)
+        for key, spec in specs.items()
+    }
 
     all_scored: List[ScoredItem] = []
     trace_summaries: Dict[str, Any] = {}
@@ -403,12 +500,14 @@ def cmd_score(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        all_scored.extend(_score_traces(config, traces, gold, kg))
+        all_scored.extend(_score_traces(config, traces, gold, kg, pricing))
         by_condition: Dict[str, List[Trace]] = {}
         for trace in traces:
             by_condition.setdefault(trace.condition, []).append(trace)
         for condition, bucket in by_condition.items():
-            trace_summaries[f"{bucket[0].model_key}/{condition}"] = aggregate_trace_metrics(bucket)
+            trace_summaries[f"{bucket[0].model_key}/{condition}"] = aggregate_trace_metrics(
+                bucket, cost_per_mtok=pricing.get(bucket[0].model_key, (0.0, 0.0))
+            )
 
     if not all_scored:
         print(f"no traces found under {config.output_dir}", file=sys.stderr)
@@ -421,6 +520,20 @@ def cmd_score(args: argparse.Namespace) -> int:
     (config.output_dir / f"trace_summary.{config.task}.json").write_text(
         json.dumps(trace_summaries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if manifest is not None:
+        (config.output_dir / f"scored_manifest.{config.task}.json").write_text(
+            json.dumps(
+                {
+                    "generation_manifest": manifest,
+                    "scored_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+                    "scoring_code": code_fingerprints(),
+                    "n_scored": len(all_scored),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     print(f"scored {len(all_scored)} traces -> {out_path}", file=sys.stderr)
 
     metrics = {"sdt": SDT_METRICS, "pa": PA_METRICS, "cp": CP_METRICS}.get(
@@ -514,7 +627,26 @@ def cmd_report(args: argparse.Namespace) -> int:
         if summary_path.exists():
             summaries.update(json.loads(summary_path.read_text(encoding="utf-8")))
         if framework is None:
-            framework = config.framework.describe()
+            # Read the frozen manifest, never recompute: at report time the
+            # config's kg_hash and dataset_hash are unset, so a recomputed
+            # framework hash would differ from the one the traces were actually
+            # generated under and the report would attest to a run that never
+            # happened.
+            manifest = _load_manifest(config)
+            framework = (
+                {
+                    k: manifest[k]
+                    for k in (
+                        "framework_hash", "task", "domain", "git_commit",
+                        "kg_content_sha256", "dataset_sha256", "case_set_sha256",
+                        "created_at", "models", "tools_impl_sha256",
+                        "scorers_impl_sha256", "retrieval_impl_sha256",
+                    )
+                    if k in manifest
+                }
+                if manifest
+                else {"note": "no frozen manifest found; run `run` first", **config.framework.describe()}
+            )
     if not items:
         print("no scores found; run `score` first", file=sys.stderr)
         return 1

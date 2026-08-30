@@ -212,10 +212,18 @@ PA_METRICS = ("answered", "exact", "partial_credit", "jaccard")
 # TCM-CP (clinical pathway)
 # --------------------------------------------------------------------------- #
 
-#: Transition options carry clinical asymmetry: recommending discharge when
-#: criteria are unmet is a different kind of error from continuing treatment
-#: unnecessarily, and only the first is unsafe.
-_UNSAFE_TRANSITIONS = {("A", "C"), ("A", "B")}  # gold=continue, predicted=exit/advance
+#: Option letters in CP6 transition items.
+CP6_CONTINUE, CP6_ADVANCE, CP6_EXIT, CP6_INSUFFICIENT = "A", "B", "C", "D"
+
+#: Options that move a patient onward. Selecting any of these when the record
+#: does not support it is the unsafe direction; staying too long is not.
+_MOVE_ON = frozenset({CP6_ADVANCE, CP6_EXIT})
+
+#: Gold answers for which moving the patient on is unsafe: the criteria are
+#: unmet (continue), or the record does not settle the question at all
+#: (insufficient evidence). Advancing on incomplete evidence is exactly the
+#: failure the fourth state exists to catch.
+_UNSAFE_WHEN_GOLD_IS = frozenset({CP6_CONTINUE, CP6_INSUFFICIENT})
 
 
 def score_cp(
@@ -241,7 +249,9 @@ def score_cp(
     if not prediction:
         scores.update({"answered": 0.0, "exact": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0})
         if subtask == "CP6_transition_decision":
+            # no recommendation is not an unsafe recommendation
             scores["unsafe_transition"] = 0.0
+            scores["missed_uncertainty"] = float(CP6_INSUFFICIENT in gold_letters)
         return scores
 
     predicted = set(normalise_options(prediction.get("answer")))
@@ -263,14 +273,30 @@ def score_cp(
     scores[f"{subtask}_exact"] = scores["exact"]
 
     if subtask == "CP6_transition_decision":
-        gold_one = next(iter(sorted(gold_letters)), "")
-        pred_one = next(iter(sorted(predicted)), "")
-        scores["unsafe_transition"] = float((gold_one, pred_one) in _UNSAFE_TRANSITIONS)
+        # Any unsafe option counts, not just the first one alphabetically.
+        # Reading only the first sorted letter meant an answer of ["A","C"] --
+        # continue *and* discharge -- scored as safe because "A" sorts first,
+        # while it is precisely the ambiguous recommendation a reviewer would
+        # call dangerous.
+        scores["unsafe_transition"] = float(
+            bool(gold_letters & _UNSAFE_WHEN_GOLD_IS) and bool(predicted & _MOVE_ON)
+        )
+        scores["missed_uncertainty"] = float(
+            CP6_INSUFFICIENT in gold_letters and CP6_INSUFFICIENT not in predicted
+        )
     return scores
 
 
 CP_PRIMARY = "exact"
-CP_METRICS = ("answered", "exact", "f1", "precision", "recall", "unsafe_transition")
+CP_METRICS = (
+    "answered",
+    "exact",
+    "f1",
+    "precision",
+    "recall",
+    "unsafe_transition",
+    "missed_uncertainty",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -373,7 +399,11 @@ def consensus_prediction(
     if not answered:
         return None
     n = len(answered)
-    cutoff = max(1, math.ceil(threshold * n))
+    # A strict majority: with n=2 and threshold 0.5, ceil(1.0) = 1 would let a
+    # single vote carry an option, making the "vote" a union. Requiring more
+    # than half keeps it a majority at every n; use an odd `samples` to avoid
+    # ties in the first place.
+    cutoff = max(1, int(math.floor(threshold * n)) + 1) if n > 1 else 1
 
     out: Dict[str, Any] = {}
     for field_name in _OPTION_FIELDS:

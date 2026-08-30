@@ -191,6 +191,73 @@ def spearman(xs: Sequence[float], ys: Sequence[float]) -> Tuple[float, int]:
     return pearson(rank(list(xs[:n])), rank(list(ys[:n])))
 
 
+def cluster_paired_bootstrap(
+    a: Sequence[float],
+    b: Sequence[float],
+    clusters: Sequence[str],
+    *,
+    n_resamples: int = 10000,
+    seed: int = 20260829,
+    alpha: float = 0.05,
+) -> PairedResult:
+    """Paired bootstrap resampling **clusters**, not items.
+
+    TCM-CP generates many items per disease from one pathway, so items within a
+    disease are not independent: they share a vignette template, a stage set
+    and a treatment sub-graph. Resampling items would treat 5,358 correlated
+    observations as 5,358 independent ones and shrink the standard error
+    accordingly, manufacturing significance. Resampling whole diseases
+    propagates the dependence into the interval.
+
+    The same applies wherever several items derive from one source case.
+    """
+    if not (len(a) == len(b) == len(clusters)):
+        raise ValueError("values and cluster labels must align")
+    n = len(a)
+    if n == 0:
+        return PairedResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, "cluster_bootstrap")
+
+    grouped: Dict[str, List[float]] = {}
+    for value_a, value_b, cluster in zip(a, b, clusters):
+        grouped.setdefault(str(cluster), []).append(float(value_b) - float(value_a))
+    keys = sorted(grouped)
+    observed = sum(sum(v) for v in grouped.values()) / n
+
+    rng = random.Random(seed)
+    deltas: List[float] = []
+    n_clusters = len(keys)
+    for _ in range(n_resamples):
+        total, count = 0.0, 0
+        for _ in range(n_clusters):
+            diffs = grouped[keys[rng.randrange(n_clusters)]]
+            total += sum(diffs)
+            count += len(diffs)
+        deltas.append(total / count if count else 0.0)
+    deltas.sort()
+
+    lo = deltas[max(0, int((alpha / 2) * n_resamples) - 1)]
+    hi = deltas[min(n_resamples - 1, int((1 - alpha / 2) * n_resamples))]
+    centred = [d - observed for d in deltas]
+    extreme = sum(1 for d in centred if abs(d) >= abs(observed))
+    p_value = (extreme + 1) / (n_resamples + 1)
+
+    wins = sum(1 for diffs in grouped.values() for d in diffs if d > 0)
+    losses = sum(1 for diffs in grouped.values() for d in diffs if d < 0)
+    return PairedResult(
+        n=n,
+        mean_a=sum(a) / n,
+        mean_b=sum(b) / n,
+        delta=observed,
+        ci_low=lo,
+        ci_high=hi,
+        p_value=p_value,
+        test=f"cluster_bootstrap[{n_clusters}_clusters]",
+        wins=wins,
+        losses=losses,
+        ties=n - wins - losses,
+    )
+
+
 def is_binary(values: Sequence[float], *, tolerance: float = 1e-9) -> bool:
     """Whether every observation is 0 or 1.
 

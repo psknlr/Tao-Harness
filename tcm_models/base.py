@@ -14,7 +14,7 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 
@@ -105,19 +105,52 @@ class ModelSpec:
             + usage.completion_tokens * self.output_usd_per_mtok
         ) / 1_000_000
 
+    def fingerprint(self) -> str:
+        """Content hash of everything that determines what this model *is*.
+
+        A run is keyed on ``model_key`` ("gpt", "deepseek") for readability,
+        but a key is a label, not an identity. Repointing ``gpt`` at a
+        different snapshot, or changing ``extra_body`` to switch on a reasoning
+        mode, leaves the key unchanged -- so a resumed run could reuse traces
+        from the old model while the manifest records the new one, and the
+        generation cache could serve responses from settings that no longer
+        apply. The fingerprint closes both holes.
+        """
+        payload = json.dumps(
+            {
+                "provider": self.provider,
+                "model_id": self.model_id,
+                "base_url": self.base_url,
+                "extra_body": dict(self.extra_body),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 def request_key(
-    model_id: str, messages: Sequence[Message], decode: DecodeParams, sample: int = 0
+    model: "str | ModelSpec",
+    messages: Sequence[Message],
+    decode: DecodeParams,
+    sample: int = 0,
 ) -> str:
     """Stable hash of a generation request.
 
     Used both for the on-disk generation cache and for keyless replay: an
     identical request replays byte-for-byte, and a changed prompt necessarily
     misses, so a replayed run can never silently reflect a stale prompt.
+
+    Accepts a :class:`ModelSpec` so the key covers provider, base URL and
+    ``extra_body`` as well as the model id. Keying on the id alone meant that
+    turning on a vendor reasoning mode -- same id, different ``extra_body`` --
+    kept serving cached responses generated without it.
     """
+    identity = model.fingerprint() if isinstance(model, ModelSpec) else str(model)
     payload = json.dumps(
         {
-            "model": model_id,
+            "model": identity,
             "messages": [m.to_dict() for m in messages],
             "decode": decode.fingerprint(),
             "sample": sample,
@@ -161,8 +194,17 @@ class LLMClient(abc.ABC):
         *,
         sample: int = 0,
     ) -> Completion:
-        """Generate with retry, backoff and usage accounting."""
+        """Generate with retry, backoff and usage accounting.
+
+        Sample index offsets the seed. Previously it entered only the cache
+        key, so five "independent" samples were five identical requests to the
+        provider at the same seed and temperature -- self-consistency voting
+        over five copies of one answer. The offset makes them genuinely
+        different draws while keeping the run reproducible.
+        """
         decode = decode or DecodeParams()
+        if sample and decode.seed is not None:
+            decode = replace(decode, seed=decode.seed + sample)
         delay = 2.0
         last_error: Optional[str] = None
         for attempt in range(self.spec.max_retries + 1):
