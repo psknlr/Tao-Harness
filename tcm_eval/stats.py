@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -258,73 +258,111 @@ def cluster_paired_bootstrap(
     )
 
 
-def stratified_macro_bootstrap(
+def hierarchical_macro_bootstrap(
     a: Sequence[float],
     b: Sequence[float],
     strata: Sequence[str],
+    families: Optional[Sequence[str]] = None,
     clusters: Optional[Sequence[str]] = None,
     *,
     n_resamples: int = 10000,
     seed: int = 20260829,
     alpha: float = 0.05,
 ) -> PairedResult:
-    """Paired test on a **macro-average**: equal weight per stratum.
+    """Paired test on a macro-average, weighting **families** equally.
 
-    TCM-CP's nine subtasks range from 306 to 988 items, so a pooled accuracy is
-    53% CP2/CP3/CP5 and 5.5% CP6 -- the safety-relevant one. A model that
-    executes stage lookups well and transition decisions badly reads as a good
-    pathway executor. The prespecified endpoint is therefore the mean of the
-    per-subtask means, and the interval has to be built the same way the point
-    estimate is or it describes a different quantity.
+    TCM-CP's nine subtasks range from 306 items to 988, so a pooled accuracy is
+    53% stage lookup and monitoring and 5.5% transition decision. A model that
+    reads stages well and moves patients on badly would read as a good pathway
+    executor. The prespecified endpoint is therefore a macro-average -- and it
+    has three levels, not two:
 
-    Resampling is done *within* each stratum, and within a stratum by cluster
-    when ``clusters`` is given, so the two dependencies TCM-CP actually has --
-    unequal subtask sizes and many items per disease -- are both carried into
-    the interval. Strata are fixed, not resampled: the six task families are
+    1. mean over the items of a **subtask** (``strata``),
+    2. mean over the subtasks of a **family** (``families``), so CP4 -- one
+       capability probed four ways -- counts once rather than four times,
+    3. mean over the six families.
+
+    Getting level 2 wrong is not a rounding difference. An earlier version
+    passed the nine subtasks straight in as strata, which gave CP4 a weight of
+    4/9 while the reported point estimate gave it 1/6. On a set where only CP4
+    improves from 0 to 1, the table said Δ = 0.167 and the test said Δ = 0.444:
+    the confidence interval and the p-value described a quantity that appeared
+    nowhere in the paper.
+
+    Resampling is by ``clusters`` within each subtask, so TCM-CP's other
+    dependence -- many items generated from one disease's pathway -- reaches
+    the interval too. Subtasks and families are fixed, not resampled: they are
     the population, not a sample from one.
+
+    ``families`` defaults to the strata themselves, which reduces to a flat
+    macro over strata.
     """
     if not (len(a) == len(b) == len(strata)):
         raise ValueError("values and stratum labels must align")
+    if families is not None and len(families) != len(a):
+        raise ValueError("family labels must align with the values")
     if clusters is not None and len(clusters) != len(a):
         raise ValueError("cluster labels must align with the values")
     n = len(a)
     if n == 0:
-        return PairedResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, "stratified_macro_bootstrap")
+        return PairedResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, "hierarchical_macro_bootstrap")
 
-    # stratum -> cluster -> [paired differences]
-    grouped: Dict[str, Dict[str, List[float]]] = {}
-    means_a: Dict[str, List[float]] = {}
-    means_b: Dict[str, List[float]] = {}
+    family_of: Dict[str, str] = {}
+    # family -> subtask -> cluster -> [paired differences]
+    grouped: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
+    levels_a: Dict[str, Dict[str, List[float]]] = {}
+    levels_b: Dict[str, Dict[str, List[float]]] = {}
     for i in range(n):
-        stratum = str(strata[i])
+        subtask = str(strata[i])
+        family = str(families[i]) if families is not None else subtask
+        if family_of.setdefault(subtask, family) != family:
+            raise ValueError(f"subtask {subtask!r} appears under two families")
         cluster = str(clusters[i]) if clusters is not None else str(i)
-        grouped.setdefault(stratum, {}).setdefault(cluster, []).append(
-            float(b[i]) - float(a[i])
-        )
-        means_a.setdefault(stratum, []).append(float(a[i]))
-        means_b.setdefault(stratum, []).append(float(b[i]))
+        grouped.setdefault(family, {}).setdefault(subtask, {}).setdefault(
+            cluster, []
+        ).append(float(b[i]) - float(a[i]))
+        levels_a.setdefault(family, {}).setdefault(subtask, []).append(float(a[i]))
+        levels_b.setdefault(family, {}).setdefault(subtask, []).append(float(b[i]))
 
-    keys = sorted(grouped)
+    family_keys = sorted(grouped)
 
-    def _macro(per_stratum: Mapping[str, List[float]]) -> float:
-        return sum(sum(v) / len(v) for v in per_stratum.values()) / len(per_stratum)
+    def _macro(levels: Mapping[str, Mapping[str, Sequence[float]]]) -> float:
+        per_family = [
+            sum(sum(v) / len(v) for v in subtasks.values()) / len(subtasks)
+            for subtasks in levels.values()
+        ]
+        return sum(per_family) / len(per_family)
 
-    observed = _macro({k: [d for c in grouped[k].values() for d in c] for k in keys})
+    observed = _macro(
+        {
+            family: {
+                subtask: [d for c in clusters_.values() for d in c]
+                for subtask, clusters_ in subtasks.items()
+            }
+            for family, subtasks in grouped.items()
+        }
+    )
 
     rng = random.Random(seed)
+    cluster_keys = {
+        family: {subtask: sorted(c) for subtask, c in subtasks.items()}
+        for family, subtasks in grouped.items()
+    }
     deltas: List[float] = []
-    cluster_keys = {k: sorted(grouped[k]) for k in keys}
     for _ in range(n_resamples):
-        total = 0.0
-        for stratum in keys:
-            names = cluster_keys[stratum]
-            picked_sum, picked_n = 0.0, 0
-            for _ in range(len(names)):
-                diffs = grouped[stratum][names[rng.randrange(len(names))]]
-                picked_sum += sum(diffs)
-                picked_n += len(diffs)
-            total += picked_sum / picked_n if picked_n else 0.0
-        deltas.append(total / len(keys))
+        family_totals = 0.0
+        for family in family_keys:
+            subtask_total, n_subtasks = 0.0, 0
+            for subtask, names in cluster_keys[family].items():
+                picked_sum, picked_n = 0.0, 0
+                for _ in range(len(names)):
+                    diffs = grouped[family][subtask][names[rng.randrange(len(names))]]
+                    picked_sum += sum(diffs)
+                    picked_n += len(diffs)
+                subtask_total += picked_sum / picked_n if picked_n else 0.0
+                n_subtasks += 1
+            family_totals += subtask_total / n_subtasks if n_subtasks else 0.0
+        deltas.append(family_totals / len(family_keys))
     deltas.sort()
 
     lo = deltas[max(0, int((alpha / 2) * n_resamples) - 1)]
@@ -333,14 +371,30 @@ def stratified_macro_bootstrap(
     extreme = sum(1 for d in centred if abs(d) >= abs(observed))
     p_value = (extreme + 1) / (n_resamples + 1)
 
-    wins = sum(1 for s in grouped.values() for c in s.values() for d in c if d > 0)
-    losses = sum(1 for s in grouped.values() for c in s.values() for d in c if d < 0)
-    label = f"stratified_macro_bootstrap[{len(keys)}_strata"
-    label += f",{sum(len(v) for v in cluster_keys.values())}_clusters]" if clusters is not None else "]"
+    wins = sum(
+        1
+        for f in grouped.values()
+        for s in f.values()
+        for c in s.values()
+        for d in c
+        if d > 0
+    )
+    losses = sum(
+        1
+        for f in grouped.values()
+        for s in f.values()
+        for c in s.values()
+        for d in c
+        if d < 0
+    )
+    n_subtasks = sum(len(s) for s in grouped.values())
+    n_clusters = sum(len(c) for f in cluster_keys.values() for c in f.values())
+    label = f"hierarchical_macro_bootstrap[{len(family_keys)}_families,{n_subtasks}_subtasks"
+    label += f",{n_clusters}_clusters]" if clusters is not None else "]"
     return PairedResult(
         n=n,
-        mean_a=_macro(means_a),
-        mean_b=_macro(means_b),
+        mean_a=_macro(levels_a),
+        mean_b=_macro(levels_b),
         delta=observed,
         ci_low=lo,
         ci_high=hi,
@@ -350,6 +404,17 @@ def stratified_macro_bootstrap(
         losses=losses,
         ties=n - wins - losses,
     )
+
+
+def stratified_macro_bootstrap(
+    a: Sequence[float],
+    b: Sequence[float],
+    strata: Sequence[str],
+    clusters: Optional[Sequence[str]] = None,
+    **kwargs: Any,
+) -> PairedResult:
+    """Flat macro over ``strata`` -- the hierarchical test with one level."""
+    return hierarchical_macro_bootstrap(a, b, strata, None, clusters, **kwargs)
 
 
 def is_binary(values: Sequence[float], *, tolerance: float = 1e-9) -> bool:

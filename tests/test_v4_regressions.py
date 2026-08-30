@@ -266,7 +266,10 @@ class V4_4_PerCaseComputeParity(unittest.TestCase):
             return ScoredItem(
                 case, "sdt", condition, "m", 0,
                 {"composite": value},
-                {"parity_error": "compute parity broken: ..." if broken else ""},
+                {
+                    "parity_error": "compute parity broken: ..." if broken else "",
+                    "branch_group": f"{case}#0",
+                },
             )
 
         items = [
@@ -287,7 +290,7 @@ class V4_4_PerCaseComputeParity(unittest.TestCase):
             return ScoredItem(
                 case, "cp", condition, "m", 0,
                 {"composite": value, "disease": disease},
-                {"parity_error": "broken" if broken else ""},
+                {"parity_error": "broken" if broken else "", "branch_group": f"{case}#0"},
             )
 
         items = [
@@ -309,7 +312,7 @@ class V4_4_PerCaseComputeParity(unittest.TestCase):
             return ScoredItem(
                 case, "sdt", condition, "m", 0,
                 {"composite": value},
-                {"verification_stratum": stratum, "parity_error": ""},
+                {"verification_stratum": stratum, "parity_error": "", "branch_group": f"{case}#0"},
             )
 
         items = []
@@ -513,7 +516,7 @@ class V4_6_ClinicalPathwayReporting(unittest.TestCase):
                             f"{subtask}::{i}", "cp", condition, "m", 0,
                             {"exact": hit, "subtask": subtask, "cp_family": family,
                              "disease": f"D{i % 5}"},
-                            {"parity_error": ""},
+                            {"parity_error": "", "branch_group": f"{subtask}::{i}#0"},
                         )
                     )
         return out
@@ -562,18 +565,42 @@ class V4_6_ClinicalPathwayReporting(unittest.TestCase):
             self.assertIn(subtask, table)
         self.assertIn("**macro**", table)
 
-    def test_the_macro_contrast_uses_a_matching_estimator(self):
-        from tcm_eval.report import cp_macro_contrast_table
+    def test_the_macro_contrast_estimates_what_the_table_reports(self):
+        """Assert the *quantity*, not the estimator's name.
 
-        table, results = cp_macro_contrast_table(
-            self._items({f"CP{i}": 0.5 for i in range(1, 7)})
+        The V4 version of this test checked that the contrast called something
+        named ``stratified_macro_bootstrap``. It did -- while passing the nine
+        subtasks in as strata, which weights CP4 at 4/9 where the table above
+        weights it at 1/6. The name matched and the number did not, so the
+        assertion that mattered was the one not being made.
+        """
+        from tcm_eval.report import cp_macro_contrast_table, cp_subtask_table
+
+        # Only CP4 improves, 0 -> 1. Six-family macro says Δ = 1/6; a flat
+        # nine-subtask macro says 4/9.
+        items = self._items({"CP1": 0.0, "CP2": 0.0, "CP3": 0.0,
+                             "CP4": 0.0, "CP5": 0.0, "CP6": 0.0})
+        for item in items:
+            if item.metrics["cp_family"] == "CP4" and item.condition == "M4":
+                item.metrics["exact"] = 1.0
+
+        table = cp_subtask_table(items)
+        macro = {
+            line.split("|")[2].strip(): float(line.split("|")[-2])
+            for line in table.splitlines()
+            if "**macro**" in line
+        }
+        reported = macro["M4"] - macro["M3C"]
+        self.assertAlmostEqual(reported, 1 / 6, places=2)
+
+        _table, results = cp_macro_contrast_table(items)
+        result = next(v for k, v in results.items() if "M3C->M4" in k)
+        self.assertAlmostEqual(
+            result.delta, reported, places=2,
+            msg=f"the test estimates {result.delta:.3f} where the table reports "
+                f"{reported:.3f} -- the CI and p describe a different quantity",
         )
-        self.assertTrue(results)
-        for result in results.values():
-            self.assertTrue(
-                result.test.startswith("stratified_macro_bootstrap"),
-                f"macro contrast used {result.test}",
-            )
+        self.assertNotAlmostEqual(result.delta, 4 / 9, places=2)
 
     def test_a_stratified_sample_gives_the_small_subtasks_room(self):
         from tcm_eval.datasets import Dataset, FieldMapping

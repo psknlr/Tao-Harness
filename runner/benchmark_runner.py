@@ -36,7 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import tcm_tools  # noqa: F401  (registers the tool surface)
 from tcm_agent import AgentRuntime, Trace, build_task, read_traces, write_traces
-from tcm_agent.runtime import BRANCHABLE
+from tcm_agent.runtime import BRANCHABLE, GROUPED
 from tcm_eval import (
     PA_METRICS,
     PA_PRIMARY,
@@ -61,6 +61,7 @@ from tcm_eval.provenance import (
     case_set_hash,
     code_fingerprints,
     compare_fingerprints,
+    design_signature,
     manifest_conflicts,
     run_signature,
 )
@@ -288,6 +289,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             code=code,
         )
 
+    def _design(model_key: str) -> str:
+        return design_signature(
+            run_signature=_signature(model_key),
+            conditions=config.conditions,
+            samples=config.samples,
+            limit=config.dataset_limit,
+            stratify=config.dataset_stratify,
+        )
+
     manifest = write_manifest(
         config,
         kg,
@@ -296,7 +306,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         extra={
             "case_ids": case_ids,
             "case_set_sha256": case_set,
+            "n_unique_case_ids": len(set(case_ids)),
+            # non-zero means the source file shipped duplicate keys and the
+            # loader had to impose uniqueness; a reader should know
+            "n_renamed_case_ids": dataset.n_renamed_ids,
             "run_signatures": {k: _signature(k) for k in config.models if k in specs},
+            # Two levels: the apparatus, which the arms share, and the design,
+            # which they do not -- a narrowed condition list or a changed
+            # sample count is a different experiment in the same apparatus.
+            "design_signatures": {k: _design(k) for k in config.models if k in specs},
+            "design_signature": design_signature(
+                run_signature=framework_hash,
+                conditions=config.conditions,
+                samples=config.samples,
+                limit=config.dataset_limit,
+                stratify=config.dataset_stratify,
+            ),
         },
         allow_conflict=bool(getattr(args, "new_run", False)),
     )
@@ -324,11 +349,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         # snapshot or from before a tool rewrite -- exactly the traces a resume
         # must regenerate. Traces predating the signature carry "" and are
         # never resumed: they cannot prove what produced them.
+        design = _design(model_key)
+        config.framework.design_signature = design
+
         recorded = read_traces(trace_file) if not args.overwrite else []
         existing = {
             (t.case_id, t.condition, t.sample): t
             for t in recorded
+            # Both levels. The apparatus signature alone let a trace from a
+            # condition this run no longer declares, or a sample index this run
+            # no longer produces, survive into the output -- the manifest then
+            # described one experiment and the trace file held another.
             if t.run_signature == signature
+            and t.design_signature == design
+            and t.condition in config.conditions
+            and t.sample < config.samples
         }
         stale = len(recorded) - len(existing)
         if existing:
@@ -350,26 +385,47 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         # M3/M3C/M4 share one agent phase and are generated together, so the
         # only difference between them is what happens after the first answer.
-        branch_conditions = [c for c in config.conditions if c in BRANCHABLE]
-        solo_conditions = [c for c in config.conditions if c not in BRANCHABLE]
+        # M2C joins them because it has to spend the number of model calls M3
+        # spent *on this case*, which is only known once M3 has run.
+        group_conditions = [c for c in config.conditions if c in GROUPED]
+        solo_conditions = [c for c in config.conditions if c not in GROUPED]
 
         jobs: List[Tuple[Mapping[str, Any], Tuple[str, ...], int]] = []
+        regenerated = 0
         for item in items:
             for sample in range(config.samples):
                 for condition in solo_conditions:
                     if (str(item["id"]), condition, sample) not in existing:
                         jobs.append((item, (condition,), sample))
-                missing = tuple(
+                if not group_conditions:
+                    continue
+                present = [
                     c
-                    for c in branch_conditions
-                    if (str(item["id"]), c, sample) not in existing
-                )
-                if missing:
-                    jobs.append((item, missing, sample))
+                    for c in group_conditions
+                    if (str(item["id"]), c, sample) in existing
+                ]
+                if len(present) == len(group_conditions):
+                    continue
+                # Regenerate the whole group, not just the missing arm.
+                # Filling in only M4 gave it a fresh agent prefix while the
+                # surviving M3C kept the old one, so the pair no longer shared
+                # a trajectory -- and M3C->M4, whose entire claim is that the
+                # verification report is the only difference, silently became
+                # a comparison of two independent runs.
+                for condition in present:
+                    existing.pop((str(item["id"]), condition, sample), None)
+                    regenerated += 1
+                jobs.append((item, tuple(group_conditions), sample))
+        if regenerated:
+            print(
+                f"{model_key}: discarding {regenerated} arm(s) of partially "
+                f"recorded groups so each group keeps one shared trajectory",
+                file=sys.stderr,
+            )
         n_traces = sum(len(group) for _i, group, _s in jobs)
         print(
             f"{model_key}: {n_traces} traces to generate "
-            f"({len(jobs)} invocations; {len(branch_conditions)} branch arms share a trajectory)",
+            f"({len(jobs)} invocations; {len(group_conditions)} arms generated as a group)",
             file=sys.stderr,
         )
 
@@ -381,7 +437,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             runtime = AgentRuntime(
                 kg, retriever, task, client, config.framework, run_id=config.name
             )
-            if len(group) == 1 and group[0] not in BRANCHABLE:
+            if len(group) == 1 and group[0] not in GROUPED:
                 return [runtime.run(item, group[0], sample=sample)]
             return list(runtime.run_branch_group(item, group, sample=sample).values())
 
@@ -450,9 +506,22 @@ def _consensus_traces(traces: Sequence[Trace]) -> List[Trace]:
             condition=head.condition,
             model_key=head.model_key,
             framework_hash=head.framework_hash,
+            # Provenance must survive the merge. Dropping it made a combined
+            # trace unattributable -- the branch group the M3C/M4 pairing needs,
+            # the parity flag that removes an unusable pair, and the two
+            # signatures that prove what produced it all vanished, and the
+            # analysis silently treated a consensus trace as clean.
+            run_signature=head.run_signature,
+            design_signature=head.design_signature,
             sample=-1,
             started_at=head.started_at,
         )
+        combined.branch_group = head.branch_group
+        combined.verification_stratum = head.verification_stratum
+        # Any sample whose compute did not match invalidates the merged case:
+        # the consensus answer was voted on by an arm that spent differently.
+        broken = [t.parity_error for t in bucket if t.parity_error]
+        combined.parity_error = broken[0] if broken else ""
         for trace in bucket:
             combined.llm_steps.extend(trace.llm_steps)
             combined.tool_steps.extend(trace.tool_steps)
@@ -568,12 +637,17 @@ def cmd_score(args: argparse.Namespace) -> int:
 
     manifest = _load_manifest(config)
     if manifest is None:
-        print(
-            f"WARNING: no frozen manifest in {config.output_dir}; scoring against "
-            f"the config as it reads now, which may not describe the run.",
-            file=sys.stderr,
+        # A scored file with no manifest has no experimental identity: nothing
+        # records which graph, dataset, code or models produced it, and the
+        # config it is scored against is whatever the file says today. Fine
+        # while developing, not fine for a number that goes in a paper.
+        code = _refuse_or_note(
+            "no frozen manifest in the output directory",
+            f"{config.output_dir} has no manifest.{config.task}.json, so there is "
+            f"no record of what produced these traces. Run `run` first.",
         )
-        drift_notes.append("no frozen manifest: the config may not describe the run")
+        if code is not None:
+            return code
     else:
         drift = compare_fingerprints(manifest, code_fingerprints())
         if drift:

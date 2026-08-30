@@ -313,7 +313,24 @@ changes it. The retrieval index caches on it too; keying on node *count*, as an
 earlier version did, meant a thousand edited relations silently reused a stale
 index.
 
-### 7. The run signature
+### 7. Dataset identity
+
+`case_id` is the primary key of the gold lookup, the resume key and the paired
+analysis — three dicts, so a repeat means last-write-wins in all three. A
+TCM-CP build shipped 825 rows over 331 identifiers because CP4 ids named the
+syndrome and not the disease; one id spanned 19 diseases whose gold letters ran
+A through F. A model answering one disease was scored against another's key,
+and whether a run had been resumed changed the score.
+
+The builder now validates before writing and refuses on any violation: unique
+non-blank ids, gold inside the options, two real distractors, no two options
+carrying the same answer, no answer echoed in the question under punctuation
+and width normalisation. `load_dataset` imposes unique keys for every benchmark
+and records what it had to rename — which found TCM-SD's released dev split
+shipping 178 repeated `user_id`s, a third-party file disambiguated
+deterministically rather than refused.
+
+### 8. The run signature
 
 The framework hash has to stay **equal** across models — that is what makes
 "every arm saw the same scaffold" a checkable claim. The same blindness means
@@ -342,6 +359,13 @@ missing or stale manifest.
   separating generation from scoring. `--allow-drift` overrides, and the drift
   is written into `scored_manifest` and printed as a banner at the top of the
   report, so a forced number cannot later pass as a clean one.
+
+**The design signature** sits one level up. The run signature omits the
+condition on purpose, which leaves `conditions`, `samples`, `limit` and the
+sampling rule in no fingerprint at all: narrow a seven-arm config to `[M0, M1]`
+and the M2–M4 traces still matched, so the manifest described a two-arm
+experiment beside a seven-arm trace file. It covers both levels, is stamped on
+every trace, and gates resume.
 
 Every run writes its `manifest.json` before generation starts, so an
 interrupted run still records what it was doing. The report reproduces one
@@ -587,14 +611,28 @@ medicine/external therapy (CP4), monitoring (CP5) and transition decisions
   unassessed — including a mixed answer that contains both a safe and an
   unsafe option.
 
+**CP4 treatment is disease-conditioned.** `Syndrome → Treatment` is a global
+edge, but the clinical fact is ternary — *this disease's* guideline, for this
+syndrome, recommends this treatment. Read globally, 补中益气汤 is "the formula
+for 脾胃虚弱证" whether the pathway is 弱视, 吉兰巴雷综合征 or 糖尿病性胃轻瘫, and
+the first global edge became the gold for all three. 54.45% of CP4 gold shared
+no source document with the current `Disease → Syndrome` edge. **异病同治** is
+real, so that is not proof of error — but the system could not show the
+*pathway* recommends it. `treatments_of(syndrome, disease)` separates
+`disease_specific` from `cross_disease_general`; ungrounded gold is down to
+14.48% and the rest is labelled per item.
+
 **The prespecified CP endpoint is the macro-average**, not pooled accuracy.
 The nine subtasks run from 306 items (CP6) to 988 (CP3, CP5), so a pooled
 number is 53% stage lookup and monitoring and 5.5% transition decision — a
 model that reads stages well and moves patients on badly would read as a good
 pathway executor. The report gives per-subtask rows plus the mean of the six
-capability means, and tests it with a stratified macro bootstrap (resample
-diseases within subtask, average within subtask, weight families equally) so
-the interval describes the same quantity as the point estimate. The sample is
+capability means, and tests it with a **hierarchical** macro bootstrap (resample
+diseases within subtask, average the subtasks of a family, weight the six
+families equally) so the interval describes the same quantity as the point
+estimate. Two levels were not enough: passing the nine subtasks in flat
+weighted CP4 at 4/9 where the table weighted it 1/6, and on a CP4-only
+improvement the table said 0.167 while the test said 0.444. The sample is
 drawn stratified by subtask for the same reason: a head-slice of 400 leaves CP6
 with 28 items.
 

@@ -736,6 +736,20 @@ def normalise_options(value: Any) -> List[str]:
     return sorted(letters)
 
 
+def _plan_names(kg, rows) -> Dict[str, List[str]]:
+    """``{relation key: [treatment name, ...]}``, in the tool's own shape.
+
+    The static context and the tool must offer the same *kinds* of knowledge or
+    the contrast between them is not about retrieval.
+    """
+    out: Dict[str, List[str]] = {}
+    for relation, key in kg.TREATMENT_EDGES:
+        names = [r["name"] for r in rows if r["relation"] == relation]
+        if names:
+            out[key] = names[:4]
+    return out
+
+
 class ClinicalPathwayTask(Task):
     """TCM-CP: execute a staged clinical pathway.
 
@@ -803,18 +817,29 @@ class ClinicalPathwayTask(Task):
         if syndrome:
             found = self.kg.find_by_name(syndrome, [NodeType.SYNDROME.value])
             if found:
+                # Every relation type ``retrieve_treatment_plan`` returns, and
+                # split the same way. The static block used to carry only
+                # principles and formulas, while the tool also returned patent
+                # medicines and external therapies -- and 100 of the 450 formal
+                # CP cases ask about exactly those two. On those items M2C→M3
+                # would have measured whether the target relation was in the
+                # context at all, not whether adaptive retrieval helps, which
+                # is the one thing that contrast is for.
+                disease_node = self.kg.find_by_name(
+                    coerce_str(item.get("disease")),
+                    [NodeType.DISEASE.value, NodeType.DISEASE_SUBTYPE.value],
+                )
+                plan = self.kg.treatments_of(
+                    found[0].id,
+                    disease_id=disease_node[0].id if disease_node else None,
+                )
                 context["treatment"] = {
                     "syndrome": found[0].name,
-                    "principles": [
-                        t.name
-                        for _e, t in self.kg.neighbours(
-                            found[0].id, {EdgeType.TREATED_BY_PRINCIPLE.value}
-                        )
-                    ][:4],
-                    "formulas": [
-                        t.name
-                        for _e, t in self.kg.neighbours(found[0].id, {EdgeType.USES_FORMULA.value})
-                    ][:4],
+                    "scope": plan["scope"],
+                    "disease_specific": _plan_names(self.kg, plan["disease_specific"]),
+                    "cross_disease_general": _plan_names(
+                        self.kg, plan["cross_disease_general"]
+                    ),
                 }
         return context
 
