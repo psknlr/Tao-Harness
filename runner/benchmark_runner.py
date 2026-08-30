@@ -544,6 +544,10 @@ def _score_traces(
     pricing: Optional[Mapping[str, Sequence[float]]] = None,
 ) -> List[ScoredItem]:
     scored: List[ScoredItem] = []
+    # If a contamination audit has been run for this experiment, every scored
+    # item carries its stratum, so the clean-subset sensitivity analysis needs
+    # no separate bookkeeping at report time.
+    contamination = _load_contamination(config)
     if config.samples > 1:
         traces = _consensus_traces(traces)
     for trace in traces:
@@ -567,6 +571,13 @@ def _score_traces(
             accuracy = tool_selection_accuracy(trace, reference.get("rule_id"))
             if accuracy is not None:
                 metrics["tool_selection_accuracy"] = accuracy
+        stratum = contamination.get(trace.case_id)
+        if stratum:
+            metrics["contamination_stratum"] = stratum["stratum"]
+            metrics["contamination_score"] = max(
+                float(stratum.get("ngram_jaccard") or 0.0),
+                float(stratum.get("containment") or 0.0),
+            )
         scored.append(
             ScoredItem(
                 case_id=trace.case_id,
@@ -588,6 +599,25 @@ def _score_traces(
             )
         )
     return scored
+
+
+def _load_contamination(config: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
+    """The audit for this experiment, if one has been run.
+
+    Absent is not an error here -- ``score`` should work while developing --
+    but the report says loudly when the stratification is missing, because a
+    KG result with no contamination audit behind it has not ruled out the one
+    explanation a paired design cannot rule out by itself.
+    """
+    path = config.output_dir / f"contamination.{config.task}.json"
+    if not path.exists():
+        return {}
+    try:
+        from tcm_eval.contamination import load_report
+
+        return load_report(path)
+    except (OSError, json.JSONDecodeError, KeyError):
+        return {}
 
 
 def _load_manifest(config: ExperimentConfig) -> Optional[Dict[str, Any]]:
@@ -1033,6 +1063,43 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_contaminate(args: argparse.Namespace) -> int:
+    """Audit the benchmark against the graph's own text.
+
+    Run this before generation, not after: the stratum it assigns each case is
+    what makes the clean-subset sensitivity analysis possible, and that is the
+    only argument that separates "the graph improved reasoning" from "the graph
+    contained the answer".
+    """
+    from tcm_eval.contamination import GraphText, audit_dataset, format_report
+
+    config = load_experiment(args.config)
+    dataset = load_dataset(
+        config.dataset_path, config.dataset_kind, **config.loader_kwargs()
+    )
+    items = dataset.subset(
+        config.dataset_limit, stratify=config.dataset_stratify
+    ).items
+
+    kg = load_kg(args.kg)
+    print(f"indexing graph text ...", file=sys.stderr)
+    graph = GraphText.from_kg(kg)
+    print(f"  {len(graph)} passages", file=sys.stderr)
+
+    report = audit_dataset(items, graph, config.dataset_kind)
+    report["kg_content_sha256"] = kg.content_hash()
+    report["dataset_sha256"] = _file_hash(config.dataset_path)
+
+    out = Path(args.out or config.output_dir / f"contamination.{config.task}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    markdown = format_report(report)
+    Path(str(out).replace(".json", ".md")).write_text(markdown, encoding="utf-8")
+    print(markdown)
+    print(f"\n(written to {out})", file=sys.stderr)
+    return 0
+
+
 def cmd_coverage(args: argparse.Namespace) -> int:
     from scripts.kg_coverage import coverage_report
 
@@ -1078,6 +1145,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--replay", action="store_true", help="offline: cache only, no API key")
     run.add_argument("--echo-script", nargs="*", default=None, help="scripted offline responses")
     run.set_defaults(func=cmd_run)
+
+    contaminate = sub.add_parser(
+        "contaminate",
+        help="audit the benchmark against the graph's text before running",
+    )
+    contaminate.add_argument("config")
+    contaminate.add_argument("--out", default=None)
+    contaminate.set_defaults(func=cmd_contaminate)
 
     score = sub.add_parser("score", help="score recorded traces")
     score.add_argument("config")

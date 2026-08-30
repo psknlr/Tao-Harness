@@ -642,6 +642,98 @@ def cp4_provenance_table(items: Sequence[ScoredItem], metric: str = CP_PRIMARY) 
     return _md_table(["model", "condition", "gold provenance", "n", metric], rows)
 
 
+#: The contrasts a graph leak would inflate. M0->M1 changes no knowledge, and
+#: M3C->M4 changes only the verification report, so neither can be explained by
+#: what the graph contains.
+KG_CONTRASTS: Tuple[Tuple[str, str, str], ...] = (
+    ("M1", "M2", "static KG evidence"),
+    ("M2C", "M3", "agentic retrieval over the same KG"),
+)
+
+
+def contamination_table(
+    items: Sequence[ScoredItem], dataset: str, metric: str
+) -> Tuple[str, str]:
+    """The KG contrasts recomputed on the uncontaminated subset.
+
+    This is the analysis the audit exists for. Pre-training contamination is a
+    *shared* confound -- every arm of a model memorised the same things, so the
+    paired difference cancels it. Graph contamination is not shared: only M2,
+    M3 and M4 can read the graph, so a case whose answer sits in the graph's
+    evidence text hands those arms the answer key and lands the difference in
+    exactly the contrast reported as the knowledge-graph effect.
+
+    Restricting to ``clean`` cases removes that reading. A gain that survives
+    here is not retrieval of the answer.
+
+    Returns ``(table, note)``; the note says what is missing when no audit has
+    been run, because silence would look like a clean result.
+    """
+    scoped = [i for i in items if i.dataset == dataset]
+    if not scoped:
+        return "", ""
+    strata = [
+        str(i.metrics.get("contamination_stratum") or "") for i in scoped
+    ]
+    if not any(strata):
+        return "", (
+            f"> **No contamination audit for {dataset.upper()}.** Run "
+            f"`benchmark_runner contaminate` before generation: without it, a "
+            f"KG gain cannot be separated from the graph containing the answer, "
+            f"and a paired design does not rule that out — only M2/M3/M4 can "
+            f"read the graph, so the leak lands in the KG contrast itself."
+        )
+
+    counts: Dict[str, int] = defaultdict(int)
+    for stratum in strata:
+        counts[stratum or "unaudited"] += 1
+    clean = [
+        i for i in scoped if i.metrics.get("contamination_stratum") == "clean"
+    ]
+    index_all = index_items(scoped)
+    index_clean = index_items(clean)
+
+    rows: List[List[Any]] = []
+    for model in sorted({i.model_key for i in scoped}):
+        for left, right, label in KG_CONTRASTS:
+            xs, ys = paired_vectors(index_all, model, left, right, metric)
+            cxs, cys = paired_vectors(index_clean, model, left, right, metric)
+            if not xs:
+                continue
+            full = (sum(ys) - sum(xs)) / len(xs)
+            clean_delta = (
+                (sum(cys) - sum(cxs)) / len(cxs) if cxs else float("nan")
+            )
+            rows.append(
+                [
+                    model,
+                    f"{left}→{right}",
+                    label,
+                    len(xs),
+                    full,
+                    len(cxs),
+                    clean_delta if clean_delta == clean_delta else None,
+                    (clean_delta - full) if clean_delta == clean_delta else None,
+                ]
+            )
+    summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+    note = (
+        f"Cases by contamination stratum: {summary}. `clean` means the case's "
+        f"narrative does not overlap any graph passage and its gold answer does "
+        f"not appear in the graph."
+    )
+    if not rows:
+        return "", note
+    return (
+        _md_table(
+            ["model", "contrast", "what it isolates", "n (all)", f"Δ {metric} (all)",
+             "n (clean)", f"Δ {metric} (clean)", "shift"],
+            rows,
+        ),
+        note,
+    )
+
+
 def compute_parity_table(items: Sequence[ScoredItem]) -> str:
     """Did each control actually spend what the arm it matches spent?
 
@@ -1062,6 +1154,23 @@ def build_report(
             parts.append("")
             parts.append(strata)
             parts.append("")
+        contam_table, contam_note = contamination_table(items, dataset, primary)
+        if contam_note:
+            parts.append("### Contamination sensitivity")
+            parts.append("")
+            parts.append(contam_note)
+            parts.append("")
+            if contam_table:
+                parts.append(
+                    "Pre-training contamination is shared across a model's arms and "
+                    "cancels in the paired difference. Graph contamination does not: "
+                    "only M2/M3/M4 read the graph, so a leaked answer inflates the KG "
+                    "contrast itself. **A gain that survives on the `clean` subset "
+                    "cannot be read as retrieving the answer from the graph.**"
+                )
+                parts.append("")
+                parts.append(contam_table)
+                parts.append("")
         comp_table, comp_stats = compensation_table(items, dataset, primary)
         parts.append("### Does the framework compensate weaker models?")
         parts.append("")
