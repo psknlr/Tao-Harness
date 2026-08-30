@@ -684,9 +684,17 @@ def contamination_table(
             f"read the graph, so the leak lands in the KG contrast itself."
         )
 
+    # Count *cases*, not scored items: every case appears once per arm, so
+    # counting items multiplied every stratum by the number of conditions and
+    # reported a 50-case benchmark as 350.
+    per_case: Dict[str, str] = {}
+    for item in scoped:
+        per_case.setdefault(
+            item.case_id, str(item.metrics.get("contamination_stratum") or "unaudited")
+        )
     counts: Dict[str, int] = defaultdict(int)
-    for stratum in strata:
-        counts[stratum or "unaudited"] += 1
+    for stratum in per_case.values():
+        counts[stratum] += 1
     clean = [
         i for i in scoped if i.metrics.get("contamination_stratum") == "clean"
     ]

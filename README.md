@@ -313,7 +313,35 @@ changes it. The retrieval index caches on it too; keying on node *count*, as an
 earlier version did, meant a thousand edited relations silently reused a stale
 index.
 
-### 7. Dataset identity
+### 7. Contamination: the confound pairing cannot remove
+
+Pre-training contamination is **shared** — every arm of a model memorised the
+same records, so the paired difference cancels it. Graph contamination is not:
+only M2/M3/M4 read the graph, so a case whose answer sits in the graph's
+evidence text hands those arms the answer key, and the difference lands in the
+contrast reported as the KG effect.
+
+`benchmark_runner contaminate` audits the 16,052 passages a KG arm can reach at
+four levels — verbatim gold, character 5-gram Jaccard, containment, cited
+source — deterministically and with no embedding model, because an audit whose
+purpose is to be checkable should not contain an uncontrolled variable.
+
+| benchmark | cases | clean | gold in graph |
+|---|---|---|---|
+| SDT | 50 | **100.0%** | 0 |
+| PA | 328 | **99.4%** | 0 |
+| CP | 500 | 0.0% | 136 |
+
+**The detector was validated before those numbers were trusted.** TCM-CP is
+contaminated by construction and the audit says so at 100% — that is what makes
+the SDT and PA readings mean something. Planted copies and six realistic
+rewrite modes are caught; unrelated text scores zero; a character-shuffled
+passage is missed and that limit is stated rather than hidden.
+
+`score` attaches the stratum and the report recomputes the KG contrasts on the
+clean subset. **A gain that survives there is not retrieval of the answer.**
+
+### 8. Dataset identity
 
 `case_id` is the primary key of the gold lookup, the resume key and the paired
 analysis — three dicts, so a repeat means last-write-wins in all three. A
@@ -330,7 +358,7 @@ and records what it had to rename — which found TCM-SD's released dev split
 shipping 178 repeated `user_id`s, a third-party file disambiguated
 deterministically rather than refused.
 
-### 8. The run signature
+### 9. The run signature
 
 The framework hash has to stay **equal** across models — that is what makes
 "every arm saw the same scaffold" a checkable claim. The same blindness means
