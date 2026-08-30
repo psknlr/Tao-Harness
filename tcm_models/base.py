@@ -122,6 +122,14 @@ class ModelSpec:
                 "model_id": self.model_id,
                 "base_url": self.base_url,
                 "extra_body": dict(self.extra_body),
+                # Retry policy is part of the apparatus, not a convenience.
+                # max_retries=1 against max_retries=10 on the same model gives
+                # a different rate of unanswered cases under identical load,
+                # and an unanswered case scores zero -- so the difference
+                # arrives as a capability difference between arms that never
+                # existed. Same for the timeout.
+                "timeout_s": self.timeout_s,
+                "max_retries": self.max_retries,
             },
             sort_keys=True,
             ensure_ascii=False,

@@ -1,10 +1,16 @@
 """Provider adapters.
 
-Four of the five frontier models under study speak the OpenAI chat-completions
-shape (DeepSeek, GLM, MiniMax, GPT); Gemini has its own shape and gets a
-dedicated adapter.  Both adapters normalise into the same
-:class:`~tcm_models.base.Completion`, so the agent runtime above them is
-provider-agnostic.
+Most of the models under study speak the OpenAI chat-completions shape
+(DeepSeek, GLM, GPT); Gemini has its own. MiniMax and Poe speak the OpenAI
+shape but diverge in ways that would otherwise become per-model confounds --
+MiniMax reports errors with HTTP 200 and may omit the prompt/completion token
+split, and Poe is a gateway whose bot name is not a snapshot identity -- so
+each gets a thin adapter that normalises the difference rather than letting it
+land in the results.
+
+Every adapter returns the same :class:`~tcm_models.base.Completion`, so the
+agent runtime above them is provider-agnostic and no arm can differ because of
+how its provider was read.
 """
 
 from __future__ import annotations
@@ -150,6 +156,76 @@ class GeminiClient(LLMClient):
             finish_reason=str(candidates[0].get("finishReason") or ""),
             raw=data,
         )
+
+
+class MiniMaxClient(OpenAICompatClient):
+    """MiniMax chat-completions.
+
+    MiniMax speaks the OpenAI shape, so the request side is inherited. Two
+    things differ enough to matter for a controlled comparison:
+
+    * **Errors arrive with HTTP 200.** A failed request returns
+      ``base_resp.status_code != 0`` in the body rather than a non-2xx status,
+      so the shared HTTP layer sees success and the run records an empty
+      completion as a legitimate blank answer. That would show up as a lower
+      ``answered`` rate for MiniMax and read as a model difference.
+    * **Usage may report only ``total_tokens``.** Splitting cost between
+      prompt and completion at their published rates would be a guess, so the
+      total is recorded as completion tokens and the prompt count left at zero
+      -- visibly incomplete rather than plausibly wrong. ``smoke`` reports it.
+    """
+
+    #: Documented MiniMax API status codes worth retrying rather than failing.
+    _RETRYABLE = frozenset({1002, 1027, 1039, 2013})
+
+    def _generate(self, messages: Sequence[Message], decode: DecodeParams) -> Completion:
+        completion = super()._generate(messages, decode)
+        body = completion.raw if isinstance(completion.raw, Mapping) else {}
+
+        resp = body.get("base_resp") or {}
+        status = int(resp.get("status_code") or 0)
+        if status:
+            detail = str(resp.get("status_msg") or "")
+            message = f"MiniMax error {status}: {detail}"
+            if status in self._RETRYABLE:
+                raise RetryableError(message)
+            raise LLMError(message)
+
+        # Fill in a usage split MiniMax sometimes omits.
+        usage_raw = body.get("usage") or {}
+        if not completion.usage.prompt_tokens and not completion.usage.completion_tokens:
+            total = int(usage_raw.get("total_tokens") or 0)
+            if total:
+                completion.usage = Usage(prompt_tokens=0, completion_tokens=total)
+        return completion
+
+
+class PoeClient(OpenAICompatClient):
+    """Poe's OpenAI-compatible gateway.
+
+    Poe fronts many upstream models behind one endpoint, which makes it useful
+    for reaching a model whose first-party API is not available -- and makes
+    two things the harness depends on less certain:
+
+    * **The bot name is the model identity.** ``model_id`` is a Poe bot, and a
+      bot can be repointed at a different upstream snapshot without its name
+      changing. The manifest therefore cannot promise the same reproducibility
+      it does for a first-party endpoint, so the completion records
+      ``via_gateway`` and the spec is fingerprinted with the gateway marked.
+      Prefer a first-party adapter where one exists; a paper that pins a
+      snapshot should say which models came through here.
+    * **Sampling controls may be ignored.** Poe forwards what the upstream bot
+      accepts, so ``seed`` in particular may not be honoured even though the
+      request carries it. ``smoke`` reports whether two seeded calls agree, and
+      that answer is the one to trust over this docstring.
+    """
+
+    def _generate(self, messages: Sequence[Message], decode: DecodeParams) -> Completion:
+        completion = super()._generate(messages, decode)
+        # Say plainly, in the trace, that this answer came through a gateway.
+        if isinstance(completion.raw, dict):
+            completion.raw.setdefault("via_gateway", "poe")
+        return completion
 
 
 class EchoClient(LLMClient):

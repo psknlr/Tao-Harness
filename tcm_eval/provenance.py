@@ -107,6 +107,9 @@ IMMUTABLE_MANIFEST_KEYS: Sequence[str] = (
     "design_signature",
     "kg_content_sha256",
     "dataset_sha256",
+    # The gold file, resolved rather than configured: replacing it changes the
+    # answers a run is graded against, which is a different experiment even
+    # though the input JSON is byte-identical.
     "dataset_results_sha256",
     "case_set_sha256",
 )

@@ -152,6 +152,7 @@ def write_manifest(
     n_items: int,
     extra: Optional[Mapping[str, Any]] = None,
     allow_conflict: bool = False,
+    gold_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Record everything needed to reproduce or audit this run.
 
@@ -189,9 +190,18 @@ def write_manifest(
         "framework": config.framework.describe(),
         **code_fingerprints(),
     }
-    if config.dataset_results_path:
-        manifest["dataset_results_path"] = str(config.dataset_results_path)
-        manifest["dataset_results_sha256"] = _file_hash(config.dataset_results_path)
+    # The gold file the loader *resolved*, which for SDT it discovers rather
+    # than being told. Hashing only a configured path left the discovered one
+    # unfrozen: swap Results/*.txt after generation and `score` would re-grade
+    # recorded predictions against different answers with every other
+    # fingerprint intact.
+    resolved_gold = gold_path or config.dataset_results_path
+    if resolved_gold:
+        manifest["dataset_results_path"] = str(resolved_gold)
+        manifest["dataset_results_sha256"] = _file_hash(Path(resolved_gold))
+        manifest["dataset_results_resolved_by"] = (
+            "config" if config.dataset_results_path else "loader discovery"
+        )
     if extra:
         manifest.update(extra)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -329,6 +339,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         config,
         kg,
         specs,
+        gold_path=dataset.gold_path,
         n_items=len(items),
         extra={
             "case_ids": case_ids,
@@ -569,12 +580,13 @@ def _score_traces(
     gold: Mapping[str, Mapping[str, Any]],
     kg,
     pricing: Optional[Mapping[str, Sequence[float]]] = None,
+    contamination: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> List[ScoredItem]:
     scored: List[ScoredItem] = []
-    # If a contamination audit has been run for this experiment, every scored
-    # item carries its stratum, so the clean-subset sensitivity analysis needs
-    # no separate bookkeeping at report time.
-    contamination = _load_contamination(config)
+    # The audit, already validated against this run's identity by cmd_score.
+    # Every scored item carries its stratum, so the clean-subset sensitivity
+    # analysis needs no separate bookkeeping at report time.
+    contamination_cases = dict(contamination or {})
     if config.samples > 1:
         traces = _consensus_traces(traces)
     for trace in traces:
@@ -598,7 +610,7 @@ def _score_traces(
             accuracy = tool_selection_accuracy(trace, reference.get("rule_id"))
             if accuracy is not None:
                 metrics["tool_selection_accuracy"] = accuracy
-        stratum = contamination.get(trace.case_id)
+        stratum = contamination_cases.get(trace.case_id)
         if stratum:
             metrics["contamination_stratum"] = stratum["stratum"]
             metrics["contamination_score"] = max(
@@ -628,6 +640,19 @@ def _score_traces(
     return scored
 
 
+def _gold_hash(dataset: Any, config: ExperimentConfig) -> str:
+    """SHA of the gold file the loader *actually* resolved.
+
+    The SDT config sets no ``results_path``, so the loader discovers
+    ``Results/*.txt`` on its own -- and only an explicitly configured path was
+    ever hashed. Replacing that file after generation would let `score`
+    re-grade recorded predictions against different answers with the dataset
+    hash unchanged, and every fail-closed check would pass.
+    """
+    resolved = getattr(dataset, "gold_path", None) or config.dataset_results_path
+    return _file_hash(Path(resolved)) if resolved else ""
+
+
 def _load_contamination(config: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
     """The audit for this experiment, if one has been run.
 
@@ -645,6 +670,28 @@ def _load_contamination(config: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
         return load_report(path)
     except (OSError, json.JSONDecodeError, KeyError):
         return {}
+
+
+def _check_contamination_identity(
+    audit: Mapping[str, Any],
+    dataset: Any,
+    config: ExperimentConfig,
+    kg_hash: str,
+    case_ids: Sequence[str],
+) -> List[str]:
+    """Is this audit about the run being scored, or an older one?"""
+    from tcm_eval.contamination import audit_identity, identity_conflicts
+
+    frozen = audit.get("identity") or {}
+    if not frozen:
+        return ["the audit predates identity stamping; re-run `contaminate`"]
+    current = audit_identity(
+        kg_hash=kg_hash,
+        dataset_hash=_file_hash(config.dataset_path),
+        gold_hash=_gold_hash(dataset, config),
+        case_set_hash=case_set_hash([str(c) for c in case_ids]),
+    )
+    return identity_conflicts(frozen, current)
 
 
 def _load_manifest(config: ExperimentConfig) -> Optional[Dict[str, Any]]:
@@ -731,6 +778,10 @@ def cmd_score(args: argparse.Namespace) -> int:
         current_inputs = {
             "kg_content_sha256": _kg_hash_for(config, args),
             "dataset_sha256": _file_hash(config.dataset_path),
+            # The gold answers themselves. An unchanged input JSON with a
+            # swapped Results file re-grades the same predictions against
+            # different answers, and every other check passes.
+            "dataset_results_sha256": _gold_hash(dataset, config),
         }
         for key, value in current_inputs.items():
             frozen_value = manifest.get(key)
@@ -762,6 +813,26 @@ def cmd_score(args: argparse.Namespace) -> int:
                 f"(case_set {str(manifest.get('case_set_sha256'))[:12]})",
                 file=sys.stderr,
             )
+    # A stale contamination audit is worse than none. None is visible -- the
+    # report says so loudly. A stale one silently stratifies this run by a
+    # previous graph's contamination, so the clean-subset analysis, whose whole
+    # job is to show the gain is not retrieval, gets computed against a graph
+    # that no longer exists.
+    audit = _load_contamination(config)
+    contamination_cases: Dict[str, Any] = {}
+    if audit:
+        stale = _check_contamination_identity(
+            audit, dataset, config, _kg_hash_for(config, args), sorted(gold)
+        )
+        if stale:
+            code = _refuse_or_note(
+                "the contamination audit does not describe this run",
+                "; ".join(stale) + ". Re-run `benchmark_runner contaminate`.",
+            )
+            if code is not None:
+                return code
+        contamination_cases = audit.get("cases") or {}
+
     kg, _ = _load_graph(args.kg, config) if config.task == "sdt" else (None, None)
     if kg is not None:
         config.framework.kg_hash = kg.content_hash()
@@ -870,7 +941,9 @@ def cmd_score(args: argparse.Namespace) -> int:
                 if code is not None:
                     return code
 
-        all_scored.extend(_score_traces(config, traces, gold, kg, pricing))
+        all_scored.extend(
+            _score_traces(config, traces, gold, kg, pricing, contamination_cases)
+        )
         by_condition: Dict[str, List[Trace]] = {}
         for trace in traces:
             by_condition.setdefault(trace.condition, []).append(trace)
@@ -1280,9 +1353,15 @@ def cmd_contaminate(args: argparse.Namespace) -> int:
     graph = GraphText.from_kg(kg)
     print(f"  {len(graph)} passages", file=sys.stderr)
 
+    from tcm_eval.contamination import audit_identity
+
     report = audit_dataset(items, graph, config.dataset_kind)
-    report["kg_content_sha256"] = kg.content_hash()
-    report["dataset_sha256"] = _file_hash(config.dataset_path)
+    report["identity"] = audit_identity(
+        kg_hash=kg.content_hash(),
+        dataset_hash=_file_hash(config.dataset_path),
+        gold_hash=_gold_hash(dataset, config),
+        case_set_hash=case_set_hash([str(i["id"]) for i in items]),
+    )
 
     out = Path(args.out or config.output_dir / f"contamination.{config.task}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
