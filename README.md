@@ -105,6 +105,13 @@ load (`validate_graph`), and it matches exactly.
 | regulation | PharmacoPoeiaEntry (386) |
 | provenance | DocumentSource (632) |
 
+![The TCM clinical knowledge graph](docs/figures/kg_schema.svg)
+
+The figure above is generated from the graph and the schema by
+`scripts/figure_kg.py`, so its counts cannot drift from the data; panel **b**
+is the access-domain table described under *Access domains* below. See
+`docs/figures/README.md` for the caption and how to raster it.
+
 **There is no `Symptom` node and no `Pathogenesis` node, and none was added.**
 Symptoms, tongue, pulse and pathogenesis are *transient clinical features* the
 model produces at run time. Pathogenesis in particular is treated as a latent
@@ -743,11 +750,11 @@ tcm_agent/    frozen runtime, M0–M4 + controls, tasks, prompts, phase-tagged t
 tcm_models/   provider adapters, generation cache, keyless replay
 tcm_eval/     datasets · scorers · judge · trace metrics · statistics · report
 runner/       CLI: run · score · judge · report · compare · inspect · coverage
-scripts/      KG coverage audit, TCM-CP benchmark builder
+scripts/      KG coverage audit, TCM-CP benchmark builder, figure generator
 configs/      models.yaml + one experiment file per benchmark
 kg/           tcm_knowledge_graph.json.gz (the committed artefact)
 vendor/       the benchmark's own evaluate.py, vendored unmodified
-docs/         design.md · kg_coverage.md (generated)
+docs/         design.md · kg_coverage.md · figures/ (all generated)
 ```
 
 Datasets are not committed — see `data/*/README.md` for where to put them.
